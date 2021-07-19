@@ -18,12 +18,14 @@ const fullyQualifiedName = "name1.ns.svc.mycluster.local"
 const fullyQualifiedNameOpaque = "name3.ns.svc.mycluster.local"
 const fullyQualifiedNameOpaqueService = "name4.ns.svc.mycluster.local"
 const fullyQualifiedNameSkipped = "name5.ns.svc.mycluster.local"
+const fullyQualifiedPodDNS = "pod-0.statefulset-svc.ns.svc.mycluster.local"
 const clusterIP = "172.17.12.0"
 const clusterIPOpaque = "172.17.12.1"
 const podIP1 = "172.17.0.12"
 const podIP2 = "172.17.0.13"
 const podIPOpaque = "172.17.0.14"
 const podIPSkipped = "172.17.0.15"
+const podIPStatefulSet = "172.17.13.15"
 const port uint32 = 8989
 const opaquePort uint32 = 4242
 const skippedPort uint32 = 24224
@@ -269,11 +271,54 @@ spec:
         value: 0.0.0.0:4143
       name: linkerd-proxy`,
 	}
+
+	meshedStatefulSetPodResource := []string{
+		`
+apiVersion: v1
+kind: Service
+metadata:
+  name: statefulset-svc
+  namespace: ns
+spec:
+  type: LoadBalancer
+  clusterIP: 172.17.13.5
+  ports:
+  - port: 8989`,
+		`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name:	statefulset-svc
+  namespace: ns
+subsets:
+- addresses:
+  - ip: 172.17.13.15
+    hostname: pod-0
+    targetRef:
+      kind: Pod
+      name: pod-0
+      namespace: ns
+  ports:
+  - port: 8989`,
+		`
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    linkerd.io/control-plane-ns: linkerd
+  name: pod-0
+  namespace: ns
+status:
+  phase: Running
+  podIP: 172.17.13.15`,
+	}
+
 	res := append(meshedPodResources, clientSP...)
 	res = append(res, unmeshedPod)
 	res = append(res, meshedOpaquePodResources...)
 	res = append(res, meshedOpaqueServiceResources...)
 	res = append(res, meshedSkippedPodResource...)
+	res = append(res, meshedStatefulSetPodResource...)
 	k8sAPI, err := k8s.NewFakeAPI(res...)
 	if err != nil {
 		t.Fatalf("NewFakeAPI returned an error: %s", err)
@@ -303,6 +348,7 @@ spec:
 	k8sAPI.Sync(nil)
 
 	return &server{
+		pb.UnimplementedDestinationServer{},
 		endpoints,
 		opaquePorts,
 		profiles,
@@ -413,12 +459,12 @@ func TestGet(t *testing.T) {
 			t.Fatalf("Expected len(addrs) to be > 0")
 		}
 
-		if addrs[0].ProtocolHint != nil {
+		if addrs[0].GetProtocolHint().GetProtocol() != nil || addrs[0].GetProtocolHint().GetOpaqueTransport() != nil {
 			t.Fatalf("Expected protocol hint for %s to be nil but got %+v", path, addrs[0].ProtocolHint)
 		}
 
 		if addrs[0].TlsIdentity != nil {
-			t.Fatalf("Expected protocol hint for %s to be nil but got %+v", path, addrs[0].TlsIdentity)
+			t.Fatalf("Expected TLS identity for %s to be nil but got %+v", path, addrs[0].TlsIdentity)
 		}
 	})
 }
@@ -644,6 +690,56 @@ func TestGetProfiles(t *testing.T) {
 		}
 	})
 
+	t.Run("Return profile with endpoint when using pod DNS", func(t *testing.T) {
+		server := makeServer(t)
+		stream := &bufferingGetProfileStream{
+			updates:          []*pb.DestinationProfile{},
+			MockServerStream: util.NewMockServerStream(),
+		}
+		stream.Cancel()
+
+		epAddr, err := toAddress(podIPStatefulSet, port)
+		if err != nil {
+			t.Fatalf("Got error: %s", err)
+		}
+
+		err = server.GetProfile(&pb.GetDestination{
+			Scheme:       "k8s",
+			Path:         fmt.Sprintf("%s:%d", fullyQualifiedPodDNS, port),
+			ContextToken: "ns:ns",
+		}, stream)
+		if err != nil {
+			t.Fatalf("Got error: %s", err)
+		}
+
+		// An explanation for why we expect 1 to 3 updates is in test cases
+		// above
+		if len(stream.updates) == 0 || len(stream.updates) > 3 {
+			t.Fatalf("Expected 1 to 3 updates but got %d: %v", len(stream.updates), stream.updates)
+		}
+
+		first := stream.updates[0]
+		if first.Endpoint == nil {
+			t.Fatalf("Expected response to have endpoint field")
+		}
+		if first.OpaqueProtocol {
+			t.Fatalf("Expected port %d to not be an opaque protocol, but it was", port)
+		}
+		_, exists := first.Endpoint.MetricLabels["namespace"]
+		if !exists {
+			t.Fatalf("Expected 'namespace' metric label to exist but it did not")
+		}
+		if first.GetEndpoint().GetProtocolHint() == nil {
+			t.Fatalf("Expected protocol hint but found none")
+		}
+		if first.GetEndpoint().GetProtocolHint().GetOpaqueTransport() != nil {
+			t.Fatalf("Expected pod to not support opaque traffic on port %d", port)
+		}
+		if first.Endpoint.Addr.String() != epAddr.String() {
+			t.Fatalf("Expected endpoint IP to be %s, but it was %s", epAddr.Ip, first.Endpoint.Addr.Ip)
+		}
+	})
+
 	t.Run("Return profile with endpoint when using pod IP", func(t *testing.T) {
 		server := makeServer(t)
 		stream := &bufferingGetProfileStream{
@@ -682,10 +778,10 @@ func TestGetProfiles(t *testing.T) {
 		if !exists {
 			t.Fatalf("Expected 'namespace' metric label to exist but it did not")
 		}
-		if first.Endpoint.ProtocolHint == nil {
+		if first.GetEndpoint().GetProtocolHint() == nil {
 			t.Fatalf("Expected protocol hint but found none")
 		}
-		if first.Endpoint.ProtocolHint.GetOpaqueTransport() != nil {
+		if first.GetEndpoint().GetProtocolHint().GetOpaqueTransport() != nil {
 			t.Fatalf("Expected pod to not support opaque traffic on port %d", port)
 		}
 		if first.Endpoint.Addr.String() != epAddr.String() {
@@ -745,7 +841,7 @@ func TestGetProfiles(t *testing.T) {
 		if first.Endpoint == nil {
 			t.Fatalf("Expected response to have endpoint field")
 		}
-		if first.Endpoint.ProtocolHint != nil {
+		if first.Endpoint.GetProtocolHint().GetProtocol() != nil || first.Endpoint.GetProtocolHint().GetOpaqueTransport() != nil {
 			t.Fatalf("Expected no protocol hint but found one")
 		}
 	})
@@ -884,12 +980,12 @@ func TestGetProfiles(t *testing.T) {
 			t.Fatalf("Expected to not be nil")
 		}
 
-		if addr.ProtocolHint != nil {
+		if addr.GetProtocolHint().GetProtocol() != nil || addr.GetProtocolHint().GetOpaqueTransport() != nil {
 			t.Fatalf("Expected protocol hint for %s to be nil but got %+v", path, addr.ProtocolHint)
 		}
 
 		if addr.TlsIdentity != nil {
-			t.Fatalf("Expected protocol hint for %s to be nil but got %+v", path, addr.TlsIdentity)
+			t.Fatalf("Expected TLS identity for %s to be nil but got %+v", path, addr.TlsIdentity)
 		}
 	})
 }
@@ -1059,7 +1155,7 @@ status:
 
 		k8sAPI.Sync(nil)
 		// Get host IP pod that is mapped to the port `hostPort1`
-		pod, err := getPod(k8sAPI, hostIP, hostPort1, logging.WithFields(nil))
+		pod, err := getPodByIP(k8sAPI, hostIP, hostPort1, logging.WithFields(nil))
 		if err != nil {
 			t.Fatalf("failed to get pod: %s", err)
 		}
@@ -1072,7 +1168,7 @@ status:
 		// Get host IP pod that is mapped to the port `hostPort2`; this tests
 		// that the indexer properly adds multiple containers from a single
 		// pod.
-		pod, err = getPod(k8sAPI, hostIP, hostPort2, logging.WithFields(nil))
+		pod, err = getPodByIP(k8sAPI, hostIP, hostPort2, logging.WithFields(nil))
 		if err != nil {
 			t.Fatalf("failed to get pod: %s", err)
 		}
@@ -1083,7 +1179,7 @@ status:
 			t.Fatalf("expected pod name to be %s, but got %s", expectedPodName, pod.Name)
 		}
 		// Get host IP pod with unmapped host port
-		pod, err = getPod(k8sAPI, hostIP, 12347, logging.WithFields(nil))
+		pod, err = getPodByIP(k8sAPI, hostIP, 12347, logging.WithFields(nil))
 		if err != nil {
 			t.Fatalf("expected no error when getting host IP pod with unmapped host port, but got: %s", err)
 		}
@@ -1091,7 +1187,7 @@ status:
 			t.Fatal("expected no pod to be found with unmapped host port")
 		}
 		// Get pod IP pod and expect an error
-		_, err = getPod(k8sAPI, podIP, 12346, logging.WithFields(nil))
+		_, err = getPodByIP(k8sAPI, podIP, 12346, logging.WithFields(nil))
 		if err == nil {
 			t.Fatal("expected error when getting by pod IP and unmapped host port, but got none")
 		}

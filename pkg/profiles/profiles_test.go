@@ -66,7 +66,7 @@ spec:
               min: 503`,
 		},
 		{
-			err: errors.New("ServiceProfile \"^.^\" has invalid name: a DNS-1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')"),
+			err: errors.New("ServiceProfile \"^.^\" has invalid name: a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')"),
 			sp: `apiVersion: linkerd.io/v1alpha2
 kind: ServiceProfile
 metadata:
@@ -123,15 +123,6 @@ spec:
       foo: bar
       method: GET
       pathRegex: /route-1`,
-		},
-		{
-			err: errors.New("ServiceProfile \"name.ns.svc.cluster.local\" has no routes"),
-			sp: `apiVersion: linkerd.io/v1alpha2
-kind: ServiceProfile
-metadata:
-  name: name.ns.svc.cluster.local
-  namespace: linkerd-ns
-spec:`,
 		},
 		{
 			err: errors.New("ServiceProfile \"name.ns.svc.cluster.local\" has a route with no condition"),

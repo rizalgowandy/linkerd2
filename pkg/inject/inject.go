@@ -49,6 +49,7 @@ var (
 		k8s.ProxyInitImageAnnotation,
 		k8s.ProxyInitImageVersionAnnotation,
 		k8s.ProxyOutboundPortAnnotation,
+		k8s.ProxyPodInboundPortsAnnotation,
 		k8s.ProxyCPULimitAnnotation,
 		k8s.ProxyCPURequestAnnotation,
 		k8s.ProxyImageAnnotation,
@@ -121,7 +122,7 @@ type ResourceConfig struct {
 		meta *metav1.ObjectMeta
 		// This fields hold labels and annotations which are to be added to the
 		// injected resource. This is different from meta.Labels and
-		// meta.Annotationswhich are the labels and annotations on the original
+		// meta.Annotations which are the labels and annotations on the original
 		// resource before injection.
 		labels      map[string]string
 		annotations map[string]string
@@ -248,7 +249,7 @@ func (conf *ResourceConfig) ParseMetaAndYAML(bytes []byte) (*Report, error) {
 }
 
 // GetOverriddenValues returns the final Values struct which is created
-// by overiding annoatated configuration on top of default Values
+// by overriding annotated configuration on top of default Values
 func (conf *ResourceConfig) GetOverriddenValues() (*linkerd2.Values, error) {
 	// Make a copy of Values and mutate that
 	copyValues, err := conf.values.DeepCopy()
@@ -256,6 +257,7 @@ func (conf *ResourceConfig) GetOverriddenValues() (*linkerd2.Values, error) {
 		return nil, err
 	}
 
+	copyValues.Proxy.PodInboundPorts = getPodInboundPorts(conf.pod.spec)
 	conf.applyAnnotationOverrides(copyValues)
 	return copyValues, nil
 }
@@ -361,7 +363,13 @@ func (conf *ResourceConfig) GetConfigAnnotation(annotationKey string) (string, b
 // CreateAnnotationPatch returns a json patch which adds the opaque ports
 // annotation with the `opaquePorts` value.
 func (conf *ResourceConfig) CreateAnnotationPatch(opaquePorts string) ([]byte, error) {
-	addRootAnnotations := len(conf.pod.meta.Annotations) == 0
+	addRootAnnotations := false
+	if conf.IsPod() {
+		addRootAnnotations = len(conf.pod.meta.Annotations) == 0
+	} else {
+		addRootAnnotations = len(conf.workload.Meta.Annotations) == 0
+	}
+
 	patch := &annotationPatch{
 		AddRootAnnotations: addRootAnnotations,
 		OpaquePorts:        opaquePorts,
@@ -657,7 +665,19 @@ func (conf *ResourceConfig) injectPodSpec(values *podPatch) {
 func (conf *ResourceConfig) injectProxyInit(values *podPatch) {
 
 	// Fill common fields from Proxy into ProxyInit
-	values.ProxyInit.Capabilities = values.Proxy.Capabilities
+	if values.Proxy.Capabilities != nil {
+		values.ProxyInit.Capabilities = &l5dcharts.Capabilities{}
+		values.ProxyInit.Capabilities.Add = values.Proxy.Capabilities.Add
+		values.ProxyInit.Capabilities.Drop = []string{}
+		for _, drop := range values.Proxy.Capabilities.Drop {
+			// Skip NET_RAW and NET_ADMIN as the init container requires them to setup iptables.
+			if drop == "NET_RAW" || drop == "NET_ADMIN" {
+				continue
+			}
+			values.ProxyInit.Capabilities.Drop = append(values.ProxyInit.Capabilities.Drop, drop)
+		}
+	}
+
 	values.ProxyInit.SAMountPath = values.Proxy.SAMountPath
 
 	if v := conf.pod.meta.Annotations[k8s.CloseWaitTimeoutAnnotation]; v != "" {
@@ -788,6 +808,10 @@ func (conf *ResourceConfig) applyAnnotationOverrides(values *l5dcharts.Values) {
 		if err == nil {
 			values.Proxy.Ports.Outbound = int32(outboundPort)
 		}
+	}
+
+	if override, ok := annotations[k8s.ProxyPodInboundPortsAnnotation]; ok {
+		values.Proxy.PodInboundPorts = override
 	}
 
 	if override, ok := annotations[k8s.ProxyLogLevelAnnotation]; ok {
@@ -1041,4 +1065,16 @@ func ToWholeCPUCores(q k8sResource.Quantity) (int64, error) {
 		return n, nil
 	}
 	return 0, fmt.Errorf("Could not parse cores: %s", q.String())
+}
+
+func getPodInboundPorts(podSpec *corev1.PodSpec) string {
+	ports := []string{}
+	if podSpec != nil {
+		for _, container := range podSpec.Containers {
+			for _, port := range container.Ports {
+				ports = append(ports, strconv.Itoa(int(port.ContainerPort)))
+			}
+		}
+	}
+	return strings.Join(ports, ",")
 }

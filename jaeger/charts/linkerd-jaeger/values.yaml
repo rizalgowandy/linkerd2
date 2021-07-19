@@ -4,21 +4,84 @@ installNamespace: true
 
 namespace: linkerd-jaeger
 
-collector:
-  image: 
-    name: omnition/opencensus-collector
-    version: 0.1.11
-    pullPolicy: Always
-  # resources:
+# -- Namespace of the Linkerd core control-plane install
+linkerdNamespace: linkerd
 
-  # -- address of the jaeger backend to send traces to
-  jaegerAddr:
+# -- Default nodeSelector section, See the
+# [K8S documentation](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector) for more information
+nodeSelector: &default_node_selector
+  beta.kubernetes.io/os: linux
+
+# -- Default tolerations section, See the
+# [K8S documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+# for more information
+tolerations: &default_tolerations
+
+collector:
+  # -- Set to false to exclude collector installation
+  enabled: true
+  image:
+    name: otel/opentelemetry-collector
+    version: 0.27.0
+    pullPolicy: Always
+
+  # -- NodeSelector section, See the
+  # [K8S documentation](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector) for more information
+  nodeSelector: *default_node_selector
+  # -- Tolerations section, See the
+  # [K8S documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+  # for more information
+  tolerations: *default_tolerations
+
+  # -- OpenTelemetry Collector config, See the
+  # [Configuration docs](https://opentelemetry.io/docs/collector/configuration/)
+  # for more information
+  # @default -- see `value.yaml` for actual configuration
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+          http:
+      opencensus:
+      zipkin:
+      jaeger:
+        protocols:
+          grpc:
+          thrift_http:
+          thrift_compact:
+          thrift_binary:
+    processors:
+      batch:
+    extensions:
+      health_check:
+    exporters:
+      jaeger:
+        endpoint: jaeger.${POD_NAMESPACE}:14250
+        insecure: true
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp,opencensus,zipkin,jaeger]
+          processors: [batch]
+          exporters: [jaeger]
 
 jaeger:
-  image: 
+  # -- Set to false to exclude all-in-one Jaeger installation
+  enabled: true
+  image:
     name: jaegertracing/all-in-one
     version: 1.19.2
     pullPolicy: Always
+
+  # -- NodeSelector section, See the
+  # [K8S documentation](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector) for more information
+  nodeSelector: *default_node_selector
+  # -- Tolerations section, See the
+  # [K8S documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+  # for more information
+  tolerations: *default_tolerations
 
 linkerdVersion: &linkerd_version linkerdVersionValue
 
@@ -39,7 +102,7 @@ webhook:
   collectorSvcAccount: collector
 
   failurePolicy: Ignore
-  image: 
+  image:
     name: cr.l5d.io/linkerd/jaeger-webhook
     version: *linkerd_version
     pullPolicy: IfNotPresent
@@ -53,3 +116,11 @@ webhook:
   objectSelector:
     #matchLabels:
     #  foo: bar
+
+  # -- NodeSelector section, See the
+  # [K8S documentation](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#nodeselector) for more information
+  nodeSelector: *default_node_selector
+  # -- Tolerations section, See the
+  # [K8S documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+  # for more information
+  tolerations: *default_tolerations
