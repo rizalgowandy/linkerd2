@@ -14,11 +14,9 @@ import (
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/linkerd/linkerd2/cli/flag"
 	"github.com/linkerd/linkerd2/pkg/charts/linkerd2"
-	charts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/inject"
 	"github.com/linkerd/linkerd2/pkg/k8s"
-	api "github.com/linkerd/linkerd2/pkg/public"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"
@@ -31,7 +29,7 @@ const (
 	injectDisabledDesc               = "pods are not annotated to disable injection"
 	unsupportedDesc                  = "at least one resource can be injected or annotated"
 	udpDesc                          = "pod specs do not include UDP ports"
-	automountServiceAccountTokenDesc = "pods do not have automountServiceAccountToken set to \"false\""
+	automountServiceAccountTokenDesc = "pods do not have automountServiceAccountToken set to \"false\" or service account token projection is enabled"
 	slash                            = "/"
 )
 
@@ -42,14 +40,15 @@ type resourceTransformerInject struct {
 	overrideAnnotations map[string]string
 	enableDebugSidecar  bool
 	closeWaitTimeout    time.Duration
+	overrider           inject.ValueOverrider
 }
 
-func runInjectCmd(inputs []io.Reader, errWriter, outWriter io.Writer, transformer *resourceTransformerInject) int {
-	return transformInput(inputs, errWriter, outWriter, transformer)
+func runInjectCmd(inputs []io.Reader, errWriter, outWriter io.Writer, transformer *resourceTransformerInject, output string) int {
+	return transformInput(inputs, errWriter, outWriter, transformer, output)
 }
 
-func newCmdInject() *cobra.Command {
-	defaults, err := charts.NewValues()
+func NewCmdInject(overrider inject.ValueOverrider) *cobra.Command {
+	defaults, err := linkerd2.NewValues()
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())
 		os.Exit(1)
@@ -58,6 +57,7 @@ func newCmdInject() *cobra.Command {
 	injectFlags, injectFlagSet := makeInjectFlags(defaults)
 	var manualOption, enableDebugSidecar bool
 	var closeWaitTimeout time.Duration
+	var output string
 
 	cmd := &cobra.Command{
 		Use:   "inject [flags] CONFIG-FILE",
@@ -70,7 +70,7 @@ sub-folders, or coming from stdin.`,
   kubectl get deploy -o yaml | linkerd inject - | kubectl apply -f -
 
   # Injecting a file from a remote URL
-  linkerd inject http://url.to/yml | kubectl apply -f -
+  linkerd inject https://url.to/yml | kubectl apply -f -
 
   # Inject all the resources inside a folder and its sub-folders.
   linkerd inject <folder> | kubectl apply -f -`,
@@ -110,8 +110,9 @@ sub-folders, or coming from stdin.`,
 				overrideAnnotations: overrideAnnotations,
 				enableDebugSidecar:  enableDebugSidecar,
 				closeWaitTimeout:    closeWaitTimeout,
+				overrider:           overrider,
 			}
-			exitCode := uninjectAndInject(in, stderr, stdout, transformer)
+			exitCode := uninjectAndInject(in, stderr, stdout, transformer, output)
 			os.Exit(exitCode)
 			return nil
 		},
@@ -134,22 +135,24 @@ sub-folders, or coming from stdin.`,
 		&closeWaitTimeout, "close-wait-timeout", closeWaitTimeout,
 		"Sets nf_conntrack_tcp_timeout_close_wait")
 
+	cmd.Flags().StringVarP(&output, "output", "o", "yaml", "Output format, one of: json|yaml")
+
 	cmd.Flags().AddFlagSet(proxyFlagSet)
 	cmd.Flags().AddFlagSet(injectFlagSet)
 
 	return cmd
 }
 
-func uninjectAndInject(inputs []io.Reader, errWriter, outWriter io.Writer, transformer *resourceTransformerInject) int {
+func uninjectAndInject(inputs []io.Reader, errWriter, outWriter io.Writer, transformer *resourceTransformerInject, output string) int {
 	var out bytes.Buffer
-	if exitCode := runUninjectSilentCmd(inputs, errWriter, &out, transformer.values); exitCode != 0 {
+	if exitCode := runUninjectSilentCmd(inputs, errWriter, &out, transformer.values, "yaml"); exitCode != 0 {
 		return exitCode
 	}
-	return runInjectCmd([]io.Reader{&out}, errWriter, outWriter, transformer)
+	return runInjectCmd([]io.Reader{&out}, errWriter, outWriter, transformer, output)
 }
 
 func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Report, error) {
-	conf := inject.NewResourceConfig(rt.values, inject.OriginCLI)
+	conf := inject.NewResourceConfig(rt.values, inject.OriginCLI, controlPlaneNamespace)
 
 	if rt.enableDebugSidecar {
 		conf.AppendPodAnnotation(k8s.ProxyEnableDebugAnnotation, "true")
@@ -168,8 +171,6 @@ func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Re
 		return nil, nil, errors.New("--manual must be set when injecting control plane components")
 	}
 
-	reports := []inject.Report{*report}
-
 	if conf.IsService() {
 		opaquePorts, ok := rt.overrideAnnotations[k8s.ProxyOpaquePortsAnnotation]
 		if ok {
@@ -177,28 +178,28 @@ func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Re
 			bytes, err = conf.AnnotateService(annotations)
 			report.Annotated = true
 		}
-		return bytes, reports, err
+		return bytes, []inject.Report{*report}, err
 	}
 	if rt.allowNsInject && conf.IsNamespace() {
 		bytes, err = conf.AnnotateNamespace(rt.overrideAnnotations)
 		report.Annotated = true
-		return bytes, reports, err
+		return bytes, []inject.Report{*report}, err
 	}
-	if conf.HasPodTemplate() {
+	if conf.HasPodTemplate() && len(rt.overrideAnnotations) > 0 {
 		conf.AppendPodAnnotations(rt.overrideAnnotations)
 		report.Annotated = true
 	}
 
 	if ok, _ := report.Injectable(); !ok {
 		if errs := report.ThrowInjectError(); len(errs) > 0 {
-			return bytes, reports, fmt.Errorf("failed to inject %s%s%s: %v", report.Kind, slash, report.Name, concatErrors(errs, ", "))
+			return bytes, []inject.Report{*report}, fmt.Errorf("failed to inject %s%s%s: %w", report.Kind, slash, report.Name, concatErrors(errs, ", "))
 		}
-		return bytes, reports, nil
+		return bytes, []inject.Report{*report}, nil
 	}
 
 	if rt.injectProxy {
 		// delete the inject annotation if present as its not needed in the manual case
-		// prevents injector from taking a different code path in the ignress mode
+		// prevents injector from taking a different code path in the ingress mode
 		delete(rt.overrideAnnotations, k8s.ProxyInjectAnnotation)
 		conf.AppendPodAnnotation(k8s.CreatedByAnnotation, k8s.CreatedByAnnotationValue())
 	} else if !rt.values.Proxy.IsIngress { // Add enabled annotation only if its not ingress mode to prevent overriding the annotation
@@ -206,13 +207,13 @@ func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Re
 		conf.AppendPodAnnotation(k8s.ProxyInjectAnnotation, k8s.ProxyInjectEnabled)
 	}
 
-	patchJSON, err := conf.GetPodPatch(rt.injectProxy)
+	patchJSON, err := conf.GetPodPatch(rt.injectProxy, rt.overrider)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if len(patchJSON) == 0 {
-		return bytes, reports, nil
+		return bytes, []inject.Report{*report}, nil
 	}
 	log.Infof("patch generated for: %s", report.ResName())
 	log.Debugf("patch: %s", patchJSON)
@@ -232,7 +233,7 @@ func (rt resourceTransformerInject) transform(bytes []byte) ([]byte, []inject.Re
 	if err != nil {
 		return nil, nil, err
 	}
-	return injectedYAML, reports, nil
+	return injectedYAML, []inject.Report{*report}, nil
 }
 
 func (resourceTransformerInject) generateReport(reports []inject.Report, output io.Writer) {
@@ -335,19 +336,19 @@ func (resourceTransformerInject) generateReport(reports []inject.Report, output 
 	}
 
 	for _, r := range reports {
-		if r.Annotated {
-			output.Write([]byte(fmt.Sprintf("%s \"%s\" annotated\n", r.Kind, r.Name)))
-		}
 		ok, _ := r.Injectable()
 		if ok {
 			output.Write([]byte(fmt.Sprintf("%s \"%s\" injected\n", r.Kind, r.Name)))
 		}
-		if !r.Annotated && !ok {
+		if !ok && !r.Annotated {
 			if r.Kind != "" {
 				output.Write([]byte(fmt.Sprintf("%s \"%s\" skipped\n", r.Kind, r.Name)))
 			} else {
 				output.Write([]byte(fmt.Sprintln("document missing \"kind\" field, skipped")))
 			}
+		}
+		if !ok && r.Annotated {
+			output.Write([]byte(fmt.Sprintf("%s \"%s\" annotated\n", r.Kind, r.Name)))
 		}
 	}
 
@@ -357,7 +358,7 @@ func (resourceTransformerInject) generateReport(reports []inject.Report, output 
 
 func fetchConfigs(ctx context.Context) (*linkerd2.Values, error) {
 
-	api.CheckPublicAPIClientOrRetryOrExit(healthcheck.Options{
+	hc := healthcheck.NewWithCoreChecks(&healthcheck.Options{
 		ControlPlaneNamespace: controlPlaneNamespace,
 		KubeConfig:            kubeconfigPath,
 		Impersonate:           impersonate,
@@ -366,6 +367,7 @@ func fetchConfigs(ctx context.Context) (*linkerd2.Values, error) {
 		APIAddr:               apiAddr,
 		RetryDeadline:         time.Time{},
 	})
+	hc.RunWithExitOnError()
 
 	api, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
 	if err != nil {
@@ -377,10 +379,10 @@ func fetchConfigs(ctx context.Context) (*linkerd2.Values, error) {
 	return values, err
 }
 
-// overrideConfigs uses command-line overrides to update the provided configs.
+// getOverrideAnnotations uses command-line overrides to update the provided configs.
 // the overrideAnnotations map keeps track of which configs are overridden, by
 // storing the corresponding annotations and values.
-func getOverrideAnnotations(values *charts.Values, base *charts.Values) map[string]string {
+func getOverrideAnnotations(values *linkerd2.Values, base *linkerd2.Values) map[string]string {
 	overrideAnnotations := make(map[string]string)
 
 	proxy := values.Proxy
@@ -415,15 +417,8 @@ func getOverrideAnnotations(values *charts.Values, base *charts.Values) map[stri
 	if proxy.Image.Name != baseProxy.Image.Name {
 		overrideAnnotations[k8s.ProxyImageAnnotation] = proxy.Image.Name
 	}
-	if values.ProxyInit.Image.Name != base.ProxyInit.Image.Name {
-		overrideAnnotations[k8s.ProxyInitImageAnnotation] = values.ProxyInit.Image.Name
-	}
 	if values.DebugContainer.Image.Name != base.DebugContainer.Image.Name {
 		overrideAnnotations[k8s.DebugImageAnnotation] = values.DebugContainer.Image.Name
-	}
-
-	if values.ProxyInit.Image.Version != base.ProxyInit.Image.Version {
-		overrideAnnotations[k8s.ProxyInitImageVersionAnnotation] = values.ProxyInit.Image.Version
 	}
 
 	if values.DebugContainer.Image.Version != base.DebugContainer.Image.Version {
@@ -438,6 +433,10 @@ func getOverrideAnnotations(values *charts.Values, base *charts.Values) map[stri
 		overrideAnnotations[k8s.ProxyUIDAnnotation] = strconv.FormatInt(proxy.UID, 10)
 	}
 
+	if proxy.GID >= 0 && (baseProxy.GID < 0 || proxy.GID != baseProxy.GID) {
+		overrideAnnotations[k8s.ProxyGIDAnnotation] = strconv.FormatInt(proxy.GID, 10)
+	}
+
 	if proxy.LogLevel != baseProxy.LogLevel {
 		overrideAnnotations[k8s.ProxyLogLevelAnnotation] = proxy.LogLevel
 	}
@@ -446,16 +445,16 @@ func getOverrideAnnotations(values *charts.Values, base *charts.Values) map[stri
 		overrideAnnotations[k8s.ProxyLogFormatAnnotation] = proxy.LogFormat
 	}
 
-	if proxy.DisableIdentity != baseProxy.DisableIdentity {
-		overrideAnnotations[k8s.ProxyDisableIdentityAnnotation] = strconv.FormatBool(proxy.DisableIdentity)
-	}
-
 	if proxy.RequireIdentityOnInboundPorts != baseProxy.RequireIdentityOnInboundPorts {
 		overrideAnnotations[k8s.ProxyRequireIdentityOnInboundPortsAnnotation] = proxy.RequireIdentityOnInboundPorts
 	}
 
 	if proxy.EnableExternalProfiles != baseProxy.EnableExternalProfiles {
 		overrideAnnotations[k8s.ProxyEnableExternalProfilesAnnotation] = strconv.FormatBool(proxy.EnableExternalProfiles)
+	}
+
+	if proxy.Metrics.HostnameLabels != baseProxy.Metrics.HostnameLabels {
+		overrideAnnotations[k8s.ProxyEnableHostnameLabels] = strconv.FormatBool(proxy.Metrics.HostnameLabels)
 	}
 
 	if proxy.IsIngress != baseProxy.IsIngress {
@@ -486,8 +485,21 @@ func getOverrideAnnotations(values *charts.Values, base *charts.Values) map[stri
 		}
 	}
 
-	// Set fields that can't be converted into annotations
-	values.Namespace = controlPlaneNamespace
+	if proxy.DefaultInboundPolicy != baseProxy.DefaultInboundPolicy {
+		overrideAnnotations[k8s.ProxyDefaultInboundPolicyAnnotation] = proxy.DefaultInboundPolicy
+	}
+
+	if proxy.AccessLog != baseProxy.AccessLog {
+		overrideAnnotations[k8s.ProxyAccessLogAnnotation] = proxy.AccessLog
+	}
+
+	if proxy.ShutdownGracePeriod != baseProxy.ShutdownGracePeriod {
+		overrideAnnotations[k8s.ProxyShutdownGracePeriodAnnotation] = proxy.ShutdownGracePeriod
+	}
+
+	if proxy.NativeSidecar != baseProxy.NativeSidecar {
+		overrideAnnotations[k8s.ProxyEnableNativeSidecarAnnotation] = strconv.FormatBool(proxy.NativeSidecar)
+	}
 
 	return overrideAnnotations
 }

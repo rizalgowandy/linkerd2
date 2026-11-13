@@ -1,22 +1,17 @@
 import { StringParam, withQueryParams } from 'use-query-params';
-import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
 
 import Button from '@material-ui/core/Button';
 import Card from '@material-ui/core/Card';
 import CardContent from '@material-ui/core/CardContent';
-import ConfigureProfilesMsg from './ConfigureProfilesMsg.jsx';
 import Divider from '@material-ui/core/Divider';
-import ErrorBanner from './ErrorBanner.jsx';
 import FormControl from '@material-ui/core/FormControl';
 import FormHelperText from '@material-ui/core/FormHelperText';
 import Grid from '@material-ui/core/Grid';
 import InputLabel from '@material-ui/core/InputLabel';
 import MenuItem from '@material-ui/core/MenuItem';
 import PropTypes from 'prop-types';
-import QueryToCliCmd from './QueryToCliCmd.jsx';
 import React from 'react';
 import Select from '@material-ui/core/Select';
-import TopRoutesModule from './TopRoutesModule.jsx';
 import { Trans } from '@lingui/macro';
 import Typography from '@material-ui/core/Typography';
 import _get from 'lodash/get';
@@ -24,10 +19,15 @@ import _isEmpty from 'lodash/isEmpty';
 import _merge from 'lodash/merge';
 import _pick from 'lodash/pick';
 import _uniq from 'lodash/uniq';
+import { withStyles } from '@material-ui/core/styles';
 import { groupResourcesByNs } from './util/MetricUtils.jsx';
 import { tapResourceTypes } from './util/TapUtils.jsx';
 import { withContext } from './util/AppContext.jsx';
-import { withStyles } from '@material-ui/core/styles';
+import TopRoutesModule from './TopRoutesModule.jsx';
+import QueryToCliCmd from './QueryToCliCmd.jsx';
+import ErrorBanner from './ErrorBanner.jsx';
+import ConfigureProfilesMsg from './ConfigureProfilesMsg.jsx';
+import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
 
 const topRoutesQueryProps = {
   resource_name: PropTypes.string,
@@ -118,7 +118,7 @@ class TopRoutes extends React.Component {
       this.api.fetchMetrics(allMetricsUrl),
     ]);
 
-    this.serverPromise = Promise.all(this.api.getCurrentPromises())
+    Promise.all(this.api.getCurrentPromises())
       .then(([svcList, allMetrics]) => {
         const services = _get(svcList, 'services', []);
         const namespaces = _uniq(services.map(s => s.namespace));
@@ -133,36 +133,25 @@ class TopRoutes extends React.Component {
         });
       })
       .catch(this.handleApiError);
-  }
-
-  handleApiError = e => {
-    if (e.isCanceled) {
-      return;
-    }
-
-    this.setState({
-      pendingRequests: false,
-      error: e,
-    });
-  }
+  };
 
   startServerPolling = () => {
     const { pollingInterval } = this.state;
     this.loadFromServer();
     this.timerId = window.setInterval(this.loadFromServer, pollingInterval);
-  }
+  };
 
   stopServerPolling = () => {
     window.clearInterval(this.timerId);
     this.api.cancelCurrentRequests();
     this.setState({ pendingRequests: false });
-  }
+  };
 
   handleBtnClick = inProgress => () => {
     this.setState({
       requestInProgress: inProgress,
     });
-  }
+  };
 
   // Each time state.query is updated, this method calls setQuery provided
   // by useQueryParams HOC to partially update url query params that have
@@ -170,7 +159,7 @@ class TopRoutes extends React.Component {
   handleUrlUpdate = query => {
     const { setQuery } = this.props;
     setQuery({ ...query });
-  }
+  };
 
   handleNamespaceSelect = nsKey => e => {
     const { query } = this.state;
@@ -191,7 +180,7 @@ class TopRoutes extends React.Component {
 
     this.handleUrlUpdate(query);
     this.setState({ query });
-  }
+  };
 
   renderRoutesQueryForm = () => {
     const { query, requestInProgress } = this.state;
@@ -200,13 +189,13 @@ class TopRoutes extends React.Component {
     return (
       <CardContent>
         <Grid container direction="column" spacing={2}>
-          <Grid item container spacing={4} alignItems="center" justify="flex-start">
+          <Grid item container spacing={4} alignItems="center" justifyContent="flex-start">
             <Grid item>
-              { this.renderNamespaceDropdown(<Trans>formNamespace</Trans>, 'namespace', <Trans>formNamespaceHelpText</Trans>) }
+              {this.renderNamespaceDropdown(<Trans>formNamespace</Trans>, 'namespace', <Trans>formNamespaceHelpText</Trans>)}
             </Grid>
 
             <Grid item>
-              { this.renderResourceDropdown(<Trans>formResource</Trans>, 'resource_name', 'resource_type', <Trans>formResourceHelpText</Trans>) }
+              {this.renderResourceDropdown(<Trans>formResource</Trans>, 'resource_name', 'resource_type', <Trans>formResourceHelpText</Trans>)}
             </Grid>
 
             <Grid item>
@@ -230,13 +219,13 @@ class TopRoutes extends React.Component {
             </Grid>
           </Grid>
 
-          <Grid item container spacing={4} alignItems="center" justify="flex-start">
+          <Grid item container spacing={4} alignItems="center" justifyContent="flex-start">
             <Grid item>
-              { this.renderNamespaceDropdown(<Trans>formToNamespace</Trans>, 'to_namespace', <Trans>formToNamespaceHelpText</Trans>) }
+              {this.renderNamespaceDropdown(<Trans>formToNamespace</Trans>, 'to_namespace', <Trans>formToNamespaceHelpText</Trans>)}
             </Grid>
 
             <Grid item>
-              { this.renderResourceDropdown(<Trans>formToResource</Trans>, 'to_name', 'to_type', <Trans>formToResourceHelpText</Trans>) }
+              {this.renderResourceDropdown(<Trans>formToResource</Trans>, 'to_name', 'to_type', <Trans>formToResourceHelpText</Trans>)}
             </Grid>
           </Grid>
         </Grid>
@@ -244,7 +233,7 @@ class TopRoutes extends React.Component {
         <Typography variant="caption"><Trans>createNewProfileMsg</Trans> <ConfigureProfilesMsg showAsIcon /></Typography>
       </CardContent>
     );
-  }
+  };
 
   renderNamespaceDropdown = (title, key, helperText) => {
     const { query, namespaces } = this.state;
@@ -270,7 +259,7 @@ class TopRoutes extends React.Component {
         <FormHelperText>{helperText}</FormHelperText>
       </FormControl>
     );
-  }
+  };
 
   renderResourceDropdown = (title, nameKey, typeKey, helperText) => {
     const { query, services, resourcesByNs } = this.state;
@@ -316,7 +305,7 @@ class TopRoutes extends React.Component {
         <FormHelperText>{helperText}</FormHelperText>
       </FormControl>
     );
-  }
+  };
 
   render() {
     const { query, requestInProgress, error } = this.state;
@@ -330,15 +319,15 @@ class TopRoutes extends React.Component {
           <ErrorBanner message={error} onHideMessage={() => this.setState({ error: null })} />
         }
         <Card elevation={3}>
-          { this.renderRoutesQueryForm() }
+          {this.renderRoutesQueryForm()}
           {
             emptyQuery ? null :
             <QueryToCliCmd
               cmdName="routes"
               query={cliQueryToDisplay}
               resource={toResourceName(query, 'resource_type', 'resource_name')} />
-            }
-          { !requestInProgress || !this._isMounted ? null : <TopRoutesModule query={query} /> }
+          }
+          {!requestInProgress || !this._isMounted ? null : <TopRoutesModule query={query} />}
         </Card>
       </div>
     );

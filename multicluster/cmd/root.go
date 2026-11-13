@@ -6,6 +6,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/linkerd/linkerd2/pkg/charts/linkerd2"
+	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	log "github.com/sirupsen/logrus"
@@ -13,18 +14,23 @@ import (
 )
 
 const (
-	defaultDockerRegistry                = "cr.l5d.io/linkerd"
 	defaultLinkerdNamespace              = "linkerd"
 	defaultMulticlusterNamespace         = "linkerd-multicluster"
 	defaultGatewayName                   = "linkerd-gateway"
-	helmMulticlusterDefaultChartName     = "linkerd-multicluster"
 	helmMulticlusterLinkDefaultChartName = "linkerd-multicluster-link"
 	tokenKey                             = "token"
 
+	saNameAnnotationKey       = "kubernetes.io/service-account.name"
 	defaultServiceAccountName = "linkerd-service-mirror-remote-access-default"
+
+	clusterNameLabel        = "multicluster.linkerd.io/cluster-name"
+	trustDomainAnnotation   = "multicluster.linkerd.io/trust-domain"
+	clusterDomainAnnotation = "multicluster.linkerd.io/cluster-domain"
 )
 
 var (
+	HelmMulticlusterDefaultChartName = "linkerd-multicluster"
+
 	apiAddr               string // An empty value means "use the Kubernetes configuration"
 	controlPlaneNamespace string
 	kubeconfigPath        string
@@ -80,11 +86,19 @@ components on a cluster, manage credentials and link clusters together.`,
 	multiclusterCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Turn on debug logging")
 	multiclusterCmd.AddCommand(newLinkCommand())
 	multiclusterCmd.AddCommand(newUnlinkCommand())
+	multiclusterCmd.AddCommand(newGenCommand())
 	multiclusterCmd.AddCommand(newMulticlusterInstallCommand())
 	multiclusterCmd.AddCommand(NewCmdCheck())
 	multiclusterCmd.AddCommand(newMulticlusterUninstallCommand())
 	multiclusterCmd.AddCommand(newGatewaysCommand())
 	multiclusterCmd.AddCommand(newAllowCommand())
+
+	// resource-aware completion flag configurations
+	pkgcmd.ConfigureNamespaceFlagCompletion(
+		multiclusterCmd, []string{"linkerd-namespace"},
+		kubeconfigPath, impersonate, impersonateGroup, kubeContext)
+
+	pkgcmd.ConfigureKubeContextFlagCompletion(multiclusterCmd, kubeconfigPath)
 	return multiclusterCmd
 }
 

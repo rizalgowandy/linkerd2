@@ -2,7 +2,6 @@ package identity
 
 import (
 	"context"
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"net"
@@ -21,15 +20,13 @@ import (
 	"github.com/linkerd/linkerd2/pkg/tls"
 	"github.com/linkerd/linkerd2/pkg/trace"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
-	v1machinery "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
 )
-
-const envTrustAnchors = "LINKERD2_IDENTITY_TRUST_ANCHORS"
 
 // Main executes the identity subcommand
 func Main(args []string) {
@@ -43,6 +40,9 @@ func Main(args []string) {
 	trustDomain := cmd.String("identity-trust-domain", "", "configures the name suffix used for identities")
 	identityIssuanceLifeTime := cmd.String("identity-issuance-lifetime", "", "the amount of time for which the Identity issuer should certify identity")
 	identityClockSkewAllowance := cmd.String("identity-clock-skew-allowance", "", "the amount of time to allow for clock skew within a Linkerd cluster")
+	enablePprof := cmd.Bool("enable-pprof", false, "Enable pprof endpoints on the admin server")
+	qps := cmd.Float64("kube-apiclient-qps", 100, "Maximum QPS sent to the kube-apiserver before throttling")
+	burst := cmd.Int("kube-apiclient-burst", 200, "Burst value over kube-apiclient-qps")
 
 	issuerPath := cmd.String("issuer",
 		"/var/run/linkerd/identity/issuer",
@@ -55,13 +55,21 @@ func Main(args []string) {
 
 	flags.ConfigureAndParse(cmd, args)
 
-	encodedIdentityTrustAnchorPEM := os.Getenv(envTrustAnchors)
-	rawPEM, err := base64.StdEncoding.DecodeString(encodedIdentityTrustAnchorPEM)
+	ready := false
+	adminServer := admin.NewServer(*adminAddr, *enablePprof, &ready)
+
+	go func() {
+		log.Infof("starting admin server on %s", *adminAddr)
+		if err := adminServer.ListenAndServe(); err != nil {
+			log.Errorf("failed to start identity admin server: %s", err)
+		}
+	}()
+
+	identityTrustAnchorPEM, err := os.ReadFile(k8s.MountPathTrustRootsPEM)
 	if err != nil {
-		log.Fatalf("could not decode identity trust anchors PEM: %s", err.Error())
+		log.Fatalf("could not read identity trust anchors PEM: %s", err.Error())
 	}
 
-	identityTrustAnchorPEM := string(rawPEM)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -69,6 +77,7 @@ func Main(args []string) {
 
 	if *identityScheme == "" || *trustDomain == "" {
 		log.Infof("Identity disabled in control plane configuration.")
+		//nolint:gocritic
 		os.Exit(0)
 	}
 
@@ -82,11 +91,13 @@ func Main(args []string) {
 
 	dom, err := idctl.NewTrustDomain(*controllerNS, *trustDomain)
 	if err != nil {
+		//nolint:gocritic
 		log.Fatalf("Invalid trust domain: %s", err.Error())
 	}
 
-	trustAnchors, err := tls.DecodePEMCertPool(identityTrustAnchorPEM)
+	trustAnchors, err := tls.DecodePEMCertPool(string(identityTrustAnchorPEM))
 	if err != nil {
+		//nolint:gocritic
 		log.Fatalf("Failed to read trust anchors: %s", err)
 	}
 
@@ -121,6 +132,7 @@ func Main(args []string) {
 	watcher := tls.NewFsCredsWatcher(*issuerPath, issuerEvent, issuerError)
 	go func() {
 		if err := watcher.StartWatching(ctx); err != nil {
+			//nolint:gocritic
 			log.Fatalf("Failed to start creds watcher: %s", err)
 		}
 	}()
@@ -128,10 +140,16 @@ func Main(args []string) {
 	//
 	// Create k8s API
 	//
-	k8sAPI, err := k8s.NewAPI(*kubeConfigPath, "", "", []string{}, 0)
+	config, err := k8s.GetConfig(*kubeConfigPath, "")
+	if err != nil {
+		log.Fatalf("Error configuring Kubernetes API client: %s", err)
+	}
+	k8sAPI, err := k8s.NewAPIForConfig(config, "", []string{}, 0, float32(*qps), *burst)
 	if err != nil {
 		log.Fatalf("Failed to load kubeconfig: %s: %s", *kubeConfigPath, err)
 	}
+	log.Infof("Using k8s client with QPS=%.2f Burst=%d", config.QPS, config.Burst)
+
 	v, err := idctl.NewK8sTokenValidator(ctx, k8sAPI, dom)
 	if err != nil {
 		log.Fatalf("Failed to initialize identity service: %s", err)
@@ -140,17 +158,24 @@ func Main(args []string) {
 	// Create K8s event recorder
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
-		Interface: k8sAPI.CoreV1().Events(*controllerNS),
+		Interface: k8sAPI.CoreV1().Events(""),
 	})
-	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: componentName})
-	deployment, err := k8sAPI.AppsV1().Deployments(*controllerNS).Get(ctx, componentName, v1machinery.GetOptions{})
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: componentName})
 
 	if err != nil {
 		log.Fatalf("Failed to construct k8s event recorder: %s", err)
 	}
 
-	recordEventFunc := func(eventType, reason, message string) {
-		recorder.Event(deployment, eventType, reason, message)
+	recordEventFunc := func(parent runtime.Object, eventType, reason, message string) {
+		if parent == nil {
+			parent = &corev1.ObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Namespace:  *controllerNS,
+				Name:       componentName,
+			}
+		}
+		recorder.Event(parent, eventType, reason, message)
 	}
 
 	//
@@ -158,6 +183,7 @@ func Main(args []string) {
 	//
 	svc := identity.NewService(v, trustAnchors, &validity, recordEventFunc, expectedName, issuerPathCrt, issuerPathKey)
 	if err = svc.Initialize(); err != nil {
+		//nolint:gocritic
 		log.Fatalf("Failed to initialize identity service: %s", err)
 	}
 	go func() {
@@ -167,9 +193,9 @@ func Main(args []string) {
 	//
 	// Bind and serve
 	//
-	go admin.StartServer(*adminAddr)
 	lis, err := net.Listen("tcp", *addr)
 	if err != nil {
+		//nolint:gocritic
 		log.Fatalf("Failed to listen on %s: %s", *addr, err)
 	}
 
@@ -178,13 +204,19 @@ func Main(args []string) {
 			log.Warnf("failed to initialize tracing: %s", err)
 		}
 	}
-	srv := prometheus.NewGrpcServer()
+	srv := prometheus.NewGrpcServer(grpc.MaxConcurrentStreams(0))
 	identity.Register(srv, svc)
 	go func() {
 		log.Infof("starting gRPC server on %s", *addr)
-		srv.Serve(lis)
+		if err := srv.Serve(lis); err != nil {
+			log.Errorf("failed to start identity gRPC server: %s", err)
+		}
 	}()
+
+	ready = true
+
 	<-stop
 	log.Infof("shutting down gRPC server on %s", *addr)
 	srv.GracefulStop()
+	adminServer.Shutdown(ctx)
 }

@@ -1,12 +1,4 @@
 import { StringParam, withQueryParams } from 'use-query-params';
-import {
-  defaultMaxRps,
-  emptyTapQuery,
-  httpMethods,
-  tapQueryPropType,
-  tapQueryProps,
-  tapResourceTypes,
-} from './util/TapUtils.jsx';
 import Accordion from '@material-ui/core/Accordion';
 import AccordionDetails from '@material-ui/core/AccordionDetails';
 import AccordionSummary from '@material-ui/core/AccordionSummary';
@@ -20,7 +12,6 @@ import Grid from '@material-ui/core/Grid';
 import InputLabel from '@material-ui/core/InputLabel';
 import MenuItem from '@material-ui/core/MenuItem';
 import PropTypes from 'prop-types';
-import QueryToCliCmd from './QueryToCliCmd.jsx';
 import React from 'react';
 import Select from '@material-ui/core/Select';
 import TextField from '@material-ui/core/TextField';
@@ -39,6 +30,15 @@ import _some from 'lodash/some';
 import _uniq from 'lodash/uniq';
 import _values from 'lodash/values';
 import { withStyles } from '@material-ui/core/styles';
+import QueryToCliCmd from './QueryToCliCmd.jsx';
+import {
+  defaultMaxRps,
+  emptyTapQuery,
+  httpMethods,
+  tapQueryPropType,
+  tapQueryProps,
+  tapResourceTypes,
+} from './util/TapUtils.jsx';
 
 const getResourceList = (resourcesByNs, ns) => {
   return resourcesByNs[ns] || _uniq(_flatten(_values(resourcesByNs)));
@@ -97,21 +97,17 @@ class TapQueryForm extends React.Component {
   static getDerivedStateFromProps(props, state) {
     if (!_isEqual(props.resourcesByNs, state.resourcesByNs)) {
       const resourcesByNs = props.resourcesByNs;
-      const authoritiesByNs = props.authoritiesByNs;
       const namespaces = Object.keys(resourcesByNs).sort();
       const resourceNames = getResourceList(resourcesByNs, state.query.namespace);
       const toResourceNames = getResourceList(resourcesByNs, state.query.toNamespace);
-      const authorities = getResourceList(authoritiesByNs, state.query.namespace);
 
       return _merge(state, {
         resourcesByNs,
-        authoritiesByNs,
         autocomplete: {
           namespace: namespaces,
           resource: resourceNames,
           toNamespace: namespaces,
           toResource: toResourceNames,
-          authority: authorities,
         },
       });
     } else {
@@ -133,20 +129,18 @@ class TapQueryForm extends React.Component {
     this.state = {
       query,
       advancedFormExpanded,
-      authoritiesByNs: {},
       resourcesByNs: {},
       autocomplete: {
         namespace: [],
         resource: [],
         toNamespace: [],
         toResource: [],
-        authority: [],
       },
     };
   }
 
   handleFormChange = (name, scopeResource) => {
-    const { query, autocomplete, resourcesByNs, authoritiesByNs } = this.state;
+    const { query, autocomplete, resourcesByNs } = this.state;
     const { updateQuery } = this.props;
 
     const state = {
@@ -154,7 +148,6 @@ class TapQueryForm extends React.Component {
       autocomplete,
     };
 
-    const shouldScopeAuthority = name === 'namespace';
     const newQueryValues = {};
 
     return event => {
@@ -169,15 +162,11 @@ class TapQueryForm extends React.Component {
         newQueryValues[scopeResource] = `namespace/${formVal}`;
       }
 
-      if (shouldScopeAuthority) {
-        state.autocomplete.authority = authoritiesByNs[formVal];
-      }
-
       this.setState(state);
       updateQuery(state.query);
       this.handleUrlUpdate(newQueryValues);
     };
-  }
+  };
 
   // Each time state.query is updated, this method calls setQuery provided
   // by useQueryParams HOC to partially update url query params that have
@@ -185,7 +174,7 @@ class TapQueryForm extends React.Component {
   handleUrlUpdate = query => {
     const { setQuery } = this.props;
     setQuery({ ...query });
-  }
+  };
 
   handleFormEvent = name => {
     const { query } = this.state;
@@ -201,19 +190,12 @@ class TapQueryForm extends React.Component {
       this.setState(state);
       updateQuery(state.query);
     };
-  }
+  };
 
   handleAdvancedFormExpandClick = () => {
     const { advancedFormExpanded } = this.state;
     this.setState({ advancedFormExpanded: !advancedFormExpanded });
-  }
-
-  autoCompleteData = name => {
-    const { autocomplete, query } = this.state;
-    return _uniq(
-      autocomplete[name].filter(d => d.indexOf(query[name]) !== -1),
-    ).sort();
-  }
+  };
 
   resetTapForm = () => {
     const { updateQuery, handleTapClear } = this.props;
@@ -226,7 +208,7 @@ class TapQueryForm extends React.Component {
 
     updateQuery(emptyTapQuery(), true);
     handleTapClear();
-  }
+  };
 
   renderResourceSelect = (resourceKey, namespaceKey) => {
     const { autocomplete, query } = this.state;
@@ -256,7 +238,7 @@ class TapQueryForm extends React.Component {
         </Select>
       </React.Fragment>
     );
-  }
+  };
 
   renderNamespaceSelect = (title, namespaceKey, resourceKey) => {
     const { autocomplete, query } = this.state;
@@ -278,7 +260,7 @@ class TapQueryForm extends React.Component {
         </Select>
       </React.Fragment>
     );
-  }
+  };
 
   renderTapButton = (tapInProgress, tapIsClosing) => {
     const { query } = this.state;
@@ -308,7 +290,7 @@ class TapQueryForm extends React.Component {
         </Button>
       );
     }
-  }
+  };
 
   renderTextInput = (title, key, helperText) => {
     const { query } = this.state;
@@ -324,10 +306,10 @@ class TapQueryForm extends React.Component {
         helperText={helperText}
         margin="normal" />
     );
-  }
+  };
 
   renderAdvancedTapFormContent() {
-    const { autocomplete, query } = this.state;
+    const { query } = this.state;
     const { classes } = this.props;
 
     return (
@@ -343,29 +325,6 @@ class TapQueryForm extends React.Component {
             <FormControl className={classes.formControl} disabled={_isEmpty(query.toNamespace)}>
               {this.renderResourceSelect('toResource', 'toNamespace')}
             </FormControl>
-          </Grid>
-        </Grid>
-
-        <Grid container spacing={3}>
-          <Grid item xs={6} md={3} classes={{ item: classes.formControlWrapper }}>
-            <FormControl className={classes.formControl}>
-              <InputLabel htmlFor="authority"><Trans>formAuthority</Trans></InputLabel>
-              <Select
-                value={query.authority}
-                onChange={this.handleFormChange('authority')}
-                inputProps={{ name: 'authority', id: 'authority' }}
-                className={classes.selectEmpty}>
-                {
-                  _map(autocomplete.authority, (d, i) => (
-                    <MenuItem key={`authority-${i}`} value={d}>{d}</MenuItem>
-                  ))
-                }
-              </Select>
-              <FormHelperText><Trans>formAuthorityHelpText</Trans></FormHelperText>
-            </FormControl>
-          </Grid>
-          <Grid item xs={6} md={3} className={classes.formControlWrapper}>
-            {this.renderTextInput(<Trans>formPath</Trans>, 'path', <Trans>formPathHelpText</Trans>)}
           </Grid>
         </Grid>
 
@@ -456,7 +415,6 @@ class TapQueryForm extends React.Component {
 }
 
 TapQueryForm.propTypes = {
-  authoritiesByNs: PropTypes.shape({}).isRequired,
   cmdName: PropTypes.string.isRequired,
   currentQuery: tapQueryPropType.isRequired,
   enableAdvancedForm: PropTypes.bool,

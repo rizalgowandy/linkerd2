@@ -17,6 +17,8 @@ const (
 
 func newCmdUninstall() *cobra.Command {
 	var force bool
+	var output string
+
 	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Args:  cobra.NoArgs,
@@ -35,7 +37,7 @@ This command provides all Kubernetes namespace-scoped and cluster-scoped resourc
 			if !force {
 
 				var fail bool
-				// Retrtieve any installed extensions
+				// Retrieve any installed extensions
 				extensionNamespaces, err := k8sAPI.GetAllNamespacesWithExtensionLabel(cmd.Context())
 				if err != nil {
 					return err
@@ -55,7 +57,7 @@ This command provides all Kubernetes namespace-scoped and cluster-scoped resourc
 						extensionNames = append(extensionNames, fmt.Sprintf("* %s", v))
 					}
 
-					fmt.Fprintln(os.Stderr, fmt.Sprintf("Please uninstall the following extensions before uninstalling the control-plane:\n\t%s", strings.Join(extensionNames, "\n\t")))
+					fmt.Fprintf(os.Stderr, "Please uninstall the following extensions before uninstalling the control-plane:\n\t%s\n", strings.Join(extensionNames, "\n\t"))
 					fail = true
 				}
 
@@ -73,7 +75,7 @@ This command provides all Kubernetes namespace-scoped and cluster-scoped resourc
 				}
 
 				if len(injectedPods) > 0 {
-					fmt.Fprintln(os.Stderr, fmt.Sprintf("Please uninject the following pods before uninstalling the control-plane:\n\t%s", strings.Join(injectedPods, "\n\t")))
+					fmt.Fprintf(os.Stderr, "Please uninject the following pods before uninstalling the control-plane:\n\t%s\n", strings.Join(injectedPods, "\n\t"))
 					fail = true
 				}
 
@@ -82,7 +84,12 @@ This command provides all Kubernetes namespace-scoped and cluster-scoped resourc
 				}
 			}
 
-			err = pkgCmd.Uninstall(cmd.Context(), k8sAPI, k8s.ControllerNSLabel)
+			selector, err := pkgCmd.GetLabelSelector(k8s.ControllerNSLabel)
+			if err != nil {
+				return err
+			}
+
+			err = pkgCmd.Uninstall(cmd.Context(), k8sAPI, selector, output)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 			}
@@ -92,5 +99,6 @@ This command provides all Kubernetes namespace-scoped and cluster-scoped resourc
 	}
 
 	cmd.Flags().BoolVarP(&force, "force", "f", force, "Force uninstall even if there exist non-control-plane injected pods")
+	cmd.PersistentFlags().StringVarP(&output, "output", "o", "yaml", "Output format. One of: json|yaml")
 	return cmd
 }

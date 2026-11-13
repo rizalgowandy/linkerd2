@@ -12,11 +12,7 @@ import (
 // DO NOT EDIT
 var Version = undefinedVersion
 
-// ProxyInitVersion is the pinned version of the proxy-init, from
-// https://github.com/linkerd/linkerd2-proxy-init
-// This has to be kept in sync with the constraint version for
-// github.com/linkerd/linkerd2-proxy-init in /go.mod
-var ProxyInitVersion = "v1.3.11"
+var LinkerdCNIVersion = "v1.7.1"
 
 const (
 	// undefinedVersion should take the form `channel-version` to conform to
@@ -45,17 +41,15 @@ func match(expectedVersion, actualVersion string) error {
 		return errors.New("expected version is empty")
 	} else if actualVersion == "" {
 		return errors.New("actual version is empty")
-	} else if actualVersion == expectedVersion {
-		return nil
 	}
 
 	actual, err := parseChannelVersion(actualVersion)
 	if err != nil {
-		return fmt.Errorf("failed to parse actual version: %s", err)
+		return fmt.Errorf("failed to parse actual version: %w", err)
 	}
 	expected, err := parseChannelVersion(expectedVersion)
 	if err != nil {
-		return fmt.Errorf("failed to parse expected version: %s", err)
+		return fmt.Errorf("failed to parse expected version: %w", err)
 	}
 
 	if actual.channel != expected.channel {
@@ -63,6 +57,10 @@ func match(expectedVersion, actualVersion string) error {
 			actual, expected)
 	}
 
-	return fmt.Errorf("is running version %s but the latest %s version is %s",
-		actual.version, actual.channel, expected.version)
+	if actual.version != expected.version || !actual.hotpatchEqual(expected) {
+		return fmt.Errorf("is running version %s but the latest %s version is %s",
+			actual.versionWithHotpatch(), actual.channel, expected.versionWithHotpatch())
+	}
+
+	return nil
 }

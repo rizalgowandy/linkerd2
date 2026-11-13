@@ -2,9 +2,9 @@ package profiles
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
+	"strings"
 
 	"github.com/emicklei/proto"
 	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
@@ -14,20 +14,15 @@ import (
 // RenderProto reads a protobuf definition file and renders the corresponding
 // ServiceProfile to a buffer, given a namespace, service, and control plane
 // namespace.
-func RenderProto(fileName, namespace, name, clusterDomain string, w io.Writer) error {
+func RenderProto(fileName, namespace, name, clusterDomain string) (*sp.ServiceProfile, error) {
 	input, err := readFile(fileName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	parser := proto.NewParser(input)
 
-	profile, err := protoToServiceProfile(parser, namespace, name, clusterDomain)
-	if err != nil {
-		return err
-	}
-
-	return writeProfile(*profile, w)
+	return protoToServiceProfile(parser, namespace, name, clusterDomain)
 }
 
 func protoToServiceProfile(parser *proto.Parser, namespace, name, clusterDomain string) (*sp.ServiceProfile, error) {
@@ -52,12 +47,14 @@ func protoToServiceProfile(parser *proto.Parser, namespace, name, clusterDomain 
 				default:
 					path = fmt.Sprintf("/%s.%s/%s", pkg, service.Name, typed.Name)
 				}
+
 				route := &sp.RouteSpec{
 					Name: typed.Name,
 					Condition: &sp.RequestMatch{
 						Method:    http.MethodPost,
 						PathRegex: regexp.QuoteMeta(path),
 					},
+					IsRetryable: isMethodRetryable(typed),
 				}
 				routes = append(routes, route)
 			}
@@ -76,4 +73,25 @@ func protoToServiceProfile(parser *proto.Parser, namespace, name, clusterDomain 
 			Routes: routes,
 		},
 	}, nil
+}
+
+func isMethodRetryable(rpc *proto.RPC) bool {
+	for _, e := range rpc.Elements {
+		option, ok := e.(*proto.Option)
+		if !ok {
+			// Not an option
+			continue
+		}
+
+		// method options can be wrapped in parentheses so we trim them away
+		if strings.Trim(option.Name, "()") != "idempotency_level" {
+			// Not an idempotency option
+			continue
+		}
+
+		return option.Constant.Source == "IDEMPOTENT" ||
+			option.Constant.Source == "NO_SIDE_EFFECTS"
+	}
+
+	return false
 }

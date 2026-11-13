@@ -19,10 +19,10 @@ limitations under the License.
 package v1alpha2
 
 import (
-	v1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	serviceprofilev1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // ServiceProfileLister helps list ServiceProfiles.
@@ -30,7 +30,7 @@ import (
 type ServiceProfileLister interface {
 	// List lists all ServiceProfiles in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1alpha2.ServiceProfile, err error)
+	List(selector labels.Selector) (ret []*serviceprofilev1alpha2.ServiceProfile, err error)
 	// ServiceProfiles returns an object that can list and get ServiceProfiles.
 	ServiceProfiles(namespace string) ServiceProfileNamespaceLister
 	ServiceProfileListerExpansion
@@ -38,25 +38,17 @@ type ServiceProfileLister interface {
 
 // serviceProfileLister implements the ServiceProfileLister interface.
 type serviceProfileLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*serviceprofilev1alpha2.ServiceProfile]
 }
 
 // NewServiceProfileLister returns a new ServiceProfileLister.
 func NewServiceProfileLister(indexer cache.Indexer) ServiceProfileLister {
-	return &serviceProfileLister{indexer: indexer}
-}
-
-// List lists all ServiceProfiles in the indexer.
-func (s *serviceProfileLister) List(selector labels.Selector) (ret []*v1alpha2.ServiceProfile, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1alpha2.ServiceProfile))
-	})
-	return ret, err
+	return &serviceProfileLister{listers.New[*serviceprofilev1alpha2.ServiceProfile](indexer, serviceprofilev1alpha2.Resource("serviceprofile"))}
 }
 
 // ServiceProfiles returns an object that can list and get ServiceProfiles.
 func (s *serviceProfileLister) ServiceProfiles(namespace string) ServiceProfileNamespaceLister {
-	return serviceProfileNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return serviceProfileNamespaceLister{listers.NewNamespaced[*serviceprofilev1alpha2.ServiceProfile](s.ResourceIndexer, namespace)}
 }
 
 // ServiceProfileNamespaceLister helps list and get ServiceProfiles.
@@ -64,36 +56,15 @@ func (s *serviceProfileLister) ServiceProfiles(namespace string) ServiceProfileN
 type ServiceProfileNamespaceLister interface {
 	// List lists all ServiceProfiles in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1alpha2.ServiceProfile, err error)
+	List(selector labels.Selector) (ret []*serviceprofilev1alpha2.ServiceProfile, err error)
 	// Get retrieves the ServiceProfile from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1alpha2.ServiceProfile, error)
+	Get(name string) (*serviceprofilev1alpha2.ServiceProfile, error)
 	ServiceProfileNamespaceListerExpansion
 }
 
 // serviceProfileNamespaceLister implements the ServiceProfileNamespaceLister
 // interface.
 type serviceProfileNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all ServiceProfiles in the indexer for a given namespace.
-func (s serviceProfileNamespaceLister) List(selector labels.Selector) (ret []*v1alpha2.ServiceProfile, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1alpha2.ServiceProfile))
-	})
-	return ret, err
-}
-
-// Get retrieves the ServiceProfile from the indexer for a given namespace and name.
-func (s serviceProfileNamespaceLister) Get(name string) (*v1alpha2.ServiceProfile, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1alpha2.Resource("serviceprofile"), name)
-	}
-	return obj.(*v1alpha2.ServiceProfile), nil
+	listers.ResourceIndexer[*serviceprofilev1alpha2.ServiceProfile]
 }

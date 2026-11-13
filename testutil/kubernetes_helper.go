@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -71,6 +72,26 @@ func (h *KubernetesHelper) CheckIfNamespaceExists(ctx context.Context, namespace
 	return err
 }
 
+// SwitchContext will re-build the clientset with the given context. Useful when
+// testing multiple clusters at the same time
+func (h *KubernetesHelper) SwitchContext(ctx string) error {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	overrides := &clientcmd.ConfigOverrides{CurrentContext: ctx}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
+	config, err := kubeConfig.ClientConfig()
+	if err != nil {
+		return err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	h.clientset = clientset
+	return nil
+}
+
 // GetSecret retrieves a Kubernetes Secret
 func (h *KubernetesHelper) GetSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
 	return h.clientset.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
@@ -110,9 +131,7 @@ func (h *KubernetesHelper) DeleteNamespaceIfExists(ctx context.Context, namespac
 
 // CreateControlPlaneNamespaceIfNotExists creates linkerd control plane namespace.
 func (h *KubernetesHelper) CreateControlPlaneNamespaceIfNotExists(ctx context.Context, namespace string) error {
-	labels := map[string]string{"linkerd.io/is-control-plane": "true", "config.linkerd.io/admission-webhooks": "disabled", "linkerd.io/control-plane-ns": namespace}
-	annotations := map[string]string{"linkerd.io/inject": "disabled"}
-	return h.createNamespaceIfNotExists(ctx, namespace, annotations, labels)
+	return h.createNamespaceIfNotExists(ctx, namespace, nil, nil)
 }
 
 // CreateDataPlaneNamespaceIfNotExists creates a dataplane namespace if it does not already exist,
@@ -143,8 +162,33 @@ func (h *KubernetesHelper) KubectlApplyWithArgs(stdin string, cmdArgs ...string)
 }
 
 // Kubectl executes an arbitrary Kubectl command
+// Deprecated: use KubectlRun instead
 func (h *KubernetesHelper) Kubectl(stdin string, arg ...string) (string, error) {
 	withContext := append([]string{"--context=" + h.k8sContext}, arg...)
+	cmd := exec.Command("kubectl", withContext...)
+	cmd.Stdin = strings.NewReader(stdin)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// KubectlRun executes an arbitrary kubectl command and returns stdout and stderr separately
+func (h *KubernetesHelper) KubectlRun(stdin string, arg ...string) (string, string, error) {
+	withContext := append([]string{"--context=" + h.k8sContext}, arg...)
+	return combinedOutput(stdin, "kubectl", withContext...)
+}
+
+// KubectlApplyWithContext applies a given configuration with the given flags
+func (h *KubernetesHelper) KubectlApplyWithContext(stdin string, context string, arg ...string) (string, error) {
+	args := append([]string{"apply"}, arg...)
+	return h.KubectlWithContext(stdin, context, args...)
+}
+
+// KubectlWithContext will call the kubectl binary with any optional arguments
+// provided and an arbitrary, given context. Useful when working with k8s
+// resources in a multi-cluster context. Optionally, stdin can be piped to
+// kubectl.
+func (h *KubernetesHelper) KubectlWithContext(stdin string, context string, arg ...string) (string, error) {
+	withContext := append([]string{"--context=" + context}, arg...)
 	cmd := exec.Command("kubectl", withContext...)
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
@@ -182,7 +226,7 @@ func (h *KubernetesHelper) GetResources(ctx context.Context, containerName, depl
 func (h *KubernetesHelper) CheckPods(ctx context.Context, namespace string, deploymentName string, replicas int) error {
 	var checkedPods []corev1.Pod
 
-	err := h.retryFor(6*time.Minute, func() error {
+	err := h.retryFor(60*time.Minute, func() error {
 		checkedPods = []corev1.Pod{}
 		pods, err := h.GetPodsForDeployment(ctx, namespace, deploymentName)
 		if err != nil {
@@ -249,6 +293,15 @@ func (h *KubernetesHelper) GetService(ctx context.Context, namespace string, ser
 		return nil, err
 	}
 	return service, nil
+}
+
+// GetEndpoints gets endpoints that exist in a namespace.
+func (h *KubernetesHelper) GetEndpoints(ctx context.Context, namespace string, serviceName string) (*corev1.Endpoints, error) {
+	ep, err := h.clientset.CoreV1().Endpoints(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return ep, nil
 }
 
 // GetPods returns all pods with the given labels
@@ -320,17 +373,50 @@ func (h *KubernetesHelper) URLFor(ctx context.Context, namespace, deployName str
 	return pf.URLFor(""), nil
 }
 
-// WaitRollout blocks until all the deployments in the linkerd namespace have been
-// completely rolled out (and their pods are ready)
-func (h *KubernetesHelper) WaitRollout(t *testing.T) {
-	for deploy, deploySpec := range LinkerdDeployReplicasEdge {
-		if deploySpec.Namespace == "linkerd" {
-			o, err := h.Kubectl("", "--namespace=linkerd", "rollout", "status", "--timeout=120s", "deploy/"+deploy)
-			if err != nil {
-				AnnotatedFatalf(t,
-					fmt.Sprintf("failed to wait rollout of deploy/%s", deploy),
-					"failed to wait for rollout of deploy/%s: %s: %s", deploy, err, o)
+// WaitRollout blocks until all the given deployments have been completely
+// rolled out (and their pods are ready)
+func (h *KubernetesHelper) WaitRollout(t *testing.T, deploys map[string]DeploySpec) {
+	t.Helper()
+	// Use default context
+	h.WaitRolloutWithContext(t, deploys, h.k8sContext)
+}
+
+// WaitRolloutWithContext blocks until all the given deployments in a provided
+// k8s context have been completely rolled out (and their pods are ready)
+func (h *KubernetesHelper) WaitRolloutWithContext(t *testing.T, deploys map[string]DeploySpec, context string) {
+	t.Helper()
+	for deploy, deploySpec := range deploys {
+		stat, err := h.KubectlWithContext("", context, "--namespace="+deploySpec.Namespace,
+			"rollout", "status", "--timeout=5m", "deploy/"+deploy)
+		if err != nil {
+			desc, _ := h.KubectlWithContext("", context, "--namespace="+deploySpec.Namespace,
+				"describe", "po")
+			AnnotatedFatalf(t,
+				fmt.Sprintf("failed to wait rollout of deploy/%s", deploy),
+				"failed to wait for rollout of deploy/%s: %s: %s\n---\n%s", deploy, err, stat, desc)
+		}
+	}
+}
+
+// WaitUntilDeployReady will block and wait until all given deploys have been
+// rolled out and their pods are in a 'ready' status. The difference between
+// this and WaitRollout is that WaitUntilDeployReady uses CheckPods underneath,
+// instead of relying on the 'rollout' command. WaitUntilDeployReady will also
+// retry for a long period time. This function is used to block tests from
+// running until the control plane and extensions are ready.
+func (h *KubernetesHelper) WaitUntilDeployReady(deploys map[string]DeploySpec) {
+	ctx := context.Background()
+	for deploy, spec := range deploys {
+		if err := h.CheckPods(ctx, spec.Namespace, deploy, 1); err != nil {
+			var out string
+			//nolint:errorlint
+			if rce, ok := err.(*RestartCountError); ok {
+				out = fmt.Sprintf("Error running test: failed to wait for deploy/%s to become 'ready', too many restarts (%v)\n", deploy, rce)
+			} else {
+				out = fmt.Sprintf("Error running test: failed to wait for deploy/%s to become 'ready', timed out waiting for condition\n", deploy)
 			}
+			os.Stderr.Write([]byte(out))
+			os.Exit(1)
 		}
 	}
 }

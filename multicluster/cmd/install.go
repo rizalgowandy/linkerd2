@@ -5,22 +5,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
+	"strings"
 	"time"
 
-	"github.com/linkerd/linkerd2/multicluster/static"
+	"github.com/linkerd/linkerd2/multicluster/charts"
 	multicluster "github.com/linkerd/linkerd2/multicluster/values"
-	"github.com/linkerd/linkerd2/pkg/charts"
-	partials "github.com/linkerd/linkerd2/pkg/charts/static"
+	chartspkg "github.com/linkerd/linkerd2/pkg/charts"
+	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/flags"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
-	api "github.com/linkerd/linkerd2/pkg/public"
 	"github.com/linkerd/linkerd2/pkg/version"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"helm.sh/helm/v3/pkg/chart/loader"
-	chartloader "helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
 	valuespkg "helm.sh/helm/v3/pkg/cli/values"
 	"helm.sh/helm/v3/pkg/engine"
@@ -30,23 +30,40 @@ import (
 
 type (
 	multiclusterInstallOptions struct {
-		gateway                 bool
-		gatewayPort             uint32
-		gatewayProbeSeconds     uint32
-		gatewayProbePort        uint32
-		namespace               string
+		gateway                 multicluster.Gateway
 		remoteMirrorCredentials bool
-		gatewayServiceType      string
 	}
 )
 
+var TemplatesMulticluster = []string{
+	chartutil.ChartfileName,
+	chartutil.ValuesfileName,
+	"templates/namespace.yaml",
+	"templates/gateway.yaml",
+	"templates/gateway-policy.yaml",
+	"templates/psp.yaml",
+	"templates/remote-access-service-mirror-rbac.yaml",
+	"templates/link-crd.yaml",
+	"templates/service-mirror-policy.yaml",
+	"templates/local-service-mirror.yaml",
+	"templates/controller-clusterrole.yaml",
+	"templates/controller/deployment.yaml",
+	"templates/controller/pdb.yaml",
+	"templates/controller/probe-svc.yaml",
+	"templates/controller/rbac.yaml",
+}
+
 func newMulticlusterInstallCommand() *cobra.Command {
 	options, err := newMulticlusterInstallOptionsWithDefault()
+	var ha bool
 	var wait time.Duration
 	var valuesOptions valuespkg.Options
+	var ignoreCluster bool
+	var cniEnabled bool
+	var output string
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -56,113 +73,42 @@ func newMulticlusterInstallCommand() *cobra.Command {
 		Args:  cobra.NoArgs,
 		Example: `  # Default install.
   linkerd multicluster install | kubectl apply -f -
-  
+
 The installation can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://github.com/linkerd/linkerd2/blob/main/multicluster/charts/linkerd-multicluster/README.md
+A full list of configurable values can be found at https://github.com/linkerd/linkerd2/blob/main/multicluster/charts/linkerd-multicluster/values.yaml
   `,
-		RunE: func(cmd *cobra.Command, args []string) error {
-
-			// Wait for the core control-plane to be up and running
-			api.CheckPublicAPIClientOrRetryOrExit(healthcheck.Options{
-				ControlPlaneNamespace: controlPlaneNamespace,
-				KubeConfig:            kubeconfigPath,
-				KubeContext:           kubeContext,
-				Impersonate:           impersonate,
-				ImpersonateGroup:      impersonateGroup,
-				APIAddr:               apiAddr,
-				RetryDeadline:         time.Now().Add(wait),
-			})
-
-			values, err := buildMulticlusterInstallValues(cmd.Context(), options)
-
-			if err != nil {
-				return err
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !ignoreCluster {
+				// Wait for the core control-plane to be up and running
+				hc := healthcheck.NewWithCoreChecks(&healthcheck.Options{
+					ControlPlaneNamespace: controlPlaneNamespace,
+					KubeConfig:            kubeconfigPath,
+					KubeContext:           kubeContext,
+					Impersonate:           impersonate,
+					ImpersonateGroup:      impersonateGroup,
+					APIAddr:               apiAddr,
+					RetryDeadline:         time.Now().Add(wait),
+				})
+				hc.RunWithExitOnError()
+				cniEnabled = hc.CNIEnabled
 			}
-
-			// Render raw values and create chart config
-			rawValues, err := yaml.Marshal(values)
-			if err != nil {
-				return err
-			}
-
-			files := []*chartloader.BufferedFile{
-				{Name: chartutil.ChartfileName},
-				{Name: "templates/namespace.yaml"},
-				{Name: "templates/gateway.yaml"},
-				{Name: "templates/remote-access-service-mirror-rbac.yaml"},
-				{Name: "templates/link-crd.yaml"},
-			}
-
-			var partialFiles []*loader.BufferedFile
-			for _, template := range charts.L5dPartials {
-				partialFiles = append(partialFiles,
-					&loader.BufferedFile{Name: template},
-				)
-			}
-
-			// Load all multicluster install chart files into buffer
-			if err := charts.FilesReader(static.Templates, helmMulticlusterDefaultChartName+"/", files); err != nil {
-				return err
-			}
-
-			// Load all partial chart files into buffer
-			if err := charts.FilesReader(partials.Templates, "", partialFiles); err != nil {
-				return err
-			}
-
-			// Create a Chart obj from the files
-			chart, err := loader.LoadFiles(append(files, partialFiles...))
-			if err != nil {
-				return err
-			}
-
-			// Store final Values generated from values.yaml and CLI flags
-			err = yaml.Unmarshal(rawValues, &chart.Values)
-			if err != nil {
-				return err
-			}
-
-			// Create values override
-			valuesOverrides, err := valuesOptions.MergeValues(nil)
-			if err != nil {
-				return err
-			}
-
-			vals, err := chartutil.CoalesceValues(chart, valuesOverrides)
-			if err != nil {
-				return err
-			}
-
-			// Attach the final values into the `Values` field for rendering to work
-			renderedTemplates, err := engine.Render(chart, map[string]interface{}{"Values": vals})
-			if err != nil {
-				return err
-			}
-
-			// Merge templates and inject
-			var buf bytes.Buffer
-			for _, tmpl := range chart.Templates {
-				t := path.Join(chart.Metadata.Name, tmpl.Name)
-				if _, err := buf.WriteString(renderedTemplates[t]); err != nil {
-					return err
-				}
-			}
-			stdout.Write(buf.Bytes())
-			stdout.Write([]byte("---\n"))
-
-			return nil
+			return install(cmd.Context(), stdout, options, valuesOptions, ha, ignoreCluster, cniEnabled, output)
 		},
 	}
 
 	flags.AddValueOptionsFlags(cmd.Flags(), &valuesOptions)
-	cmd.Flags().StringVar(&options.namespace, "namespace", options.namespace, "The namespace in which the multicluster add-on is to be installed. Must not be the control plane namespace. ")
-	cmd.Flags().BoolVar(&options.gateway, "gateway", options.gateway, "If the gateway component should be installed")
-	cmd.Flags().Uint32Var(&options.gatewayPort, "gateway-port", options.gatewayPort, "The port on the gateway used for all incoming traffic")
-	cmd.Flags().Uint32Var(&options.gatewayProbeSeconds, "gateway-probe-seconds", options.gatewayProbeSeconds, "The interval at which the gateway will be checked for being alive in seconds")
-	cmd.Flags().Uint32Var(&options.gatewayProbePort, "gateway-probe-port", options.gatewayProbePort, "The liveness check port of the gateway")
+	cmd.Flags().BoolVar(&options.gateway.Enabled, "gateway", options.gateway.Enabled, "If the gateway component should be installed")
+	cmd.Flags().Uint32Var(&options.gateway.Port, "gateway-port", options.gateway.Port, "The port on the gateway used for all incoming traffic")
+	cmd.Flags().Uint32Var(&options.gateway.Probe.Seconds, "gateway-probe-seconds", options.gateway.Probe.Seconds, "The interval at which the gateway will be checked for being alive in seconds")
+	cmd.Flags().Uint32Var(&options.gateway.Probe.Port, "gateway-probe-port", options.gateway.Probe.Port, "The liveness check port of the gateway")
 	cmd.Flags().BoolVar(&options.remoteMirrorCredentials, "service-mirror-credentials", options.remoteMirrorCredentials, "Whether to install the service account which can be used by service mirror components in source clusters to discover exported services")
-	cmd.Flags().StringVar(&options.gatewayServiceType, "gateway-service-type", options.gatewayServiceType, "Overwrite Service type for gateway service")
+	cmd.Flags().StringVar(&options.gateway.ServiceType, "gateway-service-type", options.gateway.ServiceType, "Overwrite Service type for gateway service")
+	cmd.Flags().Uint32Var(&options.gateway.HealthCheckNodePort, "gateway-healthcheck-nodeport", options.gateway.HealthCheckNodePort, "Set the healthCheckNodePort on the gateway service (only used when externalTrafficPolicy is Local)")
+	cmd.Flags().BoolVar(&ha, "ha", false, `Install multicluster extension in High Availability mode.`)
 	cmd.Flags().DurationVar(&wait, "wait", 300*time.Second, "Wait for core control-plane components to be available")
+	cmd.Flags().BoolVar(&ignoreCluster, "ignore-cluster", false,
+		"Ignore the current Kubernetes cluster when checking for existing cluster configuration (default false)")
+	cmd.PersistentFlags().StringVarP(&output, "output", "o", "yaml", "Output format. One of: json|yaml")
 
 	// Hide developer focused flags in release builds.
 	release, err := version.IsReleaseChannel(version.Version)
@@ -178,6 +124,108 @@ A full list of configurable values can be found at https://github.com/linkerd/li
 	return cmd
 }
 
+func install(ctx context.Context, w io.Writer, options *multiclusterInstallOptions, valuesOptions valuespkg.Options, ha, ignoreCluster, cniEnabled bool, format string) error {
+	values, err := buildMulticlusterInstallValues(ctx, options, ignoreCluster)
+	if err != nil {
+		return err
+	}
+
+	// Create values override
+	valuesOverrides, err := valuesOptions.MergeValues(nil)
+	if err != nil {
+		return err
+	}
+
+	if ha {
+		valuesOverrides, err = chartspkg.OverrideFromFile(valuesOverrides, charts.Templates, multicluster.HelmDefaultChartDir, "values-ha.yaml")
+		if err != nil {
+			return err
+		}
+	}
+
+	if cniEnabled {
+		valuesOverrides["cniEnabled"] = true
+	}
+
+	return render(w, values, valuesOverrides, format)
+}
+
+func render(w io.Writer, values *multicluster.Values, valuesOverrides map[string]interface{}, format string) error {
+	var files []*loader.BufferedFile
+	for _, template := range TemplatesMulticluster {
+		files = append(files, &loader.BufferedFile{Name: template})
+	}
+
+	// Load all multicluster install chart files into buffer
+	if err := chartspkg.FilesReader(charts.Templates, multicluster.HelmDefaultChartDir+"/", files); err != nil {
+		return err
+	}
+
+	partialFiles, err := chartspkg.LoadPartials()
+	if err != nil {
+		return err
+	}
+
+	// Create a Chart obj from the files
+	chart, err := loader.LoadFiles(append(files, partialFiles...))
+	if err != nil {
+		return err
+	}
+
+	// Render raw values and create chart config
+	rawValues, err := yaml.Marshal(values)
+	if err != nil {
+		return err
+	}
+	// Store final Values generated from values.yaml and CLI flags
+	err = yaml.Unmarshal(rawValues, &chart.Values)
+	if err != nil {
+		return err
+	}
+
+	if reg := os.Getenv(flags.EnvOverrideDockerRegistry); reg != "" {
+		overrideRegistry(chart.Values, "localServiceMirror.image.name", reg, "cr.l5d.io/linkerd/controller")
+
+		if controllers, ok := valuesOverrides["controllers"].([]any); ok {
+			for _, c := range controllers {
+				if controller, ok := c.(map[string]any); ok {
+					overrideRegistry(controller, "image.name", reg, "cr.l5d.io/linkerd/controller")
+				}
+			}
+		}
+	}
+
+	vals, err := chartutil.CoalesceValues(chart, valuesOverrides)
+	if err != nil {
+		return err
+	}
+
+	fullValues := map[string]interface{}{
+		"Values": vals,
+		"Release": map[string]interface{}{
+			"Namespace": defaultMulticlusterNamespace,
+			"Service":   "CLI",
+		},
+	}
+
+	// Attach the final values into the `Values` field for rendering to work
+	renderedTemplates, err := engine.Render(chart, fullValues)
+	if err != nil {
+		return err
+	}
+
+	// Merge templates and inject
+	var buf bytes.Buffer
+	for _, tmpl := range chart.Templates {
+		t := path.Join(chart.Metadata.Name, tmpl.Name)
+		if _, err := buf.WriteString(renderedTemplates[t]); err != nil {
+			return err
+		}
+	}
+
+	return pkgcmd.RenderYAMLAs(&buf, w, format)
+}
+
 func newMulticlusterInstallOptionsWithDefault() (*multiclusterInstallOptions, error) {
 	defaults, err := multicluster.NewInstallValues()
 	if err != nil {
@@ -185,17 +233,32 @@ func newMulticlusterInstallOptionsWithDefault() (*multiclusterInstallOptions, er
 	}
 
 	return &multiclusterInstallOptions{
-		gateway:                 defaults.Gateway,
-		gatewayPort:             defaults.GatewayPort,
-		gatewayProbeSeconds:     defaults.GatewayProbeSeconds,
-		gatewayProbePort:        defaults.GatewayProbePort,
-		namespace:               defaults.Namespace,
+		gateway:                 *defaults.Gateway,
 		remoteMirrorCredentials: true,
-		gatewayServiceType:      defaults.GatewayServiceType,
 	}, nil
 }
 
-func buildMulticlusterInstallValues(ctx context.Context, opts *multiclusterInstallOptions) (*multicluster.Values, error) {
+func buildMulticlusterInstallValues(ctx context.Context, opts *multiclusterInstallOptions, ignoreCluster bool) (*multicluster.Values, error) {
+	defaults, err := multicluster.NewInstallValues()
+	if err != nil {
+		return nil, err
+	}
+
+	defaults.LocalServiceMirror.Image.Version = version.Version
+	defaults.ControllerDefaults.Image.Version = version.Version
+	defaults.Gateway.Enabled = opts.gateway.Enabled
+	defaults.Gateway.Port = opts.gateway.Port
+	defaults.Gateway.Probe.Seconds = opts.gateway.Probe.Seconds
+	defaults.Gateway.Probe.Port = opts.gateway.Probe.Port
+	defaults.LinkerdNamespace = controlPlaneNamespace
+	defaults.LinkerdVersion = version.Version
+	defaults.RemoteMirrorServiceAccount = opts.remoteMirrorCredentials
+	defaults.Gateway.ServiceType = opts.gateway.ServiceType
+	defaults.Gateway.HealthCheckNodePort = opts.gateway.HealthCheckNodePort
+
+	if ignoreCluster {
+		return defaults, nil
+	}
 
 	values, err := getLinkerdConfigMap(ctx)
 	if err != nil {
@@ -204,31 +267,36 @@ func buildMulticlusterInstallValues(ctx context.Context, opts *multiclusterInsta
 		}
 		return nil, err
 	}
-
-	if opts.namespace == "" {
-		return nil, errors.New("you need to specify a namespace")
-	}
-
-	if opts.namespace == controlPlaneNamespace {
-		return nil, errors.New("you need to setup the multicluster addons in a namespace different than the Linkerd one")
-	}
-
-	defaults, err := multicluster.NewInstallValues()
-	if err != nil {
-		return nil, err
-	}
-
-	defaults.Namespace = opts.namespace
-	defaults.Gateway = opts.gateway
-	defaults.GatewayPort = opts.gatewayPort
-	defaults.GatewayProbeSeconds = opts.gatewayProbeSeconds
-	defaults.GatewayProbePort = opts.gatewayProbePort
-	defaults.IdentityTrustDomain = values.IdentityTrustDomain
-	defaults.LinkerdNamespace = controlPlaneNamespace
 	defaults.ProxyOutboundPort = uint32(values.Proxy.Ports.Outbound)
-	defaults.LinkerdVersion = version.Version
-	defaults.RemoteMirrorServiceAccount = opts.remoteMirrorCredentials
-	defaults.GatewayServiceType = opts.gatewayServiceType
+	defaults.IdentityTrustDomain = values.IdentityTrustDomain
 
 	return defaults, nil
+}
+
+// overrideRegistry overrides the image name in the values map at the given
+// keyPath with the given registry. If the keyPath does not exist, it is
+// created.
+func overrideRegistry(values map[string]any, keyPath, reg, defaultImage string) {
+	keys := strings.Split(keyPath, ".")
+	m := values
+
+	// Traverse map using keys, except for the last key
+	for _, key := range keys[:len(keys)-1] {
+		if next, ok := m[key].(map[string]any); ok {
+			m = next
+		} else {
+			newMap := make(map[string]any)
+			m[key] = newMap
+			m = newMap
+		}
+	}
+
+	// Override the last key if it exists and is a string
+	lastKey := keys[len(keys)-1]
+	if val, ok := m[lastKey].(string); ok {
+		m[lastKey] = pkgcmd.RegistryOverride(val, reg)
+	} else {
+		// If the key is missing, initialize it with an empty string before overriding
+		m[lastKey] = pkgcmd.RegistryOverride(defaultImage, reg)
+	}
 }

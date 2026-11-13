@@ -2,18 +2,21 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	pkgK8s "github.com/linkerd/linkerd2/pkg/k8s"
 	pb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
+	"github.com/linkerd/linkerd2/viz/pkg/prometheus"
 	"github.com/prometheus/common/model"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
-	clientIDLabel = model.LabelName("client_id")
 	serverIDLabel = model.LabelName("server_id")
 	resourceLabel = model.LabelName("deployment")
+	podLabel      = model.LabelName("pod")
 )
 
 type edgesExpected struct {
@@ -22,32 +25,39 @@ type edgesExpected struct {
 	expectedResponse *pb.EdgesResponse // the edges response we expect
 }
 
-func genInboundPromSample(resourceNamespace, resourceName, clientID string) *model.Sample {
+func genOutboundPromSample(resourceNamespace, resourceName, resourceNameDst, resourceNamespaceDst, serverID string) *model.Sample {
+	dstResourceLabel := "dst_" + resourceLabel
+
 	return &model.Sample{
 		Metric: model.Metric{
-			resourceLabel:  model.LabelValue(resourceName),
-			namespaceLabel: model.LabelValue(resourceNamespace),
-			clientIDLabel:  model.LabelValue(clientID),
+			resourceLabel:                model.LabelValue(resourceName),
+			prometheus.NamespaceLabel:    model.LabelValue(resourceNamespace),
+			prometheus.DstNamespaceLabel: model.LabelValue(resourceNamespaceDst),
+			dstResourceLabel:             model.LabelValue(resourceNameDst),
+			serverIDLabel:                model.LabelValue(serverID),
+			podLabel:                     model.LabelValue(resourceName + "-0"),
 		},
 		Value:     123,
 		Timestamp: 456,
 	}
 }
 
-func genOutboundPromSample(resourceNamespace, resourceName, resourceNameDst, resourceNamespaceDst, serverID string) *model.Sample {
-	dstResourceLabel := "dst_" + resourceLabel
-
-	return &model.Sample{
-		Metric: model.Metric{
-			resourceLabel:     model.LabelValue(resourceName),
-			namespaceLabel:    model.LabelValue(resourceNamespace),
-			dstNamespaceLabel: model.LabelValue(resourceNamespaceDst),
-			dstResourceLabel:  model.LabelValue(resourceNameDst),
-			serverIDLabel:     model.LabelValue(serverID),
-		},
-		Value:     123,
-		Timestamp: 456,
-	}
+func genPod(name, namespace, sa string) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  containers:
+  - name: linkerd-proxy
+    env:
+    - name: LINKERD2_PROXY_IDENTITY_LOCAL_NAME
+      value: $(_pod_sa).$(_pod_ns).serviceaccount.identity.linkerd.cluster.local
+  serviceAccountName: %s
+status:
+  phase: Running
+`, name, namespace, sa)
 }
 
 func testEdges(t *testing.T, expectations []edgesExpected) {
@@ -58,7 +68,7 @@ func testEdges(t *testing.T, expectations []edgesExpected) {
 		}
 
 		rsp, err := fakeGrpcServer.Edges(context.TODO(), exp.req)
-		if err != exp.err {
+		if !errors.Is(err, exp.err) {
 			t.Fatalf("Expected error: %s, Got: %s", exp.err, err)
 		}
 
@@ -94,15 +104,15 @@ func testEdges(t *testing.T, expectations []edgesExpected) {
 
 func TestEdges(t *testing.T) {
 	mockPromResponse := model.Vector{
-		genInboundPromSample("emojivoto", "emoji", "web.emojivoto.serviceaccount.identity.linkerd.cluster.local"),
-		genInboundPromSample("emojivoto", "voting", "web.emojivoto.serviceaccount.identity.linkerd.cluster.local"),
-		genInboundPromSample("emojivoto", "web", "default.emojivoto.serviceaccount.identity.linkerd.cluster.local"),
-		genInboundPromSample("linkerd", "linkerd-prometheus", "linkerd-identity.linkerd.identity.linkerd.cluster.local"),
-
 		genOutboundPromSample("emojivoto", "web", "emoji", "emojivoto", "emoji.emojivoto.serviceaccount.identity.linkerd.cluster.local"),
 		genOutboundPromSample("emojivoto", "web", "voting", "emojivoto", "voting.emojivoto.serviceaccount.identity.linkerd.cluster.local"),
 		genOutboundPromSample("emojivoto", "vote-bot", "web", "emojivoto", "web.emojivoto.serviceaccount.identity.linkerd.cluster.local"),
-		genOutboundPromSample("linkerd", "linkerd-identity", "linkerd-prometheus", "linkerd", "linkerd-prometheus.linkerd.identity.linkerd.cluster.local"),
+		genOutboundPromSample("linkerd", "linkerd-identity", "linkerd-prometheus", "linkerd", "linkerd-prometheus.linkerd.serviceaccount.identity.linkerd.cluster.local"),
+	}
+	pods := []string{
+		genPod("web-0", "emojivoto", "web"),
+		genPod("vote-bot-0", "emojivoto", "default"),
+		genPod("linkerd-identity-0", "linkerd", "linkerd-identity"),
 	}
 
 	t.Run("Successfully returns edges for resource type Deployment and namespace emojivoto", func(t *testing.T) {
@@ -111,6 +121,7 @@ func TestEdges(t *testing.T) {
 				expectedStatRPC: expectedStatRPC{
 					err:              nil,
 					mockPromResponse: mockPromResponse,
+					k8sConfigs:       pods,
 				},
 				req: &pb.EdgesRequest{
 					Selector: &pb.ResourceSelection{
@@ -132,6 +143,7 @@ func TestEdges(t *testing.T) {
 				expectedStatRPC: expectedStatRPC{
 					err:              nil,
 					mockPromResponse: mockPromResponse,
+					k8sConfigs:       pods,
 				},
 				req: &pb.EdgesRequest{
 					Selector: &pb.ResourceSelection{
@@ -153,6 +165,7 @@ func TestEdges(t *testing.T) {
 				expectedStatRPC: expectedStatRPC{
 					err:              nil,
 					mockPromResponse: mockPromResponse,
+					k8sConfigs:       pods,
 				},
 				req: &pb.EdgesRequest{
 					Selector: &pb.ResourceSelection{

@@ -6,21 +6,30 @@ import (
 	"os"
 	"strings"
 
-	"github.com/linkerd/linkerd2/pkg/charts"
+	"github.com/linkerd/linkerd2/charts"
+	chartspkg "github.com/linkerd/linkerd2/pkg/charts"
 	cnicharts "github.com/linkerd/linkerd2/pkg/charts/cni"
-	"github.com/linkerd/linkerd2/pkg/charts/static"
+	"github.com/linkerd/linkerd2/pkg/cmd"
+	"github.com/linkerd/linkerd2/pkg/flags"
 	"github.com/linkerd/linkerd2/pkg/version"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/chartutil"
-	"sigs.k8s.io/yaml"
+	"helm.sh/helm/v3/pkg/cli/values"
 )
 
 const (
 	helmCNIDefaultChartName = "linkerd2-cni"
 	helmCNIDefaultChartDir  = "linkerd2-cni"
 )
+
+type cniPluginImage struct {
+	name       string
+	version    string
+	pullPolicy interface{}
+}
 
 type cniPluginOptions struct {
 	linkerdVersion      string
@@ -33,13 +42,13 @@ type cniPluginOptions struct {
 	ignoreOutboundPorts []string
 	portsToRedirect     []uint
 	proxyUID            int64
-	cniPluginImage      string
+	proxyGID            int64
+	image               cniPluginImage
 	logLevel            string
 	destCNINetDir       string
 	destCNIBinDir       string
 	useWaitFlag         bool
 	priorityClassName   string
-	installNamespace    bool
 }
 
 func (options *cniPluginOptions) validate() error {
@@ -52,7 +61,7 @@ func (options *cniPluginOptions) validate() error {
 	}
 
 	if _, err := log.ParseLevel(options.logLevel); err != nil {
-		return fmt.Errorf("--cni-log-level must be one of: panic, fatal, error, warn, info, debug")
+		return fmt.Errorf("--cni-log-level must be one of: panic, fatal, error, warn, info, debug, trace")
 	}
 
 	if err := validateRangeSlice(options.ignoreInboundPorts); err != nil {
@@ -65,19 +74,31 @@ func (options *cniPluginOptions) validate() error {
 	return nil
 }
 
-func (options *cniPluginOptions) pluginImage() string {
-	if options.dockerRegistry != defaultDockerRegistry {
-		return registryOverride(options.cniPluginImage, options.dockerRegistry)
+func (options *cniPluginOptions) pluginImage() cnicharts.Image {
+	image := cnicharts.Image{
+		Name:       options.image.name,
+		Version:    options.image.version,
+		PullPolicy: options.image.pullPolicy,
 	}
-	return options.cniPluginImage
+	// env var overrides CLI flag
+	if override := os.Getenv(flags.EnvOverrideDockerRegistry); override != "" {
+		image.Name = cmd.RegistryOverride(options.image.name, override)
+		return image
+	}
+	if options.dockerRegistry != cmd.DefaultDockerRegistry {
+		image.Name = cmd.RegistryOverride(options.image.name, options.dockerRegistry)
+		return image
+	}
+	return image
 }
 
 func newCmdInstallCNIPlugin() *cobra.Command {
 	options, err := newCNIInstallOptionsWithDefaults()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	var valOpts values.Options
 
 	cmd := &cobra.Command{
 		Use:   "install-cni [flags]",
@@ -88,15 +109,19 @@ This command installs a DaemonSet into the Linkerd control plane. The DaemonSet
 copies the necessary linkerd-cni plugin binaries and configs onto the host. It
 assumes that the 'linkerd install' command will be executed with the
 '--linkerd-cni-enabled' flag. This command needs to be executed before the
-'linkerd install --linkerd-cni-enabled' command.`,
+'linkerd install --linkerd-cni-enabled' command.
+
+The installation can be configured by using the --set, --values, --set-string and --set-file flags. A full list of configurable values can be found at https://artifacthub.io/packages/helm/linkerd2/linkerd2-cni#values`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return renderCNIPlugin(os.Stdout, options)
+			return renderCNIPlugin(os.Stdout, valOpts, options)
 		},
 	}
 
 	cmd.PersistentFlags().StringVarP(&options.linkerdVersion, "linkerd-version", "v", options.linkerdVersion, "Tag to be used for Linkerd images")
-	cmd.PersistentFlags().StringVar(&options.dockerRegistry, "registry", options.dockerRegistry, "Docker registry to pull images from")
+	cmd.PersistentFlags().StringVar(&options.dockerRegistry, "registry", options.dockerRegistry,
+		fmt.Sprintf("Docker registry to pull images from ($%s)", flags.EnvOverrideDockerRegistry))
 	cmd.PersistentFlags().Int64Var(&options.proxyUID, "proxy-uid", options.proxyUID, "Run the proxy under this user ID")
+	cmd.PersistentFlags().Int64Var(&options.proxyGID, "proxy-gid", options.proxyGID, "Run the proxy under this group ID")
 	cmd.PersistentFlags().UintVar(&options.inboundPort, "inbound-port", options.inboundPort, "Proxy port to use for inbound traffic")
 	cmd.PersistentFlags().UintVar(&options.outboundPort, "outbound-port", options.outboundPort, "Proxy port to use for outbound traffic")
 	cmd.PersistentFlags().UintVar(&options.proxyControlPort, "control-port", options.proxyControlPort, "Proxy port to use for control")
@@ -104,17 +129,19 @@ assumes that the 'linkerd install' command will be executed with the
 	cmd.PersistentFlags().StringSliceVar(&options.ignoreInboundPorts, "skip-inbound-ports", options.ignoreInboundPorts, "Ports and/or port ranges (inclusive) that should skip the proxy and send directly to the application")
 	cmd.PersistentFlags().StringSliceVar(&options.ignoreOutboundPorts, "skip-outbound-ports", options.ignoreOutboundPorts, "Outbound ports and/or port ranges (inclusive) that should skip the proxy")
 	cmd.PersistentFlags().UintSliceVar(&options.portsToRedirect, "redirect-ports", options.portsToRedirect, "Ports to redirect to proxy, if no port is specified then ALL ports are redirected")
-	cmd.PersistentFlags().StringVar(&options.cniPluginImage, "cni-image", options.cniPluginImage, "Image for the cni-plugin")
+	cmd.PersistentFlags().StringVar(&options.image.name, "cni-image", options.image.name, "Image for the cni-plugin")
+	cmd.PersistentFlags().StringVar(&options.image.version, "cni-image-version", options.image.version, "Image Version for the cni-plugin")
 	cmd.PersistentFlags().StringVar(&options.logLevel, "cni-log-level", options.logLevel, "Log level for the cni-plugin")
 	cmd.PersistentFlags().StringVar(&options.destCNINetDir, "dest-cni-net-dir", options.destCNINetDir, "Directory on the host where the CNI configuration will be placed")
 	cmd.PersistentFlags().StringVar(&options.destCNIBinDir, "dest-cni-bin-dir", options.destCNIBinDir, "Directory on the host where the CNI binary will be placed")
 	cmd.PersistentFlags().StringVar(&options.priorityClassName, "priority-class-name", options.priorityClassName, "Pod priorityClassName for CNI daemonset's pods")
-	cmd.PersistentFlags().BoolVar(&options.installNamespace, "install-namespace", options.installNamespace, "Whether to create the CNI namespace or not")
 	cmd.PersistentFlags().BoolVar(
 		&options.useWaitFlag,
 		"use-wait-flag",
 		options.useWaitFlag,
 		"Configures the CNI plugin to use the \"-w\" flag for the iptables command. (default false)")
+
+	flags.AddValueOptionsFlags(cmd.Flags(), &valOpts)
 
 	return cmd
 }
@@ -124,9 +151,15 @@ func newCNIInstallOptionsWithDefaults() (*cniPluginOptions, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	cniPluginImage := cniPluginImage{
+		name:    cmd.DefaultDockerRegistry + "/cni-plugin",
+		version: version.LinkerdCNIVersion,
+	}
+
 	cniOptions := cniPluginOptions{
 		linkerdVersion:      version.Version,
-		dockerRegistry:      defaultDockerRegistry,
+		dockerRegistry:      cmd.DefaultDockerRegistry,
 		proxyControlPort:    4190,
 		proxyAdminPort:      4191,
 		inboundPort:         defaults.InboundProxyPort,
@@ -134,13 +167,13 @@ func newCNIInstallOptionsWithDefaults() (*cniPluginOptions, error) {
 		ignoreInboundPorts:  nil,
 		ignoreOutboundPorts: nil,
 		proxyUID:            defaults.ProxyUID,
-		cniPluginImage:      defaultDockerRegistry + "/cni-plugin",
+		proxyGID:            defaults.ProxyGID,
+		image:               cniPluginImage,
 		logLevel:            "info",
 		destCNINetDir:       defaults.DestCNINetDir,
 		destCNIBinDir:       defaults.DestCNIBinDir,
 		useWaitFlag:         defaults.UseWaitFlag,
 		priorityClassName:   defaults.PriorityClassName,
-		installNamespace:    defaults.InstallNamespace,
 	}
 
 	if defaults.IgnoreInboundPorts != "" {
@@ -160,39 +193,35 @@ func (options *cniPluginOptions) buildValues() (*cnicharts.Values, error) {
 		return nil, err
 	}
 
-	ignoreInboundPorts := []string{
-		fmt.Sprintf("%d", options.proxyControlPort),
-		fmt.Sprintf("%d", options.proxyAdminPort),
-	}
-
-	ignoreInboundPorts = append(ignoreInboundPorts, options.ignoreInboundPorts...)
-
 	portsToRedirect := []string{}
 	for _, p := range options.portsToRedirect {
 		portsToRedirect = append(portsToRedirect, fmt.Sprintf("%d", p))
 	}
 
-	installValues.CNIPluginImage = options.pluginImage()
-	installValues.CNIPluginVersion = options.linkerdVersion
+	installValues.Image = options.pluginImage()
 	installValues.LogLevel = options.logLevel
 	installValues.InboundProxyPort = options.inboundPort
 	installValues.OutboundProxyPort = options.outboundPort
-	installValues.IgnoreInboundPorts = strings.Join(ignoreInboundPorts, ",")
+	installValues.IgnoreInboundPorts = strings.Join(options.ignoreInboundPorts, ",")
 	installValues.IgnoreOutboundPorts = strings.Join(options.ignoreOutboundPorts, ",")
 	installValues.PortsToRedirect = strings.Join(portsToRedirect, ",")
 	installValues.ProxyUID = options.proxyUID
+	installValues.ProxyGID = options.proxyGID
 	installValues.DestCNINetDir = options.destCNINetDir
 	installValues.DestCNIBinDir = options.destCNIBinDir
 	installValues.UseWaitFlag = options.useWaitFlag
-	installValues.Namespace = cniNamespace
 	installValues.PriorityClassName = options.priorityClassName
-	installValues.InstallNamespace = options.installNamespace
 	return installValues, nil
 }
 
-func renderCNIPlugin(w io.Writer, config *cniPluginOptions) error {
+func renderCNIPlugin(w io.Writer, valOpts values.Options, config *cniPluginOptions) error {
 
 	if err := config.validate(); err != nil {
+		return err
+	}
+
+	valuesOverrides, err := valOpts.MergeValues(nil)
+	if err != nil {
 		return err
 	}
 
@@ -201,8 +230,16 @@ func renderCNIPlugin(w io.Writer, config *cniPluginOptions) error {
 		return err
 	}
 
-	// Render raw values and create chart config
-	rawValues, err := yaml.Marshal(values)
+	mapValues, err := values.ToMap()
+	if err != nil {
+		return err
+	}
+
+	valuesWrapper := &chart.Chart{
+		Metadata: &chart.Metadata{Name: ""},
+		Values:   mapValues,
+	}
+	mergedValues, err := chartutil.CoalesceValues(valuesWrapper, valuesOverrides)
 	if err != nil {
 		return err
 	}
@@ -212,15 +249,16 @@ func renderCNIPlugin(w io.Writer, config *cniPluginOptions) error {
 		{Name: "templates/cni-plugin.yaml"},
 	}
 
-	chart := &charts.Chart{
+	ch := &chartspkg.Chart{
 		Name:      helmCNIDefaultChartName,
 		Dir:       helmCNIDefaultChartDir,
-		Namespace: controlPlaneNamespace,
-		RawValues: rawValues,
+		Namespace: defaultCNINamespace,
+		Values:    mergedValues,
 		Files:     files,
-		Fs:        static.Templates,
+		Fs:        charts.Templates,
 	}
-	buf, err := chart.RenderCNI()
+
+	buf, err := ch.RenderCNI()
 	if err != nil {
 		return err
 	}

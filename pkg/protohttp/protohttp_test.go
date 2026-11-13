@@ -6,17 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
-	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"github.com/go-test/deep"
 	metricsPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -103,10 +103,11 @@ func TestHttpRequestToProto(t *testing.T) {
 			t.Fatalf("Expecting error, got nothing")
 		}
 
-		if httpErr, ok := err.(HTTPError); ok {
+		var he HTTPError
+		if errors.As(err, &he) {
 			expectedStatusCode := http.StatusBadRequest
-			if httpErr.Code != expectedStatusCode || httpErr.WrappedError == nil {
-				t.Fatalf("Expected error status to be [%d] and contain wrapper error, got status [%d] and error [%v]", expectedStatusCode, httpErr.Code, httpErr.WrappedError)
+			if he.Code != expectedStatusCode || he.WrappedError == nil {
+				t.Fatalf("Expected error status to be [%d] and contain wrapper error, got status [%d] and error [%s]", expectedStatusCode, he.Code, he.WrappedError)
 			}
 		} else {
 			t.Fatalf("Expected error to be httpError, got: %v", err)
@@ -186,7 +187,7 @@ func TestWriteErrorToHttpResponse(t *testing.T) {
 
 		responseWriter := newStubResponseWriter()
 		expectedErrorMessage := "error message"
-		grpcError := status.Errorf(codes.AlreadyExists, expectedErrorMessage)
+		grpcError := status.Error(codes.AlreadyExists, expectedErrorMessage)
 
 		WriteErrorToHTTPResponse(responseWriter, grpcError)
 
@@ -235,12 +236,12 @@ func TestDeserializePayloadFromReader(t *testing.T) {
 	t.Run("Can multiple messages in the same stream", func(t *testing.T) {
 		expectedMessage1 := "Hit the road, Jack and don't you come back\n"
 		for i := 0; i < 450; i++ {
-			expectedMessage1 = expectedMessage1 + fmt.Sprintf("no more (%d), ", i)
+			expectedMessage1 += fmt.Sprintf("no more (%d), ", i)
 		}
 
 		expectedMessage2 := "back street back, alright\n"
 		for i := 0; i < 450; i++ {
-			expectedMessage2 = expectedMessage2 + fmt.Sprintf("tum (%d), ", i)
+			expectedMessage2 += fmt.Sprintf("tum (%d), ", i)
 		}
 
 		messageWithSize1 := SerializeAsPayload([]byte(expectedMessage1))
@@ -272,7 +273,7 @@ func TestDeserializePayloadFromReader(t *testing.T) {
 		goDefaultChunkSize := 4000
 		expectedMessage := "Hit the road, Jack and don't you come back\n"
 		for i := 0; i < 450; i++ {
-			expectedMessage = expectedMessage + fmt.Sprintf("no more (%d), ", i)
+			expectedMessage += fmt.Sprintf("no more (%d), ", i)
 		}
 
 		expectedMessageAsBytes := []byte(expectedMessage)
@@ -362,7 +363,7 @@ func TestCheckIfResponseHasError(t *testing.T) {
 		message := SerializeAsPayload(protoInBytes)
 		response := &http.Response{
 			Header:     make(http.Header),
-			Body:       ioutil.NopCloser(bytes.NewReader(message)),
+			Body:       io.NopCloser(bytes.NewReader(message)),
 			StatusCode: http.StatusInternalServerError,
 		}
 		response.Header.Set(errorHeader, "error")
@@ -393,7 +394,7 @@ func TestCheckIfResponseHasError(t *testing.T) {
 
 		response := &http.Response{
 			Header:     make(http.Header),
-			Body:       ioutil.NopCloser(bytes.NewReader(j)),
+			Body:       io.NopCloser(bytes.NewReader(j)),
 			StatusCode: http.StatusForbidden,
 			Status:     "403 Forbidden",
 		}
@@ -401,8 +402,8 @@ func TestCheckIfResponseHasError(t *testing.T) {
 		err = CheckIfResponseHasError(response)
 		expectedErr := HTTPError{Code: http.StatusForbidden, WrappedError: statusError}
 
-		if !reflect.DeepEqual(err, expectedErr) {
-			t.Fatalf("Expected %s, got %s", expectedErr, err)
+		if diff := deep.Equal(err, expectedErr); diff != nil {
+			t.Fatalf("%v", diff)
 		}
 	})
 

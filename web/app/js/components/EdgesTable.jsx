@@ -1,13 +1,13 @@
-import BaseTable from './BaseTable.jsx';
 import CheckCircleOutline from '@material-ui/icons/CheckCircleOutline';
 import PropTypes from 'prop-types';
 import React from 'react';
 import Tooltip from '@material-ui/core/Tooltip';
 import { Trans } from '@lingui/macro';
 import WarningIcon from '@material-ui/icons/Warning';
+import { withStyles } from '@material-ui/core/styles';
 import { directionColumn } from './util/TapUtils.jsx';
 import { processedEdgesPropType } from './util/EdgesUtils.jsx';
-import { withStyles } from '@material-ui/core/styles';
+import BaseTable from './BaseTable.jsx';
 
 const styles = theme => ({
   secure: {
@@ -95,7 +95,7 @@ const generateEdgesTableTitle = edges => {
   return title;
 };
 
-const EdgesTable = ({ edges, api, namespace, type, classes }) => {
+const EdgesTable = function({ edges, api, namespace, type, classes }) {
   const edgesColumns = edgesColumnDefinitions(api.PrefixedLink, namespace, type, classes);
   const edgesTableTitle = generateEdgesTableTitle(edges);
 

@@ -16,8 +16,8 @@ import React from 'react';
 import { Trans } from '@lingui/macro';
 import Typography from '@material-ui/core/Typography';
 import _isEmpty from 'lodash/isEmpty';
-import { withContext } from './util/AppContext.jsx';
 import { withStyles } from '@material-ui/core/styles';
+import { withContext } from './util/AppContext.jsx';
 
 const styles = theme => ({
   button: {
@@ -210,7 +210,7 @@ class ConfigureProfilesMsg extends React.Component {
         </Dialog>
       </React.Fragment>
     );
-  }
+  };
 
   render() {
     const { showAsIcon } = this.props;

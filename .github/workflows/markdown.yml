@@ -1,0 +1,23 @@
+name: markdown
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/markdown.yml
+      - "**/*.md"
+
+jobs:
+  markdownlint:
+    timeout-minutes: 5
+    runs-on: ${{ vars.LINKERD2_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff
+        with:
+          globs: |
+            **/*.md
+            !**/node_modules/**
+            !target/**

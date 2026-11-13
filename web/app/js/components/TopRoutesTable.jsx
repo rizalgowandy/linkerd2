@@ -1,8 +1,8 @@
-import BaseTable from './BaseTable.jsx';
 import PropTypes from 'prop-types';
 import React from 'react';
-import SuccessRateMiniChart from './util/SuccessRateMiniChart.jsx';
 import { Trans } from '@lingui/macro';
+import SuccessRateMiniChart from './util/SuccessRateMiniChart.jsx';
+import BaseTable from './BaseTable.jsx';
 import { metricToFormatter } from './util/Utils.js';
 
 const routesColumns = [
@@ -56,16 +56,18 @@ const routesColumns = [
   },
 ];
 
-const TopRoutesTable = ({ rows }) => (
-  <BaseTable
-    enableFilter
-    tableRows={rows}
-    tableColumns={routesColumns}
-    tableClassName="metric-table"
-    defaultOrderBy="route"
-    rowKey={r => r.route + r.authority}
-    padding="dense" />
-);
+const TopRoutesTable = function TopRoutesTable({ rows }) {
+  return (
+    <BaseTable
+      enableFilter
+      tableRows={rows}
+      tableColumns={routesColumns}
+      tableClassName="metric-table"
+      defaultOrderBy="route"
+      rowKey={r => r.route + r.authority}
+      padding="dense" />
+  );
+};
 
 TopRoutesTable.propTypes = {
   rows: PropTypes.arrayOf(PropTypes.shape({})),

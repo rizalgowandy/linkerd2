@@ -3,6 +3,9 @@
 #   helm install -f values.yaml -f values-ha.yaml
 
 enablePodAntiAffinity: true
+enablePodDisruptionBudget: true
+
+# nodeAffinity:
 
 resources: &ha_resources
   cpu: &ha_resources_cpu
@@ -21,14 +24,6 @@ tap:
 # web configuration
 dashboard:
   resources: *ha_resources
-
-# grafana configuration
-grafana:
-  resources:
-    cpu: *ha_resources_cpu
-    memory:
-      limit: 1024Mi
-      request: 50Mi
 
 # prometheus configuration
 prometheus:

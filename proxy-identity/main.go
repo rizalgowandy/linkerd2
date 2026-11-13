@@ -6,36 +6,25 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
-	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
-	"github.com/linkerd/linkerd2/pkg/flags"
 	"github.com/linkerd/linkerd2/pkg/tls"
 	log "github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
 const (
-	envDisabled     = "LINKERD2_PROXY_IDENTITY_DISABLED"
+	envDir          = "LINKERD2_PROXY_IDENTITY_DIR"
+	envLocalName    = "LINKERD2_PROXY_IDENTITY_LOCAL_NAME"
 	envTrustAnchors = "LINKERD2_PROXY_IDENTITY_TRUST_ANCHORS"
 )
 
 func main() {
-	cmd := flag.NewFlagSet("public-api", flag.ExitOnError)
-
-	name := cmd.String("name", "", "identity name")
-	dir := cmd.String("dir", "", "directory under which credentials are written")
-
-	flags.ConfigureAndParse(cmd, os.Args[1:])
-
-	if os.Getenv(envDisabled) != "" {
-		log.Debug("Identity disabled.")
-		os.Exit(0)
-	}
-
-	keyPath, csrPath, err := checkEndEntityDir(*dir)
+	dir := os.Getenv(envDir)
+	keyPath, csrPath, err := checkEndEntityDir(dir)
 	if err != nil {
 		log.Fatalf("Invalid end-entity directory: %s", err)
 	}
@@ -49,9 +38,12 @@ func main() {
 		log.Fatal(err.Error())
 	}
 
-	if _, err := generateAndStoreCSR(csrPath, *name, key); err != nil {
+	name := os.Getenv(envLocalName)
+	if _, err := generateAndStoreCSR(csrPath, name, key); err != nil {
 		log.Fatal(err.Error())
 	}
+
+	runProxy()
 }
 
 func loadVerifier(pem string) (verify x509.VerifyOptions, err error) {
@@ -121,14 +113,17 @@ func generateAndStoreKey(p string) (key *ecdsa.PrivateKey, err error) {
 	}
 
 	pemb := tls.EncodePrivateKeyP8(key)
-	err = ioutil.WriteFile(p, pemb, 0600)
+	err = os.WriteFile(p, pemb, 0600)
 	return
 }
 
 func generateAndStoreCSR(p, id string, key *ecdsa.PrivateKey) ([]byte, error) {
-	// TODO do proper DNS name validation.
 	if id == "" {
 		return nil, errors.New("a non-empty identity is required")
+	}
+
+	if err := validation.IsFullyQualifiedDomainName(field.NewPath(""), id).ToAggregate(); err != nil {
+		return nil, fmt.Errorf("%s a fully qualified DNS name is required", id)
 	}
 
 	csr := x509.CertificateRequest{
@@ -137,11 +132,11 @@ func generateAndStoreCSR(p, id string, key *ecdsa.PrivateKey) ([]byte, error) {
 	}
 	csrb, err := x509.CreateCertificateRequest(rand.Reader, &csr, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create CSR: %s", err)
+		return nil, fmt.Errorf("failed to create CSR: %w", err)
 	}
 
-	if err = ioutil.WriteFile(p, csrb, 0600); err != nil {
-		return nil, fmt.Errorf("failed to write CSR: %s", err)
+	if err = os.WriteFile(p, csrb, 0600); err != nil {
+		return nil, fmt.Errorf("failed to write CSR: %w", err)
 	}
 
 	return csrb, nil

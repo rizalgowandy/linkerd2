@@ -5,28 +5,31 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"reflect"
 	"testing"
 
+	"github.com/go-test/deep"
 	"github.com/linkerd/linkerd2/controller/k8s"
 	k8sutils "github.com/linkerd/linkerd2/pkg/k8s"
+	pkgTls "github.com/linkerd/linkerd2/pkg/tls"
 )
 
 func TestAPIServerAuth(t *testing.T) {
 	expectations := []struct {
-		k8sRes         []string
-		clientCAPem    string
-		allowedNames   []string
-		usernameHeader string
-		groupHeader    string
-		err            error
+		k8sRes            []string
+		clientCAPem       string
+		allowedNames      []string
+		usernameHeader    string
+		groupHeader       string
+		extraHeaderPrefix string
+		err               error
 	}{
 		{
-			err: fmt.Errorf("failed to load [%s] config: configmaps \"%s\" not found", k8sutils.ExtensionAPIServerAuthenticationConfigMapName, k8sutils.ExtensionAPIServerAuthenticationConfigMapName),
+			err: fmt.Errorf("failed to load [%s] config: configmaps %q not found", k8sutils.ExtensionAPIServerAuthenticationConfigMapName, k8sutils.ExtensionAPIServerAuthenticationConfigMapName),
 		},
 		{
 			k8sRes: []string{`
@@ -44,11 +47,29 @@ data:
   requestheader-username-headers: '["X-Remote-User"]'
 `,
 			},
-			clientCAPem:    "requestheader-client-ca-file",
-			allowedNames:   []string{"name1", "name2"},
-			usernameHeader: "X-Remote-User",
-			groupHeader:    "X-Remote-Group",
-			err:            nil,
+			clientCAPem:       "requestheader-client-ca-file",
+			allowedNames:      []string{"name1", "name2"},
+			usernameHeader:    "X-Remote-User",
+			groupHeader:       "X-Remote-Group",
+			extraHeaderPrefix: "X-Remote-Extra-",
+			err:               nil,
+		},
+		{
+			k8sRes: []string{`
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: extension-apiserver-authentication
+  namespace: kube-system
+data:
+  requestheader-client-ca-file: 'requestheader-client-ca-file'
+`},
+			clientCAPem:       "requestheader-client-ca-file",
+			allowedNames:      nil,
+			usernameHeader:    "",
+			groupHeader:       "",
+			extraHeaderPrefix: defaultExtraHeaderPrefix,
+			err:               nil,
 		},
 	}
 
@@ -62,21 +83,32 @@ data:
 				t.Fatalf("NewFakeAPI returned an error: %s", err)
 			}
 
-			clientCAPem, allowedNames, usernameHeader, groupHeader, err := serverAuth(ctx, k8sAPI)
-			if !reflect.DeepEqual(err, exp.err) {
-				t.Errorf("apiServerAuth returned unexpected error: %s, expected: %s", err, exp.err)
+			clientCAPem, allowedNames, usernameHeader, groupHeader, extraHeaderPrefix, err := serverAuth(ctx, k8sAPI)
+
+			if err != nil && exp.err != nil {
+				if err.Error() != exp.err.Error() {
+					t.Errorf("apiServerAuth returned unexpected error: %q, expected: %q", err, exp.err)
+				}
+			} else if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			} else if exp.err != nil {
+				t.Fatalf("Did not encounter expected error: %s", err)
 			}
+
 			if clientCAPem != exp.clientCAPem {
-				t.Errorf("apiServerAuth returned unexpected clientCAPem: %s, expected: %s", clientCAPem, exp.clientCAPem)
+				t.Errorf("apiServerAuth returned unexpected clientCAPem: %q, expected: %q", clientCAPem, exp.clientCAPem)
 			}
-			if !reflect.DeepEqual(allowedNames, exp.allowedNames) {
-				t.Errorf("apiServerAuth returned unexpected allowedNames: %s, expected: %s", allowedNames, exp.allowedNames)
+			if diff := deep.Equal(allowedNames, exp.allowedNames); diff != nil {
+				t.Errorf("%v", diff)
 			}
 			if usernameHeader != exp.usernameHeader {
-				t.Errorf("apiServerAuth returned unexpected usernameHeader: %s, expected: %s", usernameHeader, exp.usernameHeader)
+				t.Errorf("apiServerAuth returned unexpected usernameHeader: %q, expected: %q", usernameHeader, exp.usernameHeader)
 			}
 			if groupHeader != exp.groupHeader {
-				t.Errorf("apiServerAuth returned unexpected groupHeader: %s, expected: %s", groupHeader, exp.groupHeader)
+				t.Errorf("apiServerAuth returned unexpected groupHeader: %q, expected: %q", groupHeader, exp.groupHeader)
+			}
+			if extraHeaderPrefix != exp.extraHeaderPrefix {
+				t.Errorf("apiServerAuth returned unexpected extraHeaderPrefix: %q, expected: %q", extraHeaderPrefix, exp.extraHeaderPrefix)
 			}
 		})
 	}
@@ -135,6 +167,67 @@ func TestValidate_ClientNotAllowed(t *testing.T) {
 	server := Server{allowedNames: []string{"name-trusted"}}
 	if err := server.validate(&req); err == nil {
 		t.Fatalf("Expected request to be rejected for %q", cert.Subject.CommonName)
+	}
+}
+
+func TestValidate_NoTLS(t *testing.T) {
+	testCases := []struct {
+		name         string
+		allowedNames []string
+	}{
+		{name: "any name allowed", allowedNames: nil},
+		{name: "names restricted", allowedNames: []string{"name-trusted"}},
+	}
+
+	for _, tc := range testCases {
+		tc := tc // pin
+		t.Run(tc.name, func(t *testing.T) {
+			req := http.Request{}
+
+			server := Server{allowedNames: tc.allowedNames}
+			if err := server.validate(&req); !errors.Is(err, errNoTLS) {
+				t.Fatalf("Expected %q but encountered %v", errNoTLS, err)
+			}
+		})
+	}
+}
+
+func TestValidate_NoClientCertificate(t *testing.T) {
+	req := http.Request{TLS: &tls.ConnectionState{}}
+
+	server := Server{allowedNames: []string{"name-trusted"}}
+	if err := server.validate(&req); err == nil {
+		t.Fatal("Expected request without a client certificate to be rejected")
+	}
+}
+
+func TestNewClientCertPool(t *testing.T) {
+	ca, err := pkgTls.GenerateRootCAWithDefaults("client-ca")
+	if err != nil {
+		t.Fatalf("Failed to generate CA: %s", err)
+	}
+
+	testCases := []struct {
+		name        string
+		clientCAPem string
+		err         error
+	}{
+		{name: "valid PEM", clientCAPem: pkgTls.EncodeCertificatesPEM(ca.Cred.Crt.Certificate)},
+		{name: "empty", clientCAPem: "", err: errDidNotAppendCert},
+		{name: "not PEM", clientCAPem: "requestheader-client-ca-file", err: errDidNotAppendCert},
+	}
+
+	for _, tc := range testCases {
+		tc := tc // pin
+		t.Run(tc.name, func(t *testing.T) {
+			pool, err := newClientCertPool(tc.clientCAPem)
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("Expected error %v but encountered %v", tc.err, err)
+			}
+			if tc.err == nil && pool == nil {
+				t.Fatal("Expected a cert pool")
+			}
+		})
 	}
 }
 

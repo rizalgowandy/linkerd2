@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"io"
 
@@ -17,6 +18,7 @@ func main() {
 	addr := flag.String("addr", ":8086", "address of destination service")
 	path := flag.String("path", "strest-server.default.svc.cluster.local:8888", "destination path")
 	method := flag.String("method", "get", "which gRPC method to invoke")
+	token := flag.String("token", "", "context token")
 	flag.Parse()
 
 	client, conn, err := destination.NewClient(*addr)
@@ -26,8 +28,9 @@ func main() {
 	defer conn.Close()
 
 	req := &pb.GetDestination{
-		Scheme: "k8s",
-		Path:   *path,
+		Scheme:       "k8s",
+		Path:         *path,
+		ContextToken: *token,
 	}
 
 	switch *method {
@@ -36,6 +39,7 @@ func main() {
 	case "getProfile":
 		getProfile(client, req)
 	default:
+		//nolint:gocritic
 		log.Fatalf("Unknown method: %s; supported methods: get, getProfile", *method)
 	}
 }
@@ -48,10 +52,10 @@ func get(client pb.DestinationClient, req *pb.GetDestination) {
 
 	for {
 		update, err := rsp.Recv()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			log.Fatal(err.Error())
 		}
 
@@ -60,7 +64,7 @@ func get(client pb.DestinationClient, req *pb.GetDestination) {
 			log.Println("Add:")
 			log.Printf("labels: %v", updateType.Add.MetricLabels)
 			for _, addr := range updateType.Add.Addrs {
-				log.Printf("- %s:%d", addrUtil.ProxyIPToString(addr.Addr.GetIp()), addr.Addr.Port)
+				log.Printf("- %s:%d", addrUtil.ProxyAddressToString(addr.Addr), addr.Addr.Port)
 				log.Printf("  - labels: %v", addr.MetricLabels)
 				switch addr.GetProtocolHint().GetProtocol().(type) {
 				case *pb.ProtocolHint_H2_:
@@ -69,12 +73,16 @@ func get(client pb.DestinationClient, req *pb.GetDestination) {
 					log.Printf("  - protocol hint: UNKNOWN")
 				}
 				log.Printf("  - identity: %s", addr.GetTlsIdentity())
+				if ot := addr.GetProtocolHint().GetOpaqueTransport(); ot != nil {
+					log.Printf("  - opaque transport port: %d", ot.GetInboundPort())
+				}
 			}
+
 			log.Println()
 		case *pb.Update_Remove:
 			log.Println("Remove:")
 			for _, addr := range updateType.Remove.Addrs {
-				log.Printf("- %s:%d", addrUtil.ProxyIPToString(addr.GetIp()), addr.Port)
+				log.Printf("- %s:%d", addrUtil.ProxyAddressToString(addr), addr.Port)
 			}
 			log.Println()
 		case *pb.Update_NoEndpoints:
@@ -93,10 +101,10 @@ func getProfile(client pb.DestinationClient, req *pb.GetDestination) {
 
 	for {
 		update, err := rsp.Recv()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			log.Fatal(err.Error())
 		}
 		log.Printf("%+v", update)

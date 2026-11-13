@@ -2,12 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/go-test/deep"
 	"github.com/golang/protobuf/ptypes/duration"
 	"github.com/linkerd/linkerd2/controller/k8s"
 	pkgK8s "github.com/linkerd/linkerd2/pkg/k8s"
@@ -168,25 +169,6 @@ spec:
 						},
 					},
 				},
-			},
-			{
-				err: fmt.Errorf("cannot set both namespace and resource in the request. These are mutually exclusive"),
-				promRes: model.Vector{
-					&model.Sample{
-						Metric:    model.Metric{"pod": "emojivoto-meshed"},
-						Timestamp: 456,
-					},
-				},
-				k8sRes: []string{},
-				req: &pb.ListPodsRequest{
-					Namespace: "test",
-					Selector: &pb.ResourceSelection{
-						Resource: &pb.Resource{
-							Type: pkgK8s.Pod,
-						},
-					},
-				},
-				res: nil,
 			},
 			{
 				err: nil,
@@ -397,19 +379,19 @@ status:
 
 			mProm := prometheus.MockProm{Res: exp.promRes}
 
-			fakeGrpcServer := newGrpcServer(
-				&mProm,
-				k8sAPI,
-				"linkerd",
-				"mycluster.local",
-				[]string{},
-			)
+			fakeGrpcServer := grpcServer{
+				prometheusAPI:       &mProm,
+				k8sAPI:              k8sAPI,
+				controllerNamespace: "linkerd",
+				clusterDomain:       "mycluster.local",
+				ignoredNamespaces:   []string{},
+			}
 
 			k8sAPI.Sync(nil)
 
 			rsp, err := fakeGrpcServer.ListPods(context.TODO(), exp.req)
-			if !reflect.DeepEqual(err, exp.err) {
-				t.Fatalf("Expected error: %s, Got: %s", exp.err, err)
+			if diff := deep.Equal(err, exp.err); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 
 			if !listPodResponsesEqual(exp.res, rsp) {
@@ -498,18 +480,18 @@ metadata:
 				t.Fatalf("NewFakeAPI returned an error: %s", err)
 			}
 
-			fakeGrpcServer := newGrpcServer(
-				&prometheus.MockProm{},
-				k8sAPI,
-				"linkerd",
-				"mycluster.local",
-				[]string{},
-			)
+			fakeGrpcServer := grpcServer{
+				prometheusAPI:       &prometheus.MockProm{},
+				k8sAPI:              k8sAPI,
+				controllerNamespace: "linkerd",
+				clusterDomain:       "mycluster.local",
+				ignoredNamespaces:   []string{},
+			}
 
 			k8sAPI.Sync(nil)
 
 			rsp, err := fakeGrpcServer.ListServices(context.TODO(), &pb.ListServicesRequest{})
-			if err != exp.err {
+			if !errors.Is(err, exp.err) {
 				t.Fatalf("Expected error: %s, Got: %s", exp.err, err)
 			}
 

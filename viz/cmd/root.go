@@ -5,6 +5,8 @@ import (
 	"regexp"
 
 	"github.com/fatih/color"
+	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
+	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -13,16 +15,23 @@ const (
 	// ExtensionName is the value that the viz extension resources should be labeled with
 	ExtensionName = "viz"
 
-	vizChartName            = "linkerd-viz"
+	// LegacyExtensionName is the value that the viz extension resources were labeled with
+	// until 15d1809bd043192bb21cacbc96112cce35bf384f
+	LegacyExtensionName = "linkerd-viz"
+
+	defaultNamespace        = "linkerd-viz"
 	defaultLinkerdNamespace = "linkerd"
 	maxRps                  = 100.0
 
-	jsonOutput  = "json"
-	tableOutput = "table"
-	wideOutput  = "wide"
+	jsonOutput     = healthcheck.JSONOutput
+	tableOutput    = healthcheck.TableOutput
+	wideOutput     = healthcheck.WideOutput
+	jsonPathOutput = "jsonpath"
 )
 
 var (
+	VizChartName = "linkerd-viz"
+
 	// special handling for Windows, on all other platforms these resolve to
 	// os.Stdout and os.Stderr, thanks to https://github.com/mattn/go-colorable
 	stdout = color.Output
@@ -32,6 +41,7 @@ var (
 	controlPlaneNamespace string
 	kubeconfigPath        string
 	kubeContext           string
+	vizNamespace          string
 	impersonate           string
 	impersonateGroup      []string
 	verbose               bool
@@ -41,7 +51,7 @@ var (
 	alphaNumDash = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 )
 
-// NewCmdViz returns a new jeager command
+// NewCmdViz returns a new viz command
 func NewCmdViz() *cobra.Command {
 	vizCmd := &cobra.Command{
 		Use:   "viz",
@@ -69,7 +79,9 @@ func NewCmdViz() *cobra.Command {
 	vizCmd.PersistentFlags().StringVar(&impersonate, "as", "", "Username to impersonate for Kubernetes operations")
 	vizCmd.PersistentFlags().StringArrayVar(&impersonateGroup, "as-group", []string{}, "Group to impersonate for Kubernetes operations")
 	vizCmd.PersistentFlags().StringVar(&apiAddr, "api-addr", "", "Override kubeconfig and communicate directly with the control plane at host:port (mostly for testing)")
+	vizCmd.PersistentFlags().StringVar(&vizNamespace, "viz-namespace", "", "Name of the linkerd-viz namespace. If not set, it's automatically detected")
 	vizCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "Turn on debug logging")
+	vizCmd.AddCommand(NewCmdAuthz())
 	vizCmd.AddCommand(NewCmdCheck())
 	vizCmd.AddCommand(NewCmdDashboard())
 	vizCmd.AddCommand(NewCmdEdges())
@@ -78,9 +90,19 @@ func NewCmdViz() *cobra.Command {
 	vizCmd.AddCommand(newCmdProfile())
 	vizCmd.AddCommand(NewCmdRoutes())
 	vizCmd.AddCommand(NewCmdStat())
+	vizCmd.AddCommand(NewCmdStatInbound())
+	vizCmd.AddCommand(NewCmdStatOutbound())
 	vizCmd.AddCommand(NewCmdTap())
 	vizCmd.AddCommand(NewCmdTop())
 	vizCmd.AddCommand(newCmdUninstall())
+	vizCmd.AddCommand(newCmdAllowScrapes())
+	vizCmd.AddCommand(newCmdPrune())
 
+	// resource-aware completion flag configurations
+	pkgcmd.ConfigureNamespaceFlagCompletion(
+		vizCmd, []string{"linkerd-namespace"},
+		kubeconfigPath, impersonate, impersonateGroup, kubeContext)
+
+	pkgcmd.ConfigureKubeContextFlagCompletion(vizCmd, kubeconfigPath)
 	return vizCmd
 }

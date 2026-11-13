@@ -1,4 +1,6 @@
 import 'whatwg-fetch';
+import 'regenerator-runtime/runtime';
+import 'core-js/stable';
 import { forceCenter, forceLink, forceManyBody, forceSimulation } from 'd3-force';
 import { select, selectAll } from 'd3-selection';
 import PropTypes from 'prop-types';
@@ -31,10 +33,12 @@ const defaultNodeRadius = 15;
 const margin = { top: 0, right: 0, bottom: 10, left: 0 };
 
 const simulation = d3.forceSimulation()
-  .force('link',
+  .force(
+    'link',
     d3.forceLink()
       .id(d => d.id)
-      .distance(140))
+      .distance(140),
+  )
   .force('charge', d3.forceManyBody().strength(-20))
   .force('center', d3.forceCenter(defaultSvgWidth / 2, defaultSvgHeight / 2));
 
@@ -139,9 +143,9 @@ export class NetworkGraphBase extends React.Component {
       .attr('r', defaultNodeRadius)
       .attr('fill', 'steelblue')
       .call(d3.drag()
-        .on('start', this.dragstarted)
-        .on('drag', this.dragged)
-        .on('end', this.dragended));
+        .on('start', NetworkGraphBase.dragstarted)
+        .on('drag', NetworkGraphBase.dragged)
+        .on('end', NetworkGraphBase.dragended));
 
     const textElements = this.svg.append('g')
       .selectAll('text')
@@ -170,7 +174,7 @@ export class NetworkGraphBase extends React.Component {
       .links(links);
   }
 
-  dragstarted = (event, d) => {
+  static dragstarted(event, d) {
     if (!event.active) {
       simulation.alphaTarget(0.3).restart();
     }
@@ -178,12 +182,12 @@ export class NetworkGraphBase extends React.Component {
     d.y = event.y;
   }
 
-  dragged = (event, d) => {
+  static dragged(event, d) {
     d.x = event.x;
     d.y = event.y;
   }
 
-  dragended = (event, d) => {
+  static dragended(event, d) {
     if (!event.active) {
       simulation.alphaTarget(0);
     }
@@ -206,6 +210,8 @@ NetworkGraphBase.defaultProps = {
 
 NetworkGraphBase.propTypes = {
   data: PropTypes.arrayOf(metricsPropType.isRequired).isRequired,
+  /* these objects have a lot of stuff */
+  /* eslint-disable react/forbid-prop-types */
   deployments: PropTypes.arrayOf(PropTypes.object),
 };
 

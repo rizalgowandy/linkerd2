@@ -14,8 +14,6 @@ USAGE: web <command>
   * build - build the assets
   * dev - run a dev server (with live reloading). Options:
       -p $DEV_PORT
-  * integration (cloud|local) - run the integration tests
-      Note: Sauce Connect tunnel must be open for cloud tests
   * port-forward - setup a tunnel to a controller component and port
       Example: port-forward linkerd controller 8085
   * run - run a local server (sans. reloading)
@@ -27,28 +25,16 @@ USAGE
 }; function --help { '-h' ;}
 
 check-for-linkerd-and-viz() {
-  controller_pod=$(get-pod linkerd controller)
   metrics_api_pod=$(get-pod linkerd-viz metrics-api)
-  grafana_pod=$(get-pod linkerd-viz grafana)
 
-  if [[ -z "${controller_pod// }" ]]; then
-    err 'Controller is not running. Have you installed Linkerd?'
-    exit 1
-  fi
-
-  if [[ -z "${metrics_api_pod// }" ]]; then
+  if [ -z "${metrics_api_pod// }" ]; then
     err 'Metrics-api is not running. Have you installed Linkerd-Viz?'
-    exit 1
-  fi
-
-  if [[ -z "${grafana_pod// }" ]]; then
-    err 'Grafana is not running. Have you installed Linkerd-Viz?'
     exit 1
   fi
 }
 
 dev() {
-  while getopts "p:" opt; do
+  while getopts 'p:' opt; do
     case "$opt" in
       p) DEV_PORT=$OPTARG;;
       *) ;;
@@ -71,8 +57,8 @@ get-pod() {
   fi
 
 
-  selector="linkerd.io/control-plane-component=$2"
-  if [ "$1" == "linkerd-viz" ]; then
+  selector=linkerd.io/control-plane-component=$2
+  if [ "$1" = 'linkerd-viz' ]; then
     selector="component=$2"
   fi
 
@@ -88,8 +74,8 @@ port-forward() {
     exit 1
   fi
 
-  port_from=""
-  port_to=""
+  port_from=''
+  port_to=''
   if [ $# -eq 4 ]; then
     port_from=$3
     port_to=$4
@@ -111,9 +97,7 @@ run() {
   build
 
   check-for-linkerd-and-viz && (
-    port-forward linkerd controller 8185 8085 &
     port-forward linkerd-viz metrics-api 8085 &
-    port-forward linkerd-viz grafana 3000 &
   )
 
   cd "$ROOT"/web && \
@@ -130,20 +114,6 @@ function test {
   yarn jest "$@"
 }
 
-integration() {
-  if [[ $# -ne 1 || ($1 != "cloud" && $1 != "local") ]]; then
-    echo "usage: bin/${0##*/} integration (cloud|local)" >&2
-    exit 1
-  fi
-  if [ "$1" = cloud ]; then
-    cd "$ROOT"/web/app && \
-    ./node_modules/.bin/wdio ./integration/wdio-sauce.conf.js
-  else
-    cd "$ROOT"/web/app && \
-    ./node_modules/.bin/wdio ./integration/wdio.conf.js
-  fi
-}
-
 main() {
   setup ''
   build
@@ -153,7 +123,8 @@ msg() { out "$*" >&2 ;}
 err() { local x=$? ; msg "$*" ; return $(( x == 0 ? 1 : x )) ;}
 out() { printf '%s\n' "$*" ;}
 
-if [[ ${1:-} ]] && declare -F | cut -d' ' -f3 | grep -Fqx -- "${1:-}"
-then "$@"
-else main "$@"
+if [ ${1:-} ] && declare -F | cut -d' ' -f3 | grep -Fqx -- "${1:-}"; then
+  "$@"
+else
+  main "$@"
 fi

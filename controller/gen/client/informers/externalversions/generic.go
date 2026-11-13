@@ -19,9 +19,19 @@ limitations under the License.
 package externalversions
 
 import (
-	"fmt"
+	fmt "fmt"
 
-	v1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
+	v1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/externalworkload/v1beta1"
+	v1alpha1 "github.com/linkerd/linkerd2/controller/gen/apis/link/v1alpha1"
+	v1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/link/v1alpha2"
+	v1alpha3 "github.com/linkerd/linkerd2/controller/gen/apis/link/v1alpha3"
+	policyv1alpha1 "github.com/linkerd/linkerd2/controller/gen/apis/policy/v1alpha1"
+	v1beta3 "github.com/linkerd/linkerd2/controller/gen/apis/policy/v1beta3"
+	serverv1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta1"
+	v1beta2 "github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta2"
+	serverv1beta3 "github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta3"
+	serverauthorizationv1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/serverauthorization/v1beta1"
+	serviceprofilev1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	cache "k8s.io/client-go/tools/cache"
 )
@@ -52,9 +62,55 @@ func (f *genericInformer) Lister() cache.GenericLister {
 // TODO extend this to unknown resources with a client pool
 func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource) (GenericInformer, error) {
 	switch resource {
-	// Group=linkerd.io, Version=v1alpha2
-	case v1alpha2.SchemeGroupVersion.WithResource("serviceprofiles"):
+	// Group=externalworkload, Version=v1beta1
+	case v1beta1.SchemeGroupVersion.WithResource("externalworkloads"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Externalworkload().V1beta1().ExternalWorkloads().Informer()}, nil
+
+		// Group=link, Version=v1alpha1
+	case v1alpha1.SchemeGroupVersion.WithResource("links"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Link().V1alpha1().Links().Informer()}, nil
+
+		// Group=link, Version=v1alpha2
+	case v1alpha2.SchemeGroupVersion.WithResource("links"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Link().V1alpha2().Links().Informer()}, nil
+
+		// Group=link, Version=v1alpha3
+	case v1alpha3.SchemeGroupVersion.WithResource("links"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Link().V1alpha3().Links().Informer()}, nil
+
+		// Group=linkerd.io, Version=v1alpha2
+	case serviceprofilev1alpha2.SchemeGroupVersion.WithResource("serviceprofiles"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Linkerd().V1alpha2().ServiceProfiles().Informer()}, nil
+
+		// Group=policy, Version=v1alpha1
+	case policyv1alpha1.SchemeGroupVersion.WithResource("authorizationpolicies"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Policy().V1alpha1().AuthorizationPolicies().Informer()}, nil
+	case policyv1alpha1.SchemeGroupVersion.WithResource("httproutes"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Policy().V1alpha1().HTTPRoutes().Informer()}, nil
+	case policyv1alpha1.SchemeGroupVersion.WithResource("meshtlsauthentications"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Policy().V1alpha1().MeshTLSAuthentications().Informer()}, nil
+	case policyv1alpha1.SchemeGroupVersion.WithResource("networkauthentications"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Policy().V1alpha1().NetworkAuthentications().Informer()}, nil
+
+		// Group=policy, Version=v1beta3
+	case v1beta3.SchemeGroupVersion.WithResource("httproutes"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Policy().V1beta3().HTTPRoutes().Informer()}, nil
+
+		// Group=server, Version=v1beta1
+	case serverv1beta1.SchemeGroupVersion.WithResource("servers"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Server().V1beta1().Servers().Informer()}, nil
+
+		// Group=server, Version=v1beta2
+	case v1beta2.SchemeGroupVersion.WithResource("servers"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Server().V1beta2().Servers().Informer()}, nil
+
+		// Group=server, Version=v1beta3
+	case serverv1beta3.SchemeGroupVersion.WithResource("servers"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Server().V1beta3().Servers().Informer()}, nil
+
+		// Group=serverauthorization, Version=v1beta1
+	case serverauthorizationv1beta1.SchemeGroupVersion.WithResource("serverauthorizations"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Serverauthorization().V1beta1().ServerAuthorizations().Informer()}, nil
 
 	}
 

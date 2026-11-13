@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	root := cmd.RootCmd
+	root := cmd.NewRootCmd()
 	args := os.Args[1:]
 	if _, _, err := root.Find(args); err != nil {
 		if strings.HasPrefix(args[0], "-") {
@@ -19,6 +19,9 @@ func main() {
 		}
 		path, err := exec.LookPath(fmt.Sprintf("linkerd-%s", args[0]))
 		if err == nil {
+			// We're working with a Linkerd plugin at this point which means
+			// it's up to the plugin to cleanse the arguments if needed.
+			//nolint:gosec
 			plugin := exec.Command(path, args[1:]...)
 			plugin.Stdin = os.Stdin
 			plugin.Stdout = os.Stdout

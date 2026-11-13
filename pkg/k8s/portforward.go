@@ -3,11 +3,12 @@ package k8s
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -56,7 +57,7 @@ func NewContainerMetricsForward(
 		return nil, fmt.Errorf("no %s port found for container %s/%s", portName, pod.GetName(), container.Name)
 	}
 
-	return newPortForward(k8sAPI, pod.GetNamespace(), pod.GetName(), "localhost", 0, int(port.ContainerPort), emitLogs)
+	return NewPodPortForward(k8sAPI, pod.GetNamespace(), pod.GetName(), "localhost", 0, int(port.ContainerPort), emitLogs)
 }
 
 // NewPortForward returns an instance of the PortForward struct that can be used
@@ -98,7 +99,7 @@ func NewPortForward(
 		return nil, fmt.Errorf("no running pods found for %s", deployName)
 	}
 
-	return newPortForward(k8sAPI, namespace, podName, host, localPort, remotePort, emitLogs)
+	return NewPodPortForward(k8sAPI, namespace, podName, host, localPort, remotePort, emitLogs)
 }
 
 func getDeploymentForPod(ctx context.Context, k8sAPI *KubernetesAPI, pod corev1.Pod) (string, error) {
@@ -117,14 +118,26 @@ func getDeploymentForPod(ctx context.Context, k8sAPI *KubernetesAPI, pod corev1.
 	return grandparents[0].Name, nil
 }
 
-func newPortForward(
+// NewPodPortForward returns an instance of the PortForward struct that can be
+// used to establish a port-forward connection to a specific Pod.
+func NewPodPortForward(
 	k8sAPI *KubernetesAPI,
 	namespace, podName string,
 	host string, localPort, remotePort int,
 	emitLogs bool,
 ) (*PortForward, error) {
 
-	req := k8sAPI.CoreV1().RESTClient().Post().
+	restClient := k8sAPI.CoreV1().RESTClient()
+	// This early return is for testing purposes. If the k8sAPI is a fake
+	// client, attempting to create a request will result in a nil-pointer
+	// panic. Instead, we return with no port-forward and no error.
+	if fakeRest, ok := restClient.(*rest.RESTClient); ok {
+		if fakeRest == nil {
+			return nil, nil
+		}
+	}
+
+	req := restClient.Post().
 		Resource("pods").
 		Namespace(namespace).
 		Name(podName).
@@ -132,6 +145,10 @@ func newPortForward(
 
 	var err error
 	if localPort == 0 {
+		if host != "localhost" {
+			return nil, fmt.Errorf("local port must be specified when host is not localhost")
+		}
+
 		localPort, err = getEphemeralPort()
 		if err != nil {
 			return nil, err
@@ -161,8 +178,8 @@ func (pf *PortForward) run() error {
 		return err
 	}
 
-	out := ioutil.Discard
-	errOut := ioutil.Discard
+	out := io.Discard
+	errOut := io.Discard
 	if pf.emitLogs {
 		out = os.Stdout
 		errOut = os.Stderr
@@ -178,7 +195,7 @@ func (pf *PortForward) run() error {
 
 	err = fw.ForwardPorts()
 	if err != nil {
-		err = fmt.Errorf("%s for %s/%s", err, pf.namespace, pf.podName)
+		err = fmt.Errorf("%w for %s/%s", err, pf.namespace, pf.podName)
 		return err
 	}
 	return nil
@@ -190,7 +207,7 @@ func (pf *PortForward) run() error {
 func (pf *PortForward) Init() error {
 	log.Debugf("Starting port forward to %s %d:%d", pf.url, pf.localPort, pf.remotePort)
 
-	failure := make(chan error)
+	failure := make(chan error, 1)
 
 	go func() {
 		if err := pf.run(); err != nil {
@@ -226,24 +243,25 @@ func (pf *PortForward) GetStop() <-chan struct{} {
 
 // URLFor returns the URL for the port-forward connection.
 func (pf *PortForward) URLFor(path string) string {
-	return fmt.Sprintf("http://%s:%d%s", pf.host, pf.localPort, path)
+	strPort := strconv.Itoa(pf.localPort)
+	urlAddress := net.JoinHostPort(pf.host, strPort)
+	return fmt.Sprintf("http://%s%s", urlAddress, path)
 }
 
 // AddressAndPort returns the address and port for the port-forward connection.
 func (pf *PortForward) AddressAndPort() string {
-	return fmt.Sprintf("%s:%d", pf.host, pf.localPort)
+	strPort := strconv.Itoa(pf.localPort)
+	return net.JoinHostPort(pf.host, strPort)
 }
 
 // getEphemeralPort selects a port for the port-forwarding. It binds to a free
 // ephemeral port and returns the port number.
 func getEphemeralPort() (int, error) {
-	ln, err := net.Listen("tcp", ":0")
+	ln, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		return 0, err
 	}
-
 	defer ln.Close()
-
 	// get port
 	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
 	if !ok {

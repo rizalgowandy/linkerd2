@@ -2,21 +2,27 @@ package identity
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
-	"github.com/golang/protobuf/ptypes"
 	pb "github.com/linkerd/linkerd2-proxy-api/go/identity"
 	"github.com/linkerd/linkerd2/pkg/tls"
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -26,22 +32,26 @@ const (
 
 	// EnvTrustAnchors is the environment variable holding the trust anchors for
 	// the proxy identity.
-	EnvTrustAnchors  = "LINKERD2_PROXY_IDENTITY_TRUST_ANCHORS"
-	eventTypeSkipped = "IssuerUpdateSkipped"
-	eventTypeUpdated = "IssuerUpdated"
-	eventTypeFailed  = "IssuerValidationFailed"
+	EnvTrustAnchors         = "LINKERD2_PROXY_IDENTITY_TRUST_ANCHORS"
+	eventTypeSkipped        = "IssuerUpdateSkipped"
+	eventTypeUpdated        = "IssuerUpdated"
+	eventTypeFailed         = "IssuerValidationFailed"
+	eventTypeIssuedLeafCert = "IssuedLeafCertificate"
 )
 
 type (
 	// Service implements the gRPC service in terms of a Validator and Issuer.
 	Service struct {
-		validator                                  Validator
-		trustAnchors                               *x509.CertPool
-		issuer                                     *tls.Issuer
-		issuerMutex                                *sync.RWMutex
-		validity                                   *tls.Validity
-		recordEvent                                func(eventType, reason, message string)
+		pb.UnimplementedIdentityServer
+		validator    Validator
+		trustAnchors *x509.CertPool
+		issuer       *tls.Issuer
+		issuerMutex  *sync.RWMutex
+		validity     *tls.Validity
+		recordEvent  func(parent runtime.Object, eventType, reason, message string)
+
 		expectedName, issuerPathCrt, issuerPathKey string
+		issuerCertTTL                              time.Time
 	}
 
 	// Validator implementors accept a bearer token, validates it, and returns a
@@ -84,6 +94,14 @@ func (svc *Service) updateIssuer(newIssuer tls.Issuer) {
 	svc.issuerMutex.Unlock()
 }
 
+func (svc *Service) getIssuerCertTTL() float64 {
+	if svc.issuerCertTTL.IsZero() {
+		log.Warn("Issuer certificate not ready: cannot get TTL")
+		return float64(0)
+	}
+	return time.Until(svc.issuerCertTTL).Seconds()
+}
+
 // Run reads from the issuer and error channels and reloads the issuer certs when necessary
 func (svc *Service) Run(issuerEvent <-chan struct{}, issuerError <-chan error) {
 	for {
@@ -92,11 +110,11 @@ func (svc *Service) Run(issuerEvent <-chan struct{}, issuerError <-chan error) {
 			if err := svc.Initialize(); err != nil {
 				message := fmt.Sprintf("Skipping issuer update as certs could not be read from disk: %s", err)
 				log.Warn(message)
-				svc.recordEvent(v1.EventTypeWarning, eventTypeSkipped, message)
+				svc.recordEvent(nil, v1.EventTypeWarning, eventTypeSkipped, message)
 			} else {
 				message := "Updated identity issuer"
-				log.Infof(message)
-				svc.recordEvent(v1.EventTypeNormal, eventTypeUpdated, message)
+				log.Info(message)
+				svc.recordEvent(nil, v1.EventTypeNormal, eventTypeUpdated, message)
 			}
 		case err := <-issuerError:
 			log.Warnf("Received error from fs watcher: %s", err)
@@ -111,21 +129,51 @@ func (svc *Service) loadCredentials() (tls.Issuer, error) {
 	)
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CA from disk: %s", err)
+		return nil, fmt.Errorf("failed to read CA from disk: %w", err)
 	}
 
 	// Don't verify with dns name as this is not a leaf certificate
 	if err := creds.Crt.Verify(svc.trustAnchors, "", time.Time{}); err != nil {
-		return nil, fmt.Errorf("failed to verify issuer credentials for '%s' with trust anchors: %s", svc.expectedName, err)
+		return nil, fmt.Errorf("failed to verify issuer credentials for '%s' with trust anchors: %w", svc.expectedName, err)
 	}
 
+	if !creds.Certificate.IsCA {
+		return nil, fmt.Errorf("failed to verify issuer certificate: it must be an intermediate-CA, but it is not")
+	}
+
+	svc.issuerCertTTL = creds.Certificate.NotAfter
+
 	log.Debugf("Loaded issuer cert: %s", creds.EncodeCertificatePEM())
+	now := time.Now().Unix()
+	log.WithFields(log.Fields{
+		"invalid_after":      creds.Certificate.NotAfter.Unix(),
+		"process_clock_time": now,
+		"ttl_seconds":        creds.Certificate.NotAfter.Unix() - now,
+	}).Info("Issuer cert loaded")
 	return tls.NewCA(*creds, *svc.validity), nil
 }
 
+func (svc *Service) registerCertExpirationMetrics() {
+	// register a metric for the expiration of the issuer cert
+	issuerCertExpireGauge := prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "issuer_cert_ttl_seconds",
+		Help: "The remaining seconds until the issuer certificate expires",
+	}, svc.getIssuerCertTTL)
+	if err := prometheus.Register(issuerCertExpireGauge); err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			log.Warn("issuer_cert_ttl_seconds metric already registered")
+		} else {
+			log.WithError(err).Error("failed to register issuer_cert_ttl_seconds metric")
+		}
+	}
+	// TODO: register a metric for the expiration of the trust anchor cert with the lowest TTL
+}
+
 // NewService creates a new identity service.
-func NewService(validator Validator, trustAnchors *x509.CertPool, validity *tls.Validity, recordEvent func(eventType, reason, message string), expectedName, issuerPathCrt, issuerPathKey string) *Service {
-	return &Service{
+func NewService(validator Validator, trustAnchors *x509.CertPool, validity *tls.Validity, recordEvent func(parent runtime.Object, eventType, reason, message string), expectedName, issuerPathCrt, issuerPathKey string) *Service {
+	svc := &Service{
+		pb.UnimplementedIdentityServer{},
 		validator,
 		trustAnchors,
 		nil,
@@ -135,7 +183,10 @@ func NewService(validator Validator, trustAnchors *x509.CertPool, validity *tls.
 		expectedName,
 		issuerPathCrt,
 		issuerPathKey,
+		time.Time{},
 	}
+	svc.registerCertExpirationMetrics()
+	return svc
 }
 
 // Register registers an identity service implementation in the provided gRPC
@@ -176,7 +227,7 @@ func (svc *Service) Certify(ctx context.Context, req *pb.CertifyRequest) (*pb.Ce
 	if err := svc.ensureIssuerStillValid(); err != nil {
 		log.Errorf("could not process CSR because of CA cert validation failure: %s - CSR Identity : %s", err, reqIdentity)
 		message := fmt.Sprintf("%s - CSR Identity : %s", err.Error(), reqIdentity)
-		svc.recordEvent(v1.EventTypeWarning, eventTypeFailed, message)
+		svc.recordEvent(nil, v1.EventTypeWarning, eventTypeFailed, message)
 		return nil, err
 	}
 
@@ -189,25 +240,27 @@ func (svc *Service) Certify(ctx context.Context, req *pb.CertifyRequest) (*pb.Ce
 	log.Debugf("Validating token for %s", reqIdentity)
 	tokIdentity, err := svc.validator.Validate(ctx, tok)
 	if err != nil {
-		switch e := err.(type) {
-		case NotAuthenticated:
-			log.Infof("authentication failed for %s: %s", reqIdentity, e)
-			return nil, status.Error(codes.FailedPrecondition, e.Error())
-		case InvalidToken:
-			log.Debugf("invalid token provided for %s: %s", reqIdentity, e)
-			return nil, status.Error(codes.InvalidArgument, e.Error())
-		default:
-			msg := fmt.Sprintf("error validating token for %s: %s", reqIdentity, e)
-			log.Error(msg)
-			return nil, status.Error(codes.Internal, msg)
+		var nae NotAuthenticated
+		if errors.As(err, &nae) {
+			log.Infof("authentication failed for %s: %s", reqIdentity, nae)
+			return nil, status.Error(codes.FailedPrecondition, nae.Error())
 		}
+		var ite InvalidToken
+		if errors.As(err, &ite) {
+			log.Infof("invalid token provided for %s: %s", reqIdentity, ite)
+			return nil, status.Error(codes.InvalidArgument, ite.Error())
+		}
+
+		msg := fmt.Sprintf("error validating token for %s: %s", reqIdentity, err)
+		log.Error(msg)
+		return nil, status.Error(codes.Internal, msg)
 	}
 
 	// Ensure the requested identity matches the token's identity.
 	if reqIdentity != tokIdentity {
 		msg := fmt.Sprintf("requested identity did not match provided token: requested=%s; found=%s",
 			reqIdentity, tokIdentity)
-		log.Debug(msg)
+		log.Info(msg)
 		return nil, status.Error(codes.FailedPrecondition, msg)
 	}
 
@@ -219,17 +272,26 @@ func (svc *Service) Certify(ctx context.Context, req *pb.CertifyRequest) (*pb.Ce
 	}
 	crts := crt.ExtractRaw()
 	if len(crts) == 0 {
+		//nolint:gocritic
 		log.Fatal("the issuer provided a certificate without key material")
 	}
+	validUntil := timestamppb.New(crt.Certificate.NotAfter)
+
+	hasher := sha256.New()
+	hasher.Write(crts[0])
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	identitySegments := strings.Split(tokIdentity, ".")
+	msg := fmt.Sprintf("issued certificate for %s until %s: %s", tokIdentity, crt.Certificate.NotAfter, hash)
+	sa := v1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      identitySegments[0],
+			Namespace: identitySegments[1],
+		},
+	}
+	svc.recordEvent(&sa, v1.EventTypeNormal, eventTypeIssuedLeafCert, msg)
+	log.Info(msg)
 
 	// Bundle issuer crt with certificate so the trust path to the root can be verified.
-	log.Infof("certifying %s until %s", tokIdentity, crt.Certificate.NotAfter)
-	validUntil, err := ptypes.TimestampProto(crt.Certificate.NotAfter)
-	if err != nil {
-		log.Errorf("invalid expiry time: %s", err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
 	rsp := &pb.CertifyResponse{
 		LeafCertificate:          crts[0],
 		IntermediateCertificates: crts[1:],

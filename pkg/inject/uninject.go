@@ -36,10 +36,13 @@ func (conf *ResourceConfig) uninjectPodSpec(report *Report) {
 	t := conf.pod.spec
 	initContainers := []v1.Container{}
 	for _, container := range t.InitContainers {
-		if container.Name != k8s.InitContainerName {
-			initContainers = append(initContainers, container)
-		} else {
+		switch container.Name {
+		case k8s.InitContainerName:
 			report.Uninjected.ProxyInit = true
+		case k8s.ProxyContainerName:
+			report.Uninjected.Proxy = true
+		default:
+			initContainers = append(initContainers, container)
 		}
 	}
 	t.InitContainers = initContainers
@@ -56,7 +59,7 @@ func (conf *ResourceConfig) uninjectPodSpec(report *Report) {
 
 	volumes := []v1.Volume{}
 	for _, volume := range t.Volumes {
-		if volume.Name != k8s.IdentityEndEntityVolumeName && volume.Name != k8s.InitXtablesLockVolumeMountName {
+		if volume.Name != k8s.IdentityEndEntityVolumeName && volume.Name != k8s.InitXtablesLockVolumeMountName && volume.Name != k8s.LinkerdTokenVolumeMountName {
 			volumes = append(volumes, volume)
 		}
 	}

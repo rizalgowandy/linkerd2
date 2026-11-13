@@ -3,9 +3,9 @@ package api
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"sort"
 
+	"github.com/go-test/deep"
 	"github.com/linkerd/linkerd2/controller/k8s"
 	"github.com/linkerd/linkerd2/pkg/prometheus"
 	pb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
@@ -19,6 +19,7 @@ type MockAPIClient struct {
 	ListPodsResponseToReturn     *pb.ListPodsResponse
 	ListServicesResponseToReturn *pb.ListServicesResponse
 	StatSummaryResponseToReturn  *pb.StatSummaryResponse
+	AuthzResponseToReturn        *pb.AuthzResponse
 	GatewaysResponseToReturn     *pb.GatewaysResponse
 	TopRoutesResponseToReturn    *pb.TopRoutesResponse
 	EdgesResponseToReturn        *pb.EdgesResponse
@@ -28,6 +29,11 @@ type MockAPIClient struct {
 // StatSummary provides a mock of a metrics-api method.
 func (c *MockAPIClient) StatSummary(ctx context.Context, in *pb.StatSummaryRequest, opts ...grpc.CallOption) (*pb.StatSummaryResponse, error) {
 	return c.StatSummaryResponseToReturn, c.ErrorToReturn
+}
+
+// Authz provides a mock of a metrics-api method.
+func (c *MockAPIClient) Authz(ctx context.Context, in *pb.AuthzRequest, opts ...grpc.CallOption) (*pb.AuthzResponse, error) {
+	return c.AuthzResponseToReturn, c.ErrorToReturn
 }
 
 // Gateways provides a mock of a metrics-api method.
@@ -132,70 +138,6 @@ func GenStatSummaryResponse(resName, resType string, resNs []string, counts *Pod
 	return resp
 }
 
-// GenStatTsResponse generates a mock metrics-api StatSummaryResponse
-// object in response to a request for trafficsplit stats.
-func GenStatTsResponse(resName, resType string, resNs []string, basicStats bool, tsStats bool) *pb.StatSummaryResponse {
-	leaves := map[string]string{
-		"service-1": "900m",
-		"service-2": "100m",
-	}
-	apex := "apex_name"
-
-	rows := []*pb.StatTable_PodGroup_Row{}
-	for _, ns := range resNs {
-		for name, weight := range leaves {
-			statTableRow := &pb.StatTable_PodGroup_Row{
-				Resource: &pb.Resource{
-					Namespace: ns,
-					Type:      resType,
-					Name:      resName,
-				},
-				TimeWindow: "1m",
-			}
-
-			if basicStats {
-				statTableRow.Stats = &pb.BasicStats{
-					SuccessCount: 123,
-					FailureCount: 0,
-					LatencyMsP50: 123,
-					LatencyMsP95: 123,
-					LatencyMsP99: 123,
-				}
-			}
-
-			if tsStats {
-				statTableRow.TsStats = &pb.TrafficSplitStats{
-					Apex:   apex,
-					Leaf:   name,
-					Weight: weight,
-				}
-			}
-			rows = append(rows, statTableRow)
-
-		}
-	}
-
-	// sort rows before returning in order to have a consistent order for tests
-	rows = sortTrafficSplitRows(rows)
-
-	resp := &pb.StatSummaryResponse{
-		Response: &pb.StatSummaryResponse_Ok_{ // https://github.com/golang/protobuf/issues/205
-			Ok: &pb.StatSummaryResponse_Ok{
-				StatTables: []*pb.StatTable{
-					{
-						Table: &pb.StatTable_PodGroup_{
-							PodGroup: &pb.StatTable_PodGroup{
-								Rows: rows,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	return resp
-}
-
 type mockEdgeRow struct {
 	resourceType string
 	src          string
@@ -249,8 +191,8 @@ var linkerdEdgeRows = []*mockEdgeRow{
 		dst:          "linkerd-prometheus",
 		srcNamespace: "linkerd",
 		dstNamespace: "linkerd",
-		clientID:     "linkerd-identity.linkerd.identity.linkerd.cluster.local",
-		serverID:     "linkerd-prometheus.linkerd.identity.linkerd.cluster.local",
+		clientID:     "linkerd-identity.linkerd.serviceaccount.identity.linkerd.cluster.local",
+		serverID:     "linkerd-prometheus.linkerd.serviceaccount.identity.linkerd.cluster.local",
 		msg:          "",
 	},
 }
@@ -368,13 +310,13 @@ func newMockGrpcServer(exp expectedStatRPC) (*prometheus.MockProm, *grpcServer, 
 	}
 
 	mockProm := &prometheus.MockProm{Res: exp.mockPromResponse}
-	fakeGrpcServer := newGrpcServer(
-		mockProm,
-		k8sAPI,
-		"linkerd",
-		"cluster.local",
-		[]string{},
-	)
+	fakeGrpcServer := &grpcServer{
+		prometheusAPI:       mockProm,
+		k8sAPI:              k8sAPI,
+		controllerNamespace: "linkerd",
+		clusterDomain:       "cluster.local",
+		ignoredNamespaces:   []string{},
+	}
 
 	k8sAPI.Sync(nil)
 
@@ -392,9 +334,8 @@ func (exp expectedStatRPC) verifyPromQueries(mockProm *prometheus.MockProm) erro
 			return nil
 		}
 
-		if !reflect.DeepEqual(exp.expectedPrometheusQueries, mockProm.QueriesExecuted) {
-			return fmt.Errorf("Prometheus queries incorrect. \nExpected:\n%+v \nGot:\n%+v",
-				exp.expectedPrometheusQueries, mockProm.QueriesExecuted)
+		if diff := deep.Equal(exp.expectedPrometheusQueries, mockProm.QueriesExecuted); diff != nil {
+			return fmt.Errorf("Prometheus queries incorrect: %+v", diff)
 		}
 	}
 	return nil

@@ -1,4 +1,59 @@
 {
+  "__inputs": [
+    {
+      "name": "datasource",
+      "label": "prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__elements": [],
+  "__requires": [
+    {
+      "type": "panel",
+      "id": "gauge",
+      "name": "Gauge",
+      "version": ""
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "8.3.3"
+    },
+    {
+      "type": "panel",
+      "id": "graph",
+      "name": "Graph (old)",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "heatmap",
+      "name": "Heatmap",
+      "version": ""
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "text",
+      "name": "Text",
+      "version": ""
+    }
+  ],
   "annotations": {
     "list": [
       {
@@ -38,7 +93,10 @@
       "bars": false,
       "dashLength": 10,
       "dashes": false,
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -164,7 +222,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "editable": true,
       "error": false,
       "format": "percent",
@@ -250,7 +311,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -337,7 +401,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -395,7 +462,7 @@
       "tableColumn": "",
       "targets": [
         {
-          "expr": "sum (container_fs_usage_bytes{device=~\"^/dev/[sv]d[a-z][1-9]$\",id=\"/\",kubernetes_io_hostname=~\"^$Node$\"}) / sum (container_fs_limit_bytes{device=~\"^/dev/[sv]d[a-z][1-9]$\",id=\"/\",kubernetes_io_hostname=~\"^$Node$\"}) * 100",
+          "expr": "sum (container_fs_usage_bytes{device=~\"^/dev/[sv]d[a-z][1-9]?$\",id=\"/\",kubernetes_io_hostname=~\"^$Node$\"}) / sum (container_fs_limit_bytes{device=~\"^/dev/[sv]d[a-z][1-9]$\",id=\"/\",kubernetes_io_hostname=~\"^$Node$\"}) * 100",
           "interval": "10s",
           "intervalFactor": 1,
           "legendFormat": "",
@@ -426,7 +493,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -513,7 +583,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -600,7 +673,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -687,7 +763,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -774,7 +853,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -861,7 +943,10 @@
         "rgba(237, 129, 40, 0.89)",
         "rgba(245, 54, 54, 0.9)"
       ],
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -957,7 +1042,10 @@
       "bars": false,
       "dashLength": 10,
       "dashes": false,
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 3,
       "editable": true,
       "error": false,
@@ -1064,7 +1152,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 3,
           "editable": true,
           "error": false,
@@ -1165,7 +1256,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 3,
           "editable": true,
           "error": false,
@@ -1288,7 +1382,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 3,
           "editable": true,
           "error": false,
@@ -1394,7 +1491,10 @@
       "bars": false,
       "dashLength": 10,
       "dashes": false,
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -1501,7 +1601,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 2,
           "editable": true,
           "error": false,
@@ -1601,7 +1704,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 2,
           "editable": true,
           "error": false,
@@ -1719,7 +1825,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 2,
           "editable": true,
           "error": false,
@@ -1822,7 +1931,10 @@
     {
       "aliasColors": {},
       "bars": false,
-      "datasource": "prometheus",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
       "decimals": 2,
       "editable": true,
       "error": false,
@@ -1928,7 +2040,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 2,
           "editable": true,
           "error": false,
@@ -2079,7 +2194,10 @@
         {
           "aliasColors": {},
           "bars": false,
-          "datasource": "prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "decimals": 2,
           "editable": true,
           "error": false,
@@ -2185,12 +2303,30 @@
   "templating": {
     "list": [
       {
-        "allValue": ".*",
         "current": {
-          "text": "All",
-          "value": "$__all"
+          "selected": false,
+          "text": "default",
+          "value": "default"
         },
-        "datasource": "prometheus",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data Source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
         "definition": "",
         "hide": 0,
         "includeAll": true,

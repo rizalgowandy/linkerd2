@@ -1,5 +1,4 @@
 import CloseIcon from '@material-ui/icons/Close';
-import EmptyCard from './EmptyCard.jsx';
 import FilterListIcon from '@material-ui/icons/FilterList';
 import Hidden from '@material-ui/core/Hidden';
 import Paper from '@material-ui/core/Paper';
@@ -20,8 +19,9 @@ import _get from 'lodash/get';
 import _isNil from 'lodash/isNil';
 import _orderBy from 'lodash/orderBy';
 import classNames from 'classnames';
-import { regexFilterString } from './util/Utils.js';
 import { withStyles } from '@material-ui/core/styles';
+import { regexFilterString } from './util/Utils.js';
+import EmptyCard from './EmptyCard.jsx';
 
 const styles = theme => ({
   root: {
@@ -94,14 +94,14 @@ class BaseTable extends React.Component {
 
   handleFilterInputChange = event => {
     this.setState({ filterBy: regexFilterString(event.target.value) });
-  }
+  };
 
   handleFilterToggle = () => {
     const { showFilter } = this.state;
     this.setState({ showFilter: !showFilter, filterBy: '' });
-  }
+  };
 
-  generateRows = (tableRows, tableColumns, order, orderBy, filterBy) => {
+  static generateRows(tableRows, tableColumns, order, orderBy, filterBy) {
     let rows = tableRows;
     const col = _find(tableColumns, d => d.dataIndex === orderBy);
 
@@ -165,7 +165,7 @@ class BaseTable extends React.Component {
 
     return _isNil(col.tooltip) ? tableCell :
     <Tooltip key={col.key || col.dataIndex} placement="top" title={col.tooltip}>{tableCell}</Tooltip>;
-  }
+  };
 
   renderToolbar = (classes, title) => {
     const { showFilter } = this.state;
@@ -195,12 +195,12 @@ class BaseTable extends React.Component {
             onClick={this.handleFilterToggle} />}
       </Toolbar>
     );
-  }
+  };
 
   render() {
     const { classes, enableFilter, tableRows, tableColumns, tableClassName, title, rowKey, padding } = this.props;
     const { order, orderBy, filterBy } = this.state;
-    const sortedTableRows = tableRows.length > 0 ? this.generateRows(tableRows, tableColumns, order, orderBy, filterBy) : tableRows;
+    const sortedTableRows = tableRows.length > 0 ? BaseTable.generateRows(tableRows, tableColumns, order, orderBy, filterBy) : tableRows;
 
     return (
       <Paper className={classes.root} elevation={3}>

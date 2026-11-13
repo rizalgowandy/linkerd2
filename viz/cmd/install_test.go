@@ -13,14 +13,12 @@ func TestRender(t *testing.T) {
 	// pin values that are changed by render functions on each test run
 	defaultValues := map[string]interface{}{
 		"tap": map[string]interface{}{
-			"keyPEM":   "test-tap-key-pem",
-			"crtPEM":   "test-tap-crt-pem",
-			"caBundle": "test-tap-ca-bundle",
+			"externalSecret": true,
+			"caBundle":       "test-tap-ca-bundle",
 		},
 		"tapInjector": map[string]interface{}{
-			"keyPEM":   "test-tap-key-pem",
-			"crtPEM":   "test-tap-crt-pem",
-			"caBundle": "test-tap-ca-bundle",
+			"externalSecret": true,
+			"caBundle":       "test-tap-ca-bundle",
 		},
 	}
 
@@ -67,7 +65,6 @@ func TestRender(t *testing.T) {
 			map[string]interface{}{
 				"prometheus": proxyResources,
 				"tap":        proxyResources,
-				"grafana":    proxyResources,
 				"dashboard":  proxyResources,
 			},
 			"install_proxy_resources.golden",
@@ -76,24 +73,20 @@ func TestRender(t *testing.T) {
 			map[string]interface{}{
 				"defaultLogLevel": "debug",
 				"defaultUID":      1234,
+				"defaultGID":      1234,
 				"defaultRegistry": "gcr.io/linkerd",
 				"tap": map[string]interface{}{
 					"logLevel": "info",
 					"UID":      5678,
+					"GID":      5678,
 					"image": map[string]interface{}{
 						"registry": "cr.l5d.io/linkerd",
 						"tag":      "stable-9.2",
 					},
 				},
+				"grafana": map[string]interface{}{"url": "grafana.grafana:3000"},
 			},
 			"install_default_overrides.golden",
-		},
-		{
-			map[string]interface{}{
-				"grafana":    map[string]interface{}{"enabled": false},
-				"grafanaUrl": "external-grafana.com",
-			},
-			"install_grafana_disabled.golden",
 		},
 	}
 
@@ -102,10 +95,12 @@ func TestRender(t *testing.T) {
 		t.Run(fmt.Sprintf("%d: %s", i, tc.goldenFileName), func(t *testing.T) {
 			var buf bytes.Buffer
 			// Merge overrides with default
-			if err := render(&buf, charts.MergeMaps(defaultValues, tc.values)); err != nil {
+			if err := render(&buf, charts.MergeMaps(defaultValues, tc.values), "yaml"); err != nil {
 				t.Fatalf("Failed to render templates: %v", err)
 			}
-			testDataDiffer.DiffTestdata(t, tc.goldenFileName, buf.String())
+			if err := testDataDiffer.DiffTestYAML(tc.goldenFileName, buf.String()); err != nil {
+				t.Error(err)
+			}
 		})
 	}
 }

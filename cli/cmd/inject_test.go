@@ -5,13 +5,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/linkerd/linkerd2/pkg/charts/linkerd2"
+	"github.com/linkerd/linkerd2/pkg/cmd"
+	"github.com/linkerd/linkerd2/pkg/inject"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/testutil"
 )
@@ -33,6 +34,8 @@ func mkFilename(filename string, verbose bool) string {
 }
 
 func testUninjectAndInject(t *testing.T, tc testCase) {
+	t.Helper()
+
 	file, err := os.Open("testdata/" + tc.inputFileName)
 	if err != nil {
 		t.Errorf("error opening test input file: %v\n", err)
@@ -48,12 +51,15 @@ func testUninjectAndInject(t *testing.T, tc testCase) {
 		overrideAnnotations: getOverrideAnnotations(tc.testInjectConfig, defaultConfig()),
 		enableDebugSidecar:  tc.enableDebugSidecarFlag,
 		allowNsInject:       true,
+		overrider:           inject.GetOverriddenValues,
 	}
 
-	if exitCode := uninjectAndInject([]io.Reader{read}, report, output, transformer); exitCode != 0 {
-		t.Errorf("Unexpected error injecting YAML: %v\n", report)
+	if exitCode := uninjectAndInject([]io.Reader{read}, report, output, transformer, "yaml"); exitCode != 0 {
+		t.Errorf("Unexpected error injecting YAML: %v", report)
 	}
-	testDataDiffer.DiffTestdata(t, tc.goldenFileName, output.String())
+	if err := testDataDiffer.DiffTestYAML(tc.goldenFileName, output.String()); err != nil {
+		t.Error(err)
+	}
 
 	reportFileName := mkFilename(tc.reportFileName, verbose)
 	testDataDiffer.DiffTestdata(t, reportFileName, report.String())
@@ -129,6 +135,17 @@ func TestUninjectAndInject(t *testing.T) {
 			testInjectConfig: func() *linkerd2.Values {
 				values := defaultConfig()
 				values.Proxy.Ports.Admin = 1234
+				return values
+			}(),
+		},
+		{
+			inputFileName:  "inject_emojivoto_deployment.input.yml",
+			goldenFileName: "inject_emojivoto_deployment_access_log.golden.yml",
+			reportFileName: "inject_emojivoto_deployment.report",
+			injectProxy:    true,
+			testInjectConfig: func() *linkerd2.Values {
+				values := defaultConfig()
+				values.Proxy.AccessLog = "apache"
 				return values
 			}(),
 		},
@@ -309,6 +326,65 @@ func TestUninjectAndInject(t *testing.T) {
 			injectProxy:      true,
 			testInjectConfig: ingressConfig,
 		},
+		{
+			inputFileName:  "inject_emojivoto_deployment.input.yml",
+			goldenFileName: "inject_emojivoto_deployment_default_inbound_policy.golden.yml",
+			reportFileName: "inject_emojivoto_deployment_default_inbound_policy.golden.report",
+			injectProxy:    false,
+			testInjectConfig: func() *linkerd2.Values {
+				values := defaultConfig()
+				values.Proxy.DefaultInboundPolicy = k8s.AllAuthenticated
+				return values
+			}(),
+		},
+		{
+			inputFileName:  "inject_emojivoto_pod.input.yml",
+			goldenFileName: "inject_emojivoto_pod_default_inbound_policy.golden.yml",
+			reportFileName: "inject_emojivoto_pod_default_inbound_policy.golden.report",
+			injectProxy:    false,
+			testInjectConfig: func() *linkerd2.Values {
+				values := defaultConfig()
+				values.Proxy.DefaultInboundPolicy = k8s.AllAuthenticated
+				return values
+			}(),
+		},
+		{
+			inputFileName:  "inject_emojivoto_deployment.input.yml",
+			goldenFileName: "inject_emojivoto_deployment_native_sidecar.golden.yml",
+			reportFileName: "inject_emojivoto_deployment.report",
+			injectProxy:    true,
+			testInjectConfig: func() *linkerd2.Values {
+				values := defaultConfig()
+				values.Proxy.NativeSidecar = true
+				return values
+			}(),
+		},
+		{
+			inputFileName:  "inject_emojivoto_deployment.input.yml",
+			goldenFileName: "inject_emojivoto_deployment_params.golden.yml",
+			reportFileName: "inject_emojivoto_deployment.report",
+			injectProxy:    true,
+			testInjectConfig: func() *linkerd2.Values {
+				values := defaultConfig()
+				values.Proxy.Inbound = linkerd2.ProxyParams{
+					"scope": linkerd2.ProxyScopeParams{
+						"proto": linkerd2.ProxyProtoParams{
+							"appleSauce": "valueA",
+							"blueberry":  3.14,
+						},
+					},
+				}
+				values.Proxy.Outbound = linkerd2.ProxyParams{
+					"scope": linkerd2.ProxyScopeParams{
+						"proto": linkerd2.ProxyProtoParams{
+							"applesauce": "valueA",
+							"blueBerry":  true,
+						},
+					},
+				}
+				return values
+			}(),
+		},
 	}
 
 	for i, tc := range testCases {
@@ -330,12 +406,19 @@ type injectCmd struct {
 	stdOutGoldenFileName string
 	exitCode             int
 	injectProxy          bool
+	values               *linkerd2.Values
 }
 
 func testInjectCmd(t *testing.T, tc injectCmd) {
-	testConfig, err := testInstallValues()
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
+	t.Helper()
+
+	testConfig := tc.values
+	if testConfig == nil {
+		var err error
+		testConfig, err = testInstallValues()
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
 	}
 	testConfig.Proxy.Image.Version = "testinjectversion"
 
@@ -350,8 +433,9 @@ func testInjectCmd(t *testing.T, tc injectCmd) {
 	transformer := &resourceTransformerInject{
 		injectProxy: tc.injectProxy,
 		values:      testConfig,
+		overrider:   inject.GetOverriddenValues,
 	}
-	exitCode := runInjectCmd([]io.Reader{in}, errBuffer, outBuffer, transformer)
+	exitCode := runInjectCmd([]io.Reader{in}, errBuffer, outBuffer, transformer, "yaml")
 	if exitCode != tc.exitCode {
 		t.Fatalf("Expected exit code to be %d but got: %d", tc.exitCode, exitCode)
 	}
@@ -390,8 +474,20 @@ func TestRunInjectCmd(t *testing.T) {
 			inputFileName:        "inject_emojivoto_deployment_automountServiceAccountToken_false.input.yml",
 			stdOutGoldenFileName: "inject_emojivoto_deployment_automountServiceAccountToken_false.golden.yml",
 			stdErrGoldenFileName: "inject_emojivoto_deployment_automountServiceAccountToken_false.golden.stderr",
+			exitCode:             0,
+			injectProxy:          true,
+		},
+		{
+			inputFileName:        "inject_emojivoto_deployment_automountServiceAccountToken_false.input.yml",
+			stdOutGoldenFileName: "inject_emojivoto_deployment_automountServiceAccountToken_false_volumeProjection_disabled.golden.yml",
+			stdErrGoldenFileName: "inject_emojivoto_deployment_automountServiceAccountToken_false_volumeProjection_disabled.golden.stderr",
 			exitCode:             1,
 			injectProxy:          false,
+			values: func() *linkerd2.Values {
+				values, _ := testInstallValues()
+				values.Identity.ServiceAccountTokenProjection = false
+				return values
+			}(),
 		},
 		{
 			inputFileName:        "inject_emojivoto_istio.input.yml",
@@ -444,11 +540,14 @@ func testInjectFilePath(t *testing.T, tc injectFilePath) {
 	transformer := &resourceTransformerInject{
 		injectProxy: true,
 		values:      values,
+		overrider:   inject.GetOverriddenValues,
 	}
-	if exitCode := runInjectCmd(in, errBuf, actual, transformer); exitCode != 0 {
+	if exitCode := runInjectCmd(in, errBuf, actual, transformer, "yaml"); exitCode != 0 {
 		t.Fatal("Unexpected error. Exit code from runInjectCmd: ", exitCode)
 	}
-	testDataDiffer.DiffTestdata(t, tc.expectedFile, actual.String())
+	if err := testDataDiffer.DiffTestYAML(tc.expectedFile, actual.String()); err != nil {
+		t.Error(err)
+	}
 
 	stdErrFile := mkFilename(tc.stdErrFile, verbose)
 	testDataDiffer.DiffTestdata(t, stdErrFile, errBuf.String())
@@ -469,13 +568,16 @@ func testReadFromFolder(t *testing.T, resourceFolder string, expectedFolder stri
 	transformer := &resourceTransformerInject{
 		injectProxy: true,
 		values:      values,
+		overrider:   inject.GetOverriddenValues,
 	}
-	if exitCode := runInjectCmd(in, errBuf, actual, transformer); exitCode != 0 {
+	if exitCode := runInjectCmd(in, errBuf, actual, transformer, "yaml"); exitCode != 0 {
 		t.Fatal("Unexpected error. Exit code from runInjectCmd: ", exitCode)
 	}
 
 	expectedFile := filepath.Join(expectedFolder, "injected_nginx_redis.yaml")
-	testDataDiffer.DiffTestdata(t, expectedFile, actual.String())
+	if err := testDataDiffer.DiffTestYAML(expectedFile, actual.String()); err != nil {
+		t.Error(err)
+	}
 
 	stdErrFileName := mkFilename(filepath.Join(expectedFolder, "injected_nginx_redis.stderr"), verbose)
 	testDataDiffer.DiffTestdata(t, stdErrFileName, errBuf.String())
@@ -526,7 +628,7 @@ func TestInjectFilePath(t *testing.T) {
 	})
 }
 
-func TestValidURL(t *testing.T) {
+func TestToURL(t *testing.T) {
 	// if the string follows a URL pattern, true has to be returned
 	// if not false is returned
 
@@ -542,9 +644,9 @@ func TestValidURL(t *testing.T) {
 	}
 
 	for url, expectedValue := range tests {
-		value := isValidURL(url)
-		if value != expectedValue {
-			t.Errorf("Result mismatch for %s. expected %v, but got %v", url, expectedValue, value)
+		_, ok := toURL(url)
+		if ok != expectedValue {
+			t.Errorf("Result mismatch for %s. expected %v, but got %v", url, expectedValue, ok)
 		}
 	}
 
@@ -569,14 +671,14 @@ func TestWalk(t *testing.T) {
 	}()
 
 	var (
-		data  = []byte(testutil.ReadTestdata(t, "inject_gettest_deployment.bad.input.yml"))
+		data  = []byte(testutil.ReadTestdata("inject_gettest_deployment.bad.input.yml"))
 		file1 = filepath.Join(tmpFolderRoot, "root.txt")
 		file2 = filepath.Join(tmpFolderData, "data.txt")
 	)
-	if err := ioutil.WriteFile(file1, data, 0644); err != nil {
+	if err := os.WriteFile(file1, data, 0600); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
-	if err := ioutil.WriteFile(file2, data, 0644); err != nil {
+	if err := os.WriteFile(file2, data, 0600); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
 
@@ -611,9 +713,9 @@ func TestProxyConfigurationAnnotations(t *testing.T) {
 	values.Proxy.Ports.Inbound = 4144
 	values.Proxy.Ports.Outbound = 4141
 	values.Proxy.UID = 999
+	values.Proxy.GID = 999
 	values.Proxy.LogLevel = "debug"
 	values.Proxy.LogFormat = "cool"
-	values.Proxy.DisableIdentity = true
 	values.Proxy.EnableExternalProfiles = true
 	values.Proxy.Resources.CPU.Request = "10m"
 	values.Proxy.Resources.CPU.Limit = "100m"
@@ -621,6 +723,8 @@ func TestProxyConfigurationAnnotations(t *testing.T) {
 	values.Proxy.Resources.Memory.Limit = "50Mi"
 	values.Proxy.WaitBeforeExitSeconds = 10
 	values.Proxy.Await = false
+	values.Proxy.AccessLog = "apache"
+	values.Proxy.ShutdownGracePeriod = "60s"
 
 	expectedOverrides := map[string]string{
 		k8s.ProxyIgnoreInboundPortsAnnotation:  "8500-8505",
@@ -630,9 +734,9 @@ func TestProxyConfigurationAnnotations(t *testing.T) {
 		k8s.ProxyInboundPortAnnotation:         "4144",
 		k8s.ProxyOutboundPortAnnotation:        "4141",
 		k8s.ProxyUIDAnnotation:                 "999",
+		k8s.ProxyGIDAnnotation:                 "999",
 		k8s.ProxyLogLevelAnnotation:            "debug",
 		k8s.ProxyLogFormatAnnotation:           "cool",
-		k8s.ProxyDisableIdentityAnnotation:     "true",
 
 		k8s.ProxyEnableExternalProfilesAnnotation: "true",
 		k8s.ProxyCPURequestAnnotation:             "10m",
@@ -641,6 +745,8 @@ func TestProxyConfigurationAnnotations(t *testing.T) {
 		k8s.ProxyMemoryLimitAnnotation:            "50Mi",
 		k8s.ProxyWaitBeforeExitSecondsAnnotation:  "10",
 		k8s.ProxyAwait:                            "disabled",
+		k8s.ProxyAccessLogAnnotation:              "apache",
+		k8s.ProxyShutdownGracePeriodAnnotation:    "60s",
 	}
 
 	overrides := getOverrideAnnotations(values, baseValues)
@@ -667,30 +773,6 @@ func TestProxyImageAnnotations(t *testing.T) {
 		k8s.ProxyImageAnnotation:           "my.registry/linkerd/proxy",
 		k8s.ProxyVersionOverrideAnnotation: "test-proxy-version",
 		k8s.ProxyImagePullPolicyAnnotation: "Always",
-	}
-
-	overrides := getOverrideAnnotations(values, baseValues)
-
-	diffOverrides(t, expectedOverrides, overrides)
-}
-
-func TestProxyInitImageAnnotations(t *testing.T) {
-	baseValues, err := linkerd2.NewValues()
-	if err != nil {
-		t.Fatal(err)
-	}
-	values, err := baseValues.DeepCopy()
-	if err != nil {
-		t.Fatal(err)
-	}
-	values.ProxyInit.Image = &linkerd2.Image{
-		Name:    "my.registry/linkerd/proxy-init",
-		Version: "test-proxy-init-version",
-	}
-
-	expectedOverrides := map[string]string{
-		k8s.ProxyInitImageAnnotation:        "my.registry/linkerd/proxy-init",
-		k8s.ProxyInitImageVersionAnnotation: "test-proxy-init-version",
 	}
 
 	overrides := getOverrideAnnotations(values, baseValues)
@@ -760,7 +842,7 @@ func TestOverwriteRegistry(t *testing.T) {
 	for i, tc := range testCases {
 		tc := tc // pin
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			actual := registryOverride(tc.image, tc.registry)
+			actual := cmd.RegistryOverride(tc.image, tc.registry)
 			if actual != tc.expected {
 				t.Fatalf("expected %q, but got %q", tc.expected, actual)
 			}
@@ -769,6 +851,7 @@ func TestOverwriteRegistry(t *testing.T) {
 }
 
 func diffOverrides(t *testing.T, expectedOverrides map[string]string, actualOverrides map[string]string) {
+	t.Helper()
 	if len(expectedOverrides) != len(actualOverrides) {
 		t.Fatalf("expected annotations:\n%s\nbut received:\n%s", expectedOverrides, actualOverrides)
 	}

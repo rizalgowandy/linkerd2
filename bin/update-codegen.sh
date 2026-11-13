@@ -1,32 +1,64 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 
-set -eu
+set -o errexit
+set -o nounset
+set -o pipefail
 
-bindir=$( cd "${0%/*}" && pwd )
-rootdir=$( cd "$bindir"/.. && pwd )
-gen_ver=$( awk '/k8s.io\/code-generator/ { print $2 }' "$rootdir/go.mod" )
-codegen_pkg=${GOPATH}/pkg/mod/k8s.io/code-generator@${gen_ver}
+SCRIPT_DIR=$(dirname "${BASH_SOURCE[0]}")
+SCRIPT_ROOT=$(dirname "${SCRIPT_DIR}")
+GEN_VER=$( awk '/k8s.io\/code-generator/ { print $2 }' "${SCRIPT_ROOT}/go.mod" )
+KUBE_OPEN_API_VER=$( awk '/k8s.io\/kube-openapi/ { print $2 }' "${SCRIPT_ROOT}/go.mod" )
+CODEGEN_PKG=$(mktemp -d -t "code-generator-${GEN_VER}.XXX")/code-generator
 
-# ROOT_PACKAGE :: the package that is the target for code generation
-ROOT_PACKAGE=github.com/linkerd/linkerd2
-# CUSTOM_RESOURCE_NAME :: the name of the custom resource that we're generating client code for
-CUSTOM_RESOURCE_NAME=serviceprofile
-# CUSTOM_RESOURCE_VERSION :: the version of the resource
-CUSTOM_RESOURCE_VERSION=v1alpha2
+git clone --depth 1 --branch "$GEN_VER" https://github.com/kubernetes/code-generator "$CODEGEN_PKG"
+(
+    cd "$CODEGEN_PKG"
+    go get k8s.io/kube-openapi/pkg/common@"$KUBE_OPEN_API_VER"
+)
 
-rm -f "${rootdir}/controller/gen/apis/${CUSTOM_RESOURCE_NAME}/${CUSTOM_RESOURCE_VERSION}/zz_generated.deepcopy.go"
-rm -rf "${rootdir}/controller/gen/client"
-rm -rf "${GOPATH}/src/${ROOT_PACKAGE}/controller/gen"
+# Remove previously generated code
+rm -rf "${SCRIPT_ROOT}/controller/gen/client/clientset/*"
+rm -rf "${SCRIPT_ROOT}/controller/gen/client/listeners/*"
+rm -rf "${SCRIPT_ROOT}/controller/gen/client/informers/*"
+crds=(serviceprofile server serverauthorization link policy policy externalworkload)
+for crd in "${crds[@]}"
+do
+  rm -f "${SCRIPT_ROOT}"/controller/gen/apis/"${crd}"/*/zz_generated.deepcopy.go
+done
 
-chmod +x "${codegen_pkg}/generate-groups.sh"
+# shellcheck disable=SC1091
+source "${CODEGEN_PKG}/kube_codegen.sh"
 
-# run the code-generator entrypoint script
-GO111MODULE='on' "${codegen_pkg}/generate-groups.sh" \
-  'deepcopy,client,informer,lister' \
-  "${ROOT_PACKAGE}/controller/gen/client" \
-  "${ROOT_PACKAGE}/controller/gen/apis" \
-  "${CUSTOM_RESOURCE_NAME}:${CUSTOM_RESOURCE_VERSION}" \
-  --go-header-file "${codegen_pkg}"/hack/boilerplate.go.txt
+# Create a symlink so that the root of the repo is inside github.com/linkerd/linkerd2.
+# This is required because the codegen scripts expect it.
+mkdir -p "${SCRIPT_ROOT}/github.com/linkerd"
+ln -s "$(realpath "${SCRIPT_ROOT}")" "${SCRIPT_ROOT}/github.com/linkerd/linkerd2"
 
-# copy generated code out of GOPATH
-cp -R "${GOPATH}/src/${ROOT_PACKAGE}/controller/gen" 'controller/'
+kube::codegen::gen_helpers \
+    --boilerplate "${SCRIPT_ROOT}/controller/gen/boilerplate.go.txt" \
+    github.com/linkerd/linkerd2/controller/gen/apis
+
+if [ -n "${API_KNOWN_VIOLATIONS_DIR:-}" ]; then
+    report_filename=${API_KNOWN_VIOLATIONS_DIR}/codegen_violation_exceptions.list
+    if [ "${UPDATE_API_KNOWN_VIOLATIONS:-}" = 'true' ]; then
+        update_report='--update-report'
+    fi
+fi
+
+kube::codegen::gen_openapi \
+    --output-pkg github.com/linkerd/linkerd2/controller/gen \
+    --output-dir "${SCRIPT_ROOT}/controller/gen/client" \
+    --report-filename "${report_filename:-"/dev/null"}" \
+    ${update_report:+"${update_report}"} \
+    --boilerplate "${SCRIPT_ROOT}/controller/gen/boilerplate.go.txt" \
+    github.com/linkerd/linkerd2/controller/gen/apis
+
+kube::codegen::gen_client \
+    --with-watch \
+    --output-pkg github.com/linkerd/linkerd2/controller/gen/client \
+    --output-dir "${SCRIPT_ROOT}/controller/gen/client" \
+    --boilerplate "${SCRIPT_ROOT}/controller/gen/boilerplate.go.txt" \
+    github.com/linkerd/linkerd2/controller/gen/apis
+
+# Once the code has been generated, we can remove the symlink.
+rm -rf "${SCRIPT_ROOT}/github.com"

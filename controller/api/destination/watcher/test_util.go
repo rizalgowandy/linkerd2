@@ -1,11 +1,13 @@
 package watcher
 
 import (
-	"encoding/json"
-	"reflect"
+	"fmt"
+	"sync"
 	"testing"
 
+	"github.com/go-test/deep"
 	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
+	"github.com/linkerd/linkerd2/controller/k8s"
 )
 
 // DeletingProfileListener implements ProfileUpdateListener and registers
@@ -24,8 +26,7 @@ func NewDeletingProfileListener() *DeletingProfileListener {
 // Update registers a deletion
 func (dpl *DeletingProfileListener) Update(profile *sp.ServiceProfile) {
 	if profile == nil {
-		dpl.NumDeletes = dpl.NumDeletes + 1
-
+		dpl.NumDeletes++
 	}
 }
 
@@ -33,6 +34,7 @@ func (dpl *DeletingProfileListener) Update(profile *sp.ServiceProfile) {
 // in a slice.  Useful for unit tests.
 type BufferingProfileListener struct {
 	Profiles []*sp.ServiceProfile
+	mu       sync.RWMutex
 }
 
 // NewBufferingProfileListener creates a new BufferingProfileListener.
@@ -42,15 +44,54 @@ func NewBufferingProfileListener() *BufferingProfileListener {
 	}
 }
 
+func CreateMockDecoder(configs ...string) configDecoder {
+	// Create a mock decoder with some random objs to satisfy client creation
+	return func(data []byte, cluster string, enableEndpointSlices bool) (*k8s.API, *k8s.MetadataAPI, error) {
+		remoteAPI, err := k8s.NewFakeAPI(configs...)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		metadataAPI, err := k8s.NewFakeMetadataAPI(nil)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return remoteAPI, metadataAPI, nil
+	}
+
+}
+
+func CreateMulticlusterDecoder(configs map[string][]string) configDecoder {
+	return func(data []byte, cluster string, enableEndpointSlices bool) (*k8s.API, *k8s.MetadataAPI, error) {
+		configs, ok := configs[cluster]
+		if !ok {
+			return nil, nil, fmt.Errorf("cluster %s not found in configs", cluster)
+		}
+		remoteAPI, err := k8s.NewFakeAPI(configs...)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		metadataAPI, err := k8s.NewFakeMetadataAPI(nil)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		return remoteAPI, metadataAPI, nil
+	}
+}
+
 // Update stores the update in the internal buffer.
 func (bpl *BufferingProfileListener) Update(profile *sp.ServiceProfile) {
+	bpl.mu.Lock()
+	defer bpl.mu.Unlock()
 	bpl.Profiles = append(bpl.Profiles, profile)
 }
 
 func testCompare(t *testing.T, expected interface{}, actual interface{}) {
-	if !reflect.DeepEqual(expected, actual) {
-		expectedBytes, _ := json.Marshal(expected)
-		actualBytes, _ := json.Marshal(actual)
-		t.Fatalf("Expected %s but got %s", string(expectedBytes), string(actualBytes))
+	t.Helper()
+	if diff := deep.Equal(expected, actual); diff != nil {
+		t.Fatalf("%v", diff)
 	}
 }

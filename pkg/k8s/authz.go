@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	authV1 "k8s.io/api/authorization/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
@@ -48,11 +48,15 @@ func ResourceAuthz(
 func ResourceAuthzForUser(
 	ctx context.Context,
 	client kubernetes.Interface,
-	namespace, verb, group, version, resource, subresource, name, user string, userGroups []string) error {
+	namespace, verb, group, version, resource, subresource, name, user string,
+	userGroups []string,
+	extra map[string]authV1.ExtraValue,
+) error {
 	sar := &authV1.SubjectAccessReview{
 		Spec: authV1.SubjectAccessReviewSpec{
 			User:   user,
 			Groups: userGroups,
+			Extra:  extra,
 			ResourceAttributes: &authV1.ResourceAttributes{
 				Namespace:   namespace,
 				Verb:        verb,
@@ -110,6 +114,60 @@ func ServiceProfilesAccess(ctx context.Context, k8sClient kubernetes.Interface) 
 	return errors.New("ServiceProfile CRD not found")
 }
 
+// ServersAccess checks whether the Server CRD is installed on the cluster
+// and the client is authorized to access Servers.
+func ServersAccess(ctx context.Context, k8sClient kubernetes.Interface) error {
+	groupVersion := fmt.Sprintf("%s/%s", PolicyAPIGroup, PolicyServerCRDVersion)
+	res, err := k8sClient.Discovery().ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		return err
+	}
+	if res.GroupVersion == groupVersion {
+		for _, apiRes := range res.APIResources {
+			if apiRes.Kind == ServerKind {
+				return ResourceAuthz(ctx, k8sClient, "", "list", PolicyAPIGroup, "", "servers", "")
+			}
+		}
+	}
+	return fmt.Errorf("server CRD (%s) not found", groupVersion)
+}
+
+// ExtWorkloadAccess checks whether the ExternalWorkload CRD is installed on the
+// cluster and the client is authorized to access ExternalWorkloads
+func ExtWorkloadAccess(ctx context.Context, k8sClient kubernetes.Interface) error {
+	groupVersion := fmt.Sprintf("%s/%s", WorkloadAPIGroup, WorkloadAPIVersion)
+	res, err := k8sClient.Discovery().ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		return err
+	}
+	if res.GroupVersion == groupVersion {
+		for _, apiRes := range res.APIResources {
+			if apiRes.Kind == ExtWorkloadKind {
+				return ResourceAuthz(ctx, k8sClient, "", "list", WorkloadAPIGroup, "", "externalworkloads", "")
+			}
+		}
+	}
+	return errors.New("ExternalWorkload CRD not found")
+}
+
+// LinksAccess checks whether the Links CRD is installed on the
+// cluster and the client is authorized to access Links
+func LinksAccess(ctx context.Context, k8sClient kubernetes.Interface) error {
+	groupVersion := fmt.Sprintf("%s/%s", LinkAPIGroup, LinkAPIVersion)
+	res, err := k8sClient.Discovery().ServerResourcesForGroupVersion(groupVersion)
+	if err != nil {
+		return err
+	}
+	if res.GroupVersion == groupVersion {
+		for _, apiRes := range res.APIResources {
+			if apiRes.Kind == LinkKind {
+				return ResourceAuthz(ctx, k8sClient, "", "list", LinkAPIGroup, "", "links", "")
+			}
+		}
+	}
+	return errors.New("Links CRD not found")
+}
+
 // EndpointSliceAccess verifies whether the K8s cluster has
 // access to EndpointSlice resources.
 func EndpointSliceAccess(ctx context.Context, k8sClient kubernetes.Interface) error {
@@ -131,7 +189,7 @@ func EndpointSliceAccess(ctx context.Context, k8sClient kubernetes.Interface) er
 }
 
 func checkEndpointSlicesExist(ctx context.Context, k8sClient kubernetes.Interface) error {
-	sliceList, err := k8sClient.DiscoveryV1beta1().EndpointSlices("").List(ctx, metav1.ListOptions{})
+	sliceList, err := k8sClient.DiscoveryV1().EndpointSlices("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err
 	}

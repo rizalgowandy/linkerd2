@@ -6,18 +6,18 @@ import Dialog from '@material-ui/core/Dialog';
 import DialogActions from '@material-ui/core/DialogActions';
 import DialogContent from '@material-ui/core/DialogContent';
 import DialogTitle from '@material-ui/core/DialogTitle';
-import ErrorBanner from './ErrorBanner.jsx';
 import Grid from '@material-ui/core/Grid';
 import Paper from '@material-ui/core/Paper';
 import PriorityHigh from '@material-ui/icons/PriorityHigh';
 import PropTypes from 'prop-types';
 import React from 'react';
-import SimpleChip from './util/Chip.jsx';
 import Slide from '@material-ui/core/Slide';
 import { Trans } from '@lingui/macro';
 import Typography from '@material-ui/core/Typography';
 import withMobileDialog from '@material-ui/core/withMobileDialog';
 import { withStyles } from '@material-ui/core/styles';
+import SimpleChip from './util/Chip.jsx';
+import ErrorBanner from './ErrorBanner.jsx';
 
 const styles = theme => ({
   wrapper: {
@@ -91,7 +91,7 @@ const Transition = React.forwardRef((props, ref) => {
   return <Slide direction="down" ref={ref} {...props} />;
 });
 
-const Results = ({ title, results, classes }) => {
+const Results = function({ title, results, classes }) {
   const getResultType = (error, warning) => {
     if (error) {
       if (warning) {
@@ -161,7 +161,7 @@ Results.propTypes = {
   title: PropTypes.string.isRequired,
 };
 
-const Icon = ({ type, classes }) => {
+const Icon = function({ type, classes }) {
   return (
     <React.Fragment>
       {(() => {
@@ -209,7 +209,7 @@ class CheckModal extends React.Component {
         open: !prevState.open,
       };
     });
-  }
+  };
 
   runCheck = () => {
     this.setState({
@@ -218,7 +218,7 @@ class CheckModal extends React.Component {
     });
 
     this.api.setCurrentRequests([this.api.fetchCheck()]);
-    this.serverPromise = Promise.all(this.api.getCurrentPromises())
+    Promise.all(this.api.getCurrentPromises())
       .then(([response]) => {
         this.setState({
           running: false,
@@ -228,14 +228,14 @@ class CheckModal extends React.Component {
         });
       })
       .catch(this.handleApiError);
-  }
+  };
 
   handleApiError = error => {
     this.setState({
       running: false,
       error,
     });
-  }
+  };
 
   render() {
     const { open, running, success, results, error } = this.state;
@@ -246,7 +246,7 @@ class CheckModal extends React.Component {
         <Grid
           container
           direction="row"
-          justify="center"
+          justifyContent="center"
           alignItems="center"
           spacing={3}>
           <Grid className={classes.wrapper} item>
@@ -276,7 +276,7 @@ class CheckModal extends React.Component {
             <Grid
               container
               direction="row"
-              justify="space-between"
+              justifyContent="space-between"
               alignItems="center">
               <Grid item>
                 Linkerd Check

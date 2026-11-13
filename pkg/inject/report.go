@@ -34,8 +34,21 @@ var (
 		injectDisableAnnotationPresent:       fmt.Sprintf("pod has the annotation \"%s:%s\"", k8s.ProxyInjectAnnotation, k8s.ProxyInjectDisabled),
 		invalidInjectAnnotationWorkload:      fmt.Sprintf("invalid value for annotation \"%s\" at workload", k8s.ProxyInjectAnnotation),
 		invalidInjectAnnotationNamespace:     fmt.Sprintf("invalid value for annotation \"%s\" at namespace", k8s.ProxyInjectAnnotation),
-		disabledAutomountServiceAccountToken: "automountServiceAccountToken set to \"false\"",
+		disabledAutomountServiceAccountToken: "automountServiceAccountToken set to \"false\", with Values.identity.serviceAccountTokenProjection set to \"false\"",
 		udpPortsEnabled:                      "UDP port(s) configured on pod spec",
+	}
+
+	// Set of valid inject annotation values
+	ValidInjectAnnotationValues = map[string]struct{}{
+		k8s.ProxyInjectEnabled:  {},
+		k8s.ProxyInjectDisabled: {},
+		k8s.ProxyInjectIngress:  {},
+	}
+
+	// Set of inject annotation values that indicate that injection is enabled
+	InjectEnabledValues = map[string]struct{}{
+		k8s.ProxyInjectEnabled: {},
+		k8s.ProxyInjectIngress: {},
 	}
 )
 
@@ -47,10 +60,11 @@ type Report struct {
 	HostNetwork                  bool
 	Sidecar                      bool
 	UDP                          bool // true if any port in any container has `protocol: UDP`
-	UnsupportedResource          bool
+	UnsupportedResource          bool // unsupported to inject
 	InjectDisabled               bool
 	InjectDisabledReason         string
 	InjectAnnotationAt           string
+	InjectAnnotationValue        string
 	Annotatable                  bool
 	Annotated                    bool
 	AutomountServiceAccountToken bool
@@ -86,16 +100,20 @@ func newReport(conf *ResourceConfig) *Report {
 	}
 
 	if conf.HasPodTemplate() {
-		report.InjectDisabled, report.InjectDisabledReason, report.InjectAnnotationAt = report.disabledByAnnotation(conf)
+		report.InjectDisabled, report.InjectDisabledReason, report.InjectAnnotationAt, report.InjectAnnotationValue = report.disabledByAnnotation(conf)
 		report.HostNetwork = conf.pod.spec.HostNetwork
 		report.Sidecar = healthcheck.HasExistingSidecars(conf.pod.spec)
 		report.UDP = checkUDPPorts(conf.pod.spec)
-		if conf.pod.spec.AutomountServiceAccountToken != nil {
+		if conf.pod.spec.AutomountServiceAccountToken != nil &&
+			(conf.values != nil && !conf.values.Identity.ServiceAccountTokenProjection) {
 			report.AutomountServiceAccountToken = *conf.pod.spec.AutomountServiceAccountToken
 		}
 		if conf.origin == OriginWebhook {
 			if vm := conf.serviceAccountVolumeMount(); vm == nil {
-				report.AutomountServiceAccountToken = false
+				// set to false only if it is not using the new linkerd-token volume projection
+				if conf.values != nil && !conf.values.Identity.ServiceAccountTokenProjection {
+					report.AutomountServiceAccountToken = false
+				}
 			}
 		}
 	} else {
@@ -162,7 +180,7 @@ func checkUDPPorts(t *v1.PodSpec) bool {
 // disabledByAnnotation checks the workload and namespace for the annotation
 // that disables injection. It returns if it is disabled, why it is disabled,
 // and the location where the annotation was present.
-func (r *Report) disabledByAnnotation(conf *ResourceConfig) (bool, string, string) {
+func (r *Report) disabledByAnnotation(conf *ResourceConfig) (bool, string, string, string) {
 	// truth table of the effects of the inject annotation:
 	//
 	// origin  | namespace | pod      | inject?  | return
@@ -184,35 +202,43 @@ func (r *Report) disabledByAnnotation(conf *ResourceConfig) (bool, string, strin
 	nsAnnotation := conf.nsAnnotations[k8s.ProxyInjectAnnotation]
 
 	if conf.origin == OriginCLI {
-		return podAnnotation == k8s.ProxyInjectDisabled, "", ""
+		return podAnnotation == k8s.ProxyInjectDisabled, "", "", podAnnotation
 	}
 
 	if !isInjectAnnotationValid(nsAnnotation) {
-		return true, invalidInjectAnnotationNamespace, ""
+		return true, invalidInjectAnnotationNamespace, "", nsAnnotation
 	}
 
 	if !isInjectAnnotationValid(podAnnotation) {
-		return true, invalidInjectAnnotationWorkload, ""
+		return true, invalidInjectAnnotationWorkload, "", podAnnotation
 	}
 
-	if nsAnnotation == k8s.ProxyInjectEnabled || nsAnnotation == k8s.ProxyInjectIngress {
+	if doesAnnotationEnableInject(nsAnnotation) {
 		if podAnnotation == k8s.ProxyInjectDisabled {
-			return true, injectDisableAnnotationPresent, annotationAtWorkload
+			return true, injectDisableAnnotationPresent, annotationAtWorkload, podAnnotation
 		}
-		return false, "", annotationAtNamespace
+		return false, "", annotationAtNamespace, nsAnnotation
 	}
 
-	if podAnnotation != k8s.ProxyInjectEnabled && podAnnotation != k8s.ProxyInjectIngress {
-		return true, injectEnableAnnotationAbsent, ""
+	if !doesAnnotationEnableInject(podAnnotation) {
+		return true, injectEnableAnnotationAbsent, "", podAnnotation
 	}
 
-	return false, "", annotationAtWorkload
+	return false, "", annotationAtWorkload, podAnnotation
+}
+
+func doesAnnotationEnableInject(annotation string) bool {
+	_, isEnabledValue := InjectEnabledValues[annotation]
+	return isEnabledValue
 }
 
 func isInjectAnnotationValid(annotation string) bool {
-	if annotation != "" && !(annotation == k8s.ProxyInjectEnabled || annotation == k8s.ProxyInjectDisabled || annotation == k8s.ProxyInjectIngress) {
+	_, validValue := ValidInjectAnnotationValues[annotation]
+	if annotation != "" && !validValue {
+		// If the annotation is not empty, it must be a valid value
 		return false
 	}
+
 	return true
 }
 

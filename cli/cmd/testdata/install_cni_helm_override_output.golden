@@ -1,36 +1,5 @@
 ---
 # Source: linkerd2-cni/templates/cni-plugin.yaml
-kind: Namespace
-apiVersion: v1
-metadata:
-  name: linkerd-test
-  annotations:
-    linkerd.io/inject: disabled
-  labels:
-    linkerd.io/cni-resource: "true"
-    config.linkerd.io/admission-webhooks: disabled
----
-apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
-metadata:
-  name: linkerd-linkerd-test-cni
-  labels:
-    linkerd.io/cni-resource: "true"
-spec:
-  allowPrivilegeEscalation: false
-  fsGroup:
-    rule: RunAsAny
-  hostNetwork: true
-  runAsUser:
-    rule: RunAsAny
-  seLinux:
-    rule: RunAsAny
-  supplementalGroups:
-    rule: RunAsAny
-  volumes:
-  - hostPath
-  - secret
----
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -38,36 +7,6 @@ metadata:
   namespace: linkerd-test
   labels:
     linkerd.io/cni-resource: "true"
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: linkerd-cni
-  namespace: linkerd-test
-  labels:
-    linkerd.io/cni-resource: "true"
-rules:
-- apiGroups: ['extensions', 'policy']
-  resources: ['podsecuritypolicies']
-  resourceNames:
-  - linkerd-linkerd-test-cni
-  verbs: ['use']
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: linkerd-cni
-  namespace: linkerd-test
-  labels:
-    linkerd.io/cni-resource: "true"
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: linkerd-cni
-subjects:
-- kind: ServiceAccount
-  name: linkerd-cni
-  namespace: linkerd-test
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
@@ -77,7 +16,7 @@ metadata:
     linkerd.io/cni-resource: "true"
 rules:
 - apiGroups: [""]
-  resources: ["pods", "nodes", "namespaces"]
+  resources: ["pods", "nodes", "namespaces", "services"]
   verbs: ["list", "get", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -107,16 +46,12 @@ data:
   dest_cni_bin_dir: "/opt/cni/bin-test"
   # The CNI network configuration to install on each node. The special
   # values in this config will be automatically populated.
+  # iptables-mode and ipv6 flags are only considered as of linkerd-cni v1.4.0
   cni_network_config: |-
     {
       "name": "linkerd-cni",
       "type": "linkerd-cni",
       "log_level": "debug",
-      "policy": {
-          "type": "k8s",
-          "k8s_api_root": "https://__KUBERNETES_SERVICE_HOST__:__KUBERNETES_SERVICE_PORT__",
-          "k8s_auth_token": "__SERVICEACCOUNT_TOKEN__"
-      },
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       },
@@ -124,9 +59,13 @@ data:
         "incoming-proxy-port": 1234,
         "outgoing-proxy-port": 5678,
         "proxy-uid": 1111,
+        "proxy-gid": 1111,
         "ports-to-redirect": [],
+        "inbound-ports-to-ignore": ["4191","4190"],
         "simulate": false,
-        "use-wait-flag": true
+        "use-wait-flag": true,
+        "iptables-mode": "nft",
+        "ipv6": false
       }
     }
 ---
@@ -141,23 +80,30 @@ metadata:
   annotations:
     linkerd.io/created-by: test-version
 spec:
+  revisionHistoryLimit: 10
   selector:
     matchLabels:
       k8s-app: linkerd-cni
   updateStrategy:
-    type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 1
+    type: RollingUpdate
   template:
     metadata:
       labels:
         k8s-app: linkerd-cni
+        linkerd.io/cni-resource: "true"
       annotations:
         linkerd.io/created-by: test-version
+        linkerd.io/inject: disabled
     spec:
+      tolerations:
+        - operator: Exists
       nodeSelector:
-        beta.kubernetes.io/os: linux
-      hostNetwork: true
+        kubernetes.io/os: linux
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: linkerd-cni
       priorityClassName: system-node-critical
       containers:
@@ -166,7 +112,8 @@ spec:
       # script copies the files into place and then sleeps so
       # that Kubernetes doesn't keep trying to restart it.
       - name: install-cni
-        image: cr.l5d.io/linkerd/cni-plugin-test:test-version
+        image: cr.l5d.io/linkerd/cni-plugin:v1.4.0
+        imagePullPolicy: IfNotPresent
         env:
         - name: DEST_CNI_NET_DIR
           valueFrom:
@@ -193,12 +140,18 @@ spec:
               command:
               - /bin/sh
               - -c
-              - kill -15 1
+              - kill -15 1; sleep 15s
         volumeMounts:
         - mountPath: /host/opt/cni/bin-test
           name: cni-bin-dir
         - mountPath: /host/etc/cni/net.d-test
           name: cni-net-dir
+        - mountPath: /tmp
+          name: linkerd-tmp-dir
+        securityContext:
+          readOnlyRootFilesystem: true
+          privileged: false
+        resources:
       volumes:
       - name: cni-bin-dir
         hostPath:
@@ -206,3 +159,5 @@ spec:
       - name: cni-net-dir
         hostPath:
           path: /etc/cni/net.d-test
+      - name: linkerd-tmp-dir
+        emptyDir: {}

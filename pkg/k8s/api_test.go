@@ -1,6 +1,7 @@
 package k8s
 
 import (
+	"context"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,30 @@ metadata:
     linkerd.io/control-plane-ns: linkerd
 status:
   phase: Running
+`,
+		},
+		{
+			desc:     "Pod with proxy native sidecar is running",
+			expected: "Running",
+			pod: `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emoji
+  namespace: emojivoto
+  labels:
+    app: emoji-svc
+    linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: linkerd-proxy
+      restartPolicy: Always
+status:
+  phase: Running
+  initContainerStatuses:
+  - name: linkerd-proxy
+    ready: true
+    started: true
 `,
 		},
 		{
@@ -164,6 +189,9 @@ metadata:
   labels:
     app: emoji-svc
     linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: foo
 status:
   phase: Running
   containerStatuses:
@@ -171,7 +199,8 @@ status:
       running:
         startedAt: 1995-02-10T00:42:42Z
   initContainerStatuses:
-  - state:
+  - name: foo
+    state:
       terminated:
         exitCode: 0
         reason: Completed
@@ -189,14 +218,21 @@ metadata:
   labels:
     app: emoji-svc
     linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: foo
+    containers:
+    - name: bar
 status:
   phase: Running
   containerStatuses:
-  - state:
+  - name: bar
+    state:
       running:
         startedAt: 1995-02-10T00:42:42Z
   initContainerStatuses:
-  - state:
+  - name: foo
+    state:
       terminated:
         exitCode: 2
 `,
@@ -213,14 +249,21 @@ metadata:
   labels:
     app: emoji-svc
     linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: foo
+    containers:
+    - name: bar
 status:
   phase: Running
   containerStatuses:
-  - state:
+  - name: bar
+    state:
       running:
         startedAt: 1995-02-10T00:42:42Z
   initContainerStatuses:
-  - state:
+  - name: foo
+    state:
       terminated:
         signal: 9
 `,
@@ -237,10 +280,14 @@ metadata:
   labels:
     app: emoji-svc
     linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: foo
 status:
   phase: Pending
   initContainerStatuses:
-  - state:
+  - name: foo
+    state:
       terminated:
         exitCode: 2
         reason: CrashLoopBackOff
@@ -258,17 +305,21 @@ metadata:
   labels:
     app: emoji-svc
     linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: foo
 status:
   phase: Pending
   initContainerStatuses:
-  - state:
+  - name: foo
+    state:
       waiting:
         reason: someReason
 `,
 		},
 		{
 			desc:     "Pod init container is waiting on PodInitializing",
-			expected: "Init:0/0",
+			expected: "Init:0/1",
 			pod: `
 apiVersion: v1
 kind: Pod
@@ -278,10 +329,14 @@ metadata:
   labels:
     app: emoji-svc
     linkerd.io/control-plane-ns: linkerd
+spec:
+    initContainers:
+    - name: foo
 status:
   phase: Pending
   initContainerStatuses:
-  - state:
+  - name: foo
+    state:
       waiting:
         reason: PodInitializing
 `,
@@ -301,5 +356,127 @@ status:
 		if s.expected != got {
 			t.Fatalf("Wrong pod status on '%s'. Expected '%s', got '%s'", s.desc, s.expected, got)
 		}
+	}
+}
+
+func TestGetPodsFor(t *testing.T) {
+
+	configs := []string{
+		// pod-1
+		`apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-1
+  namespace: ns
+  uid: pod-1
+  labels:
+    app: foo
+  ownerReferences:
+  - apiVersion: apps/v1
+    controller: true
+    kind: ReplicaSet
+    name: rs-1
+    uid: rs-1
+`,
+		// rs-1
+		`apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: rs-1
+  namespace: ns
+  uid: rs-1
+  labels:
+    app: foo
+  ownerReferences:
+  - apiVersion: apps/v1
+    controller: true
+    kind: Deployment
+    name: deploy-1
+    uid: deploy-1
+spec:
+  selector:
+    matchLabels:
+      app: foo
+`,
+		// deploy-1
+		`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-1
+  namespace: ns
+  uid: deploy-1
+spec:
+  selector:
+    matchLabels:
+      app: foo
+`,
+		// pod-2
+		`apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-2
+  namespace: ns
+  uid: pod-2
+  labels:
+    app: foo
+  ownerReferences:
+  - apiVersion: apps/v1
+    controller: true
+    kind: ReplicaSet
+    name: rs-2
+    uid: rs-2
+`,
+		// rs-2
+		`apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: rs-2
+  namespace: ns
+  uid: rs-2
+  labels:
+    app: foo
+  ownerReferences:
+  - apiVersion: apps/v1
+    controller: true
+    kind: Deployment
+    name: deploy-2
+    uid: deploy-2
+spec:
+  selector:
+    matchLabels:
+     app: foo
+`,
+		// deploy-2
+		`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploy-2
+  namespace: ns
+  uid: deploy-2
+spec:
+  selector:
+    matchLabels:
+      app: foo
+`}
+
+	k8sClient, err := NewFakeAPI(configs...)
+	if err != nil {
+		t.Fatalf("Unexpected error %s", err)
+	}
+
+	// Both pod-1 and pod-2 have labels which match deploy-1's selector.
+	// However, only pod-1 is owned by deploy-1 according to the owner references.
+	// Owner references should be considered authoritative to resolve ambiguity
+	// when deployments have overlapping seletors.
+	pods, err := GetPodsFor(context.Background(), k8sClient, "ns", "deploy/deploy-1")
+	if err != nil {
+		t.Fatalf("Unexpected error %s", err)
+	}
+
+	if len(pods) != 1 {
+		for _, p := range pods {
+			t.Logf("%s/%s", p.Namespace, p.Name)
+		}
+		t.Fatalf("Expected 1 pod, got %d", len(pods))
 	}
 }

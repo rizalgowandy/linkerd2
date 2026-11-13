@@ -2,9 +2,9 @@ import PropTypes from 'prop-types';
 import React from 'react';
 import _merge from 'lodash/merge';
 import classNames from 'classnames';
+import { withStyles } from '@material-ui/core/styles';
 import { getSuccessRateClassification } from './MetricUtils.jsx';
 import { statusClassNames } from './theme.js';
-import { withStyles } from '@material-ui/core/styles';
 
 const styles = theme => _merge({}, statusClassNames(theme), {
   successRateDot: {
@@ -15,9 +15,9 @@ const styles = theme => _merge({}, statusClassNames(theme), {
   },
 });
 
-const SuccessRateDot = ({ sr, classes }) => (
-  <div className={classNames(classes.successRateDot, classes[getSuccessRateClassification(sr)])} />
-);
+const SuccessRateDot = function({ sr, classes }) {
+  return <div className={classNames(classes.successRateDot, classes[getSuccessRateClassification(sr)])} />;
+};
 
 SuccessRateDot.propTypes = {
   sr: PropTypes.number,

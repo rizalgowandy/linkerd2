@@ -243,16 +243,6 @@ func TestInjectable(t *testing.T) {
 			injectable: false,
 			reasons:    []string{hostNetworkEnabled, sidecarExists, injectEnableAnnotationAbsent},
 		},
-		{
-			podSpec: &corev1.PodSpec{},
-			podMeta: &metav1.ObjectMeta{
-				Annotations: map[string]string{
-					k8s.ProxyInjectAnnotation: k8s.ProxyInjectEnabled,
-				},
-			},
-			injectable: false,
-			reasons:    []string{disabledAutomountServiceAccountToken},
-		},
 	}
 
 	for i, testCase := range testCases {
@@ -381,10 +371,10 @@ func TestDisableByAnnotation(t *testing.T) {
 				resourceConfig := &ResourceConfig{origin: OriginWebhook}
 				resourceConfig.WithNsAnnotations(testCase.nsAnnotations)
 				resourceConfig.pod.meta = testCase.podMeta
-				resourceConfig.pod.spec = &corev1.PodSpec{} //initialize empty spec to prevent test from failing
+				resourceConfig.pod.spec = &corev1.PodSpec{} // initialize empty spec to prevent test from failing
 
 				report := newReport(resourceConfig)
-				if actual, _, _ := report.disabledByAnnotation(resourceConfig); testCase.expected != actual {
+				if actual, _, _, _ := report.disabledByAnnotation(resourceConfig); testCase.expected != actual {
 					t.Errorf("Expected %t. Actual %t", testCase.expected, actual)
 				}
 			})
@@ -423,10 +413,10 @@ func TestDisableByAnnotation(t *testing.T) {
 			t.Run(fmt.Sprintf("test case #%d", i), func(t *testing.T) {
 				resourceConfig := &ResourceConfig{origin: OriginCLI}
 				resourceConfig.pod.meta = testCase.podMeta
-				resourceConfig.pod.spec = &corev1.PodSpec{} //initialize empty spec to prevent test from failing
+				resourceConfig.pod.spec = &corev1.PodSpec{} // initialize empty spec to prevent test from failing
 
 				report := newReport(resourceConfig)
-				if actual, _, _ := report.disabledByAnnotation(resourceConfig); testCase.expected != actual {
+				if actual, _, _, _ := report.disabledByAnnotation(resourceConfig); testCase.expected != actual {
 					t.Errorf("Expected %t. Actual %t", testCase.expected, actual)
 				}
 			})

@@ -8,13 +8,16 @@ import (
 	"io"
 	"os"
 	"path"
+	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
+	"github.com/linkerd/linkerd2/charts"
 	"github.com/linkerd/linkerd2/cli/flag"
-	"github.com/linkerd/linkerd2/pkg/charts"
+	chartspkg "github.com/linkerd/linkerd2/pkg/charts"
 	l5dcharts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
-	"github.com/linkerd/linkerd2/pkg/charts/static"
+	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	flagspkg "github.com/linkerd/linkerd2/pkg/flags"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/k8s"
@@ -27,51 +30,52 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
 )
 
 const (
-	configStage       = "config"
-	controlPlaneStage = "control-plane"
-
-	helmDefaultChartName = "linkerd2"
-	helmDefaultChartDir  = "linkerd2"
+	helmDefaultChartNameCrds = "linkerd-crds"
+	helmDefaultChartNameCP   = "linkerd-control-plane"
 
 	errMsgCannotInitializeClient = `Unable to install the Linkerd control plane. Cannot connect to the Kubernetes cluster:
 
 %s
 
-You can use the --ignore-cluster flag if you just want to generate the installation config.`
-
-	errMsgGlobalResourcesExist = `Unable to install the Linkerd control plane. It appears that there is an existing installation:
-
-%s
-
-If you are sure you'd like to have a fresh install, remove these resources with:
-
-    linkerd install --ignore-cluster | kubectl delete -f -
-
-Otherwise, you can use the --ignore-cluster flag to overwrite the existing global resources.
+You can use the --ignore-cluster flag if you just want to generate the installation config.
 `
 
 	errMsgLinkerdConfigResourceConflict = "Can't install the Linkerd control plane in the '%s' namespace. Reason: %s.\nRun the command `linkerd upgrade`, if you are looking to upgrade Linkerd.\n"
-	errMsgGlobalResourcesMissing        = "Can't install the Linkerd control plane in the '%s' namespace. The required Linkerd global resources are missing.\nIf this is expected, use the --skip-checks flag to continue the installation.\n"
 )
 
 var (
-	templatesConfigStage = []string{
+	TemplatesCrdFiles = []string{
+		"templates/policy/authorization-policy.yaml",
+		"templates/policy/egress-network.yaml",
+		"templates/policy/http-local-ratelimit-policy.yaml",
+		"templates/policy/httproute.yaml",
+		"templates/policy/meshtls-authentication.yaml",
+		"templates/policy/network-authentication.yaml",
+		"templates/policy/server-authorization.yaml",
+		"templates/policy/server.yaml",
+		"templates/serviceprofile.yaml",
+		"templates/gateway.networking.k8s.io_httproutes.yaml",
+		"templates/gateway.networking.k8s.io_grpcroutes.yaml",
+		"templates/gateway.networking.k8s.io_tlsroutes.yaml",
+		"templates/gateway.networking.k8s.io_tcproutes.yaml",
+		"templates/workload/external-workload.yaml",
+	}
+
+	TemplatesControlPlane = []string{
 		"templates/namespace.yaml",
 		"templates/identity-rbac.yaml",
 		"templates/destination-rbac.yaml",
 		"templates/heartbeat-rbac.yaml",
-		"templates/serviceprofile-crd.yaml",
-		"templates/trafficsplit-crd.yaml",
+		"templates/podmonitor.yaml",
 		"templates/proxy-injector-rbac.yaml",
 		"templates/psp.yaml",
-	}
-
-	templatesControlPlaneStage = []string{
 		"templates/config.yaml",
+		"templates/config-rbac.yaml",
 		"templates/identity.yaml",
 		"templates/destination.yaml",
 		"templates/heartbeat.yaml",
@@ -82,142 +86,16 @@ var (
 )
 
 /* Commands */
-
-/* The install commands all follow the same flow:
- * 1. Load default values from the Linkerd2 chart
- * 2. Apply flags to modify the values
- * 3. Render the chart using those values
- *
- * The individual commands (install, install config, and install control-plane)
- * differ in which flags are available to each, what pre-check validations
- * are done, and which subset of the chart is rendered.
- */
-
-func newCmdInstallConfig(values *l5dcharts.Values) *cobra.Command {
-	flags, flagSet := makeAllStageFlags(values)
-	var options valuespkg.Options
-
-	cmd := &cobra.Command{
-		Use:   "config [flags]",
-		Args:  cobra.NoArgs,
-		Short: "Output Kubernetes cluster-wide resources to install Linkerd",
-		Long: `Output Kubernetes cluster-wide resources to install Linkerd.
-
-This command provides Kubernetes configs necessary to install cluster-wide
-resources for the Linkerd control plane. This command should be followed by
-"linkerd install control-plane".`,
-		Example: `  # Default install.
-  linkerd install config | kubectl apply -f -
-
-  # Install Linkerd into a non-default namespace.
-  linkerd install config -L linkerdtest | kubectl apply -f -
-
-The installation can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd2/README.md`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			err := flag.ApplySetFlags(values, flags)
-			if err != nil {
-				return err
-			}
-			if !ignoreCluster {
-				// Ensure k8s is reachable and that Linkerd is not already installed.
-				if err := errAfterRunningChecks(values.CNIEnabled); err != nil {
-					if healthcheck.IsCategoryError(err, healthcheck.KubernetesAPIChecks) {
-						fmt.Fprintf(os.Stderr, errMsgCannotInitializeClient, err)
-					} else {
-						fmt.Fprintf(os.Stderr, errMsgGlobalResourcesExist, err)
-					}
-					os.Exit(1)
-				}
-			}
-
-			return render(os.Stdout, values, configStage, options)
-		},
-	}
-	flagspkg.AddValueOptionsFlags(cmd.Flags(), &options)
-
-	cmd.Flags().AddFlagSet(flagSet)
-
-	return cmd
-}
-
-func newCmdInstallControlPlane(values *l5dcharts.Values) *cobra.Command {
-	var skipChecks bool
-	var options valuespkg.Options
-
-	allStageFlags, allStageFlagSet := makeAllStageFlags(values)
-	installOnlyFlags, installOnlyFlagSet := makeInstallFlags(values)
-	installUpgradeFlags, installUpgradeFlagSet, err := makeInstallUpgradeFlags(values)
-	if err != nil {
-		fmt.Fprint(os.Stderr, err.Error())
-		os.Exit(1)
-	}
-	proxyFlags, proxyFlagSet := makeProxyFlags(values)
-
-	flags := flattenFlags(allStageFlags, installOnlyFlags, installUpgradeFlags, proxyFlags)
-
-	cmd := &cobra.Command{
-		Use:   "control-plane [flags]",
-		Args:  cobra.NoArgs,
-		Short: "Output Kubernetes control plane resources to install Linkerd",
-		Long: `Output Kubernetes control plane resources to install Linkerd.
-
-This command provides Kubernetes configs necessary to install the Linkerd
-control plane. It should be run after "linkerd install config".`,
-		Example: `  # Default install.
-  linkerd install control-plane | kubectl apply -f -
-
-  # Install Linkerd into a non-default namespace.
-  linkerd install control-plane -l linkerdtest | kubectl apply -f -
-
-The installation can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd2/README.md
-  `,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if !skipChecks {
-				// check if global resources exist to determine if the `install config`
-				// stage succeeded
-				if err := errAfterRunningChecks(values.CNIEnabled); err == nil {
-					if healthcheck.IsCategoryError(err, healthcheck.KubernetesAPIChecks) {
-						fmt.Fprintf(os.Stderr, errMsgCannotInitializeClient, err)
-					} else {
-						fmt.Fprintf(os.Stderr, errMsgGlobalResourcesMissing, controlPlaneNamespace)
-					}
-					os.Exit(1)
-				}
-			}
-			if !ignoreCluster {
-				// Ensure there is not already an existing Linkerd installation.
-				if err := errIfLinkerdConfigConfigMapExists(cmd.Context()); err != nil {
-					fmt.Fprintf(os.Stderr, errMsgLinkerdConfigResourceConflict, controlPlaneNamespace, err.Error())
-					os.Exit(1)
-				}
-
-			}
-
-			return install(cmd.Context(), os.Stdout, values, flags, controlPlaneStage, options)
-		},
-	}
-
-	cmd.Flags().AddFlagSet(allStageFlagSet)
-	cmd.Flags().AddFlagSet(installOnlyFlagSet)
-	cmd.Flags().AddFlagSet(installUpgradeFlagSet)
-	cmd.Flags().AddFlagSet(proxyFlagSet)
-	flagspkg.AddValueOptionsFlags(cmd.Flags(), &options)
-
-	cmd.Flags().BoolVar(
-		&skipChecks, "skip-checks", false,
-		`Skip checks for namespace existence`,
-	)
-
-	return cmd
-}
-
 func newCmdInstall() *cobra.Command {
 	values, err := l5dcharts.NewValues()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	var crds bool
 	var options valuespkg.Options
+	var output string
 
-	allStageFlags, allStageFlagSet := makeAllStageFlags(values)
 	installOnlyFlags, installOnlyFlagSet := makeInstallFlags(values)
 	installUpgradeFlags, installUpgradeFlagSet, err := makeInstallUpgradeFlags(values)
 	if err != nil {
@@ -226,7 +104,7 @@ func newCmdInstall() *cobra.Command {
 	}
 	proxyFlags, proxyFlagSet := makeProxyFlags(values)
 
-	flags := flattenFlags(allStageFlags, installOnlyFlags, installUpgradeFlags, proxyFlags)
+	flags := flattenFlags(installOnlyFlags, installUpgradeFlags, proxyFlags)
 
 	cmd := &cobra.Command{
 		Use:   "install [flags]",
@@ -236,54 +114,124 @@ func newCmdInstall() *cobra.Command {
 
 This command provides all Kubernetes configs necessary to install the Linkerd
 control plane.`,
-		Example: `  # Default install.
+		Example: `  # Install CRDs first.
+  linkerd install --crds | kubectl apply -f -
+
+  # Install the core control plane.
   linkerd install | kubectl apply -f -
 
-  # Install Linkerd into a non-default namespace.
-  linkerd install -l linkerdtest | kubectl apply -f -
-
-  # Installation may also be broken up into two stages by user privilege, via
-  # subcommands.
-
 The installation can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd2/README.md`,
+A full list of configurable values can be found at https://artifacthub.io/packages/helm/linkerd2/linkerd-control-plane#values`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return install(cmd.Context(), os.Stdout, values, flags, "", options)
+			var k8sAPI *k8s.KubernetesAPI
+			if !ignoreCluster {
+				// Ensure k8s is reachable
+				if err := errAfterRunningChecks(values.CNIEnabled); err != nil {
+					fmt.Fprintf(os.Stderr, errMsgCannotInitializeClient, err)
+					os.Exit(1)
+				}
+
+				// Ensure there is not already an existing Linkerd installation.
+				k8sAPI, err = k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 30*time.Second)
+				if err != nil {
+					return err
+				}
+
+				if !crds {
+					crds := bytes.Buffer{}
+					err = renderCRDs(cmd.Context(), nil, &crds, valuespkg.Options{
+						// GatewayAPI CRDs are optional so don't check for them.
+						Values: []string{
+							"installGatewayAPI=false",
+						},
+					}, "yaml")
+					if err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						os.Exit(1)
+					}
+					err = healthcheck.CheckCustomResourceDefinitions(cmd.Context(), k8sAPI, crds.String())
+					if err != nil {
+						fmt.Fprintln(os.Stderr, "Linkerd CRDs must be installed first. Run linkerd install with the --crds flag.")
+						os.Exit(1)
+					}
+				}
+			}
+
+			if crds {
+				if err = installCRDs(cmd.Context(), k8sAPI, os.Stdout, options, output); err != nil {
+					fmt.Fprintf(os.Stderr, "%s\n", err)
+					os.Exit(1)
+				}
+
+				fmt.Fprintln(os.Stderr, "Rendering Linkerd CRDs...")
+				fmt.Fprintln(os.Stderr, "Next, run `linkerd install | kubectl apply -f -` to install the control plane.")
+				fmt.Fprintln(os.Stderr)
+				return nil
+			}
+
+			return installControlPlane(cmd.Context(), k8sAPI, os.Stdout, values, flags, options, output)
 		},
 	}
 
-	cmd.Flags().AddFlagSet(allStageFlagSet)
 	cmd.Flags().AddFlagSet(installOnlyFlagSet)
 	cmd.Flags().AddFlagSet(installUpgradeFlagSet)
 	cmd.Flags().AddFlagSet(proxyFlagSet)
+	cmd.Flags().BoolVar(&crds, "crds", false, "Install Linkerd CRDs")
 	cmd.PersistentFlags().BoolVar(&ignoreCluster, "ignore-cluster", false,
 		"Ignore the current Kubernetes cluster when checking for existing cluster configuration (default false)")
-
-	cmd.AddCommand(newCmdInstallConfig(values))
-	cmd.AddCommand(newCmdInstallControlPlane(values))
+	cmd.PersistentFlags().StringVarP(&output, "output", "o", "yaml", "Output format. One of: json|yaml")
 
 	flagspkg.AddValueOptionsFlags(cmd.Flags(), &options)
 
 	return cmd
 }
 
-func install(ctx context.Context, w io.Writer, values *l5dcharts.Values, flags []flag.Flag, stage string, options valuespkg.Options) error {
+func checkNoConfig(ctx context.Context, k8sAPI *k8s.KubernetesAPI) error {
+	if k8sAPI == nil {
+		// When `ingoreCluster` is set, there is no k8sAPI.
+		return nil
+	}
+
+	// We just want to check if `linkerd-configmap` exists
+	_, err := k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Get(ctx, k8s.ConfigConfigMapName, metav1.GetOptions{})
+	if err == nil {
+		fmt.Fprintf(os.Stderr, errMsgLinkerdConfigResourceConflict, controlPlaneNamespace, "ConfigMap/linkerd-config already exists")
+		os.Exit(1)
+	}
+	if !kerrors.IsNotFound(err) {
+		return err
+	}
+
+	return nil
+}
+
+func installCRDs(ctx context.Context, k8sAPI *k8s.KubernetesAPI, w io.Writer, options valuespkg.Options, format string) error {
+	if err := checkNoConfig(ctx, k8sAPI); err != nil {
+		return err
+	}
+
+	return renderCRDs(ctx, k8sAPI, w, options, format)
+}
+
+func installControlPlane(ctx context.Context, k8sAPI *k8s.KubernetesAPI, w io.Writer, values *l5dcharts.Values, flags []flag.Flag, options valuespkg.Options, format string) error {
 	err := flag.ApplySetFlags(values, flags)
 	if err != nil {
 		return err
 	}
 
-	var k8sAPI *k8s.KubernetesAPI
+	if err := checkNoConfig(ctx, k8sAPI); err != nil {
+		return err
+	}
 
-	if !ignoreCluster {
-		// Ensure there is not already an existing Linkerd installation.
-		k8sAPI, err = k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 30*time.Second)
-		if err != nil {
-			return err
-		}
+	// Create values override
+	valuesOverrides, err := options.MergeValues(nil)
+	if err != nil {
+		return err
+	}
 
+	if k8sAPI != nil {
 		// We just want to check if `linkerd-configmap` exists
-		_, err := k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Get(ctx, k8s.ConfigConfigMapName, metav1.GetOptions{})
+		_, err = k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Get(ctx, k8s.ConfigConfigMapName, metav1.GetOptions{})
 		if err == nil {
 			fmt.Fprintf(os.Stderr, errMsgLinkerdConfigResourceConflict, controlPlaneNamespace, "ConfigMap/linkerd-config already exists")
 			os.Exit(1)
@@ -291,6 +239,37 @@ func install(ctx context.Context, w io.Writer, values *l5dcharts.Values, flags [
 		if !kerrors.IsNotFound(err) {
 			return err
 		}
+
+		if !isRunAsRoot(valuesOverrides) {
+			err = healthcheck.CheckNodesHaveNonDockerRuntime(ctx, k8sAPI)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+
+		// Check 'kubernetes' service in default namespace to see what ports the API
+		// Server listens on. If the ports are different from the default ('443,6443')
+		// then replace with ports from the service spec.
+		apiSrvPorts := getApiServerPorts(ctx, k8sAPI)
+		if apiSrvPorts != "" {
+			values.ProxyInit.KubeAPIServerPorts = apiSrvPorts
+		}
+	}
+
+	// in order to correctly initialize the issuer credentials the overrides
+	// (from above) need to be set/applied to the values themselves
+	// specifically identity issuer scheme, and trust values
+	//
+	// marshal+unmarshal here will only apply specific overrides to values and
+	// will not wipe out values that are not set.
+	data, err := yaml.Marshal(valuesOverrides)
+	if err != nil {
+		return err
+	}
+	err = yaml.Unmarshal(data, values)
+	if err != nil {
+		return err
 	}
 
 	err = initializeIssuerCredentials(ctx, k8sAPI, values)
@@ -303,79 +282,54 @@ func install(ctx context.Context, w io.Writer, values *l5dcharts.Values, flags [
 		return err
 	}
 
-	return render(w, values, stage, options)
+	return renderControlPlane(w, values, valuesOverrides, format)
 }
 
-func render(w io.Writer, values *l5dcharts.Values, stage string, options valuespkg.Options) error {
-
-	// Set any global flags if present, common with install and upgrade
-	values.Namespace = controlPlaneNamespace
-	values.Stage = stage
-
-	files := []*loader.BufferedFile{
-		{Name: chartutil.ChartfileName},
-	}
-
-	if stage == "" || stage == configStage {
-		for _, template := range templatesConfigStage {
-			files = append(files,
-				&loader.BufferedFile{Name: template},
-			)
+func isRunAsRoot(values map[string]interface{}) bool {
+	if proxyInit, ok := values["proxyInit"]; ok {
+		if val, ok := proxyInit.(map[string]interface{})["runAsRoot"]; ok {
+			if truth, ok := template.IsTrue(val); ok {
+				return truth
+			}
 		}
 	}
+	return false
+}
 
-	if stage == "" || stage == controlPlaneStage {
-		for _, template := range templatesControlPlaneStage {
-			files = append(files,
-				&loader.BufferedFile{Name: template},
-			)
-		}
-	}
-
-	var partialFiles []*loader.BufferedFile
-	for _, template := range charts.L5dPartials {
-		partialFiles = append(partialFiles,
-			&loader.BufferedFile{Name: template},
-		)
-	}
-
-	// Load all chart files into buffer
-	if err := charts.FilesReader(static.Templates, helmDefaultChartDir+"/", files); err != nil {
-		return err
-	}
-
-	// Load all partial chart files into buffer
-	if err := charts.FilesReader(static.Templates, "", partialFiles); err != nil {
-		return err
-	}
-
-	// Create a Chart obj from the files
-	chart, err := loader.LoadFiles(append(files, partialFiles...))
+// renderChartToBuffer takes a slice of loaded template files and configuration values and renders
+// them into a buffer. The coalesced values are also returned so that they may be rendered via
+// `renderOverrides` if appropriate.
+func renderChartToBuffer(files []*loader.BufferedFile, values map[string]interface{}, valuesOverrides map[string]interface{}) (*bytes.Buffer, chartutil.Values, error) {
+	partials, err := chartspkg.LoadPartials()
 	if err != nil {
-		return err
+		return nil, nil, err
+	}
+
+	chart, err := loader.LoadFiles(append(files, partials...))
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Store final Values generated from values.yaml and CLI flags
-	chart.Values, err = values.ToMap()
-	if err != nil {
-		return err
-	}
-
-	// Create values override
-	valuesOverrides, err := options.MergeValues(nil)
-	if err != nil {
-		return err
-	}
+	chart.Values = values
 
 	vals, err := chartutil.CoalesceValues(chart, valuesOverrides)
 	if err != nil {
-		return err
+		return nil, nil, err
+	}
+
+	fullValues := map[string]interface{}{
+		"Values": vals,
+		"Release": map[string]interface{}{
+			"Namespace": controlPlaneNamespace,
+			"Service":   "CLI",
+		},
 	}
 
 	// Attach the final values into the `Values` field for rendering to work
-	renderedTemplates, err := engine.Render(chart, map[string]interface{}{"Values": vals})
+	renderedTemplates, err := engine.Render(chart, fullValues)
 	if err != nil {
-		return err
+		return nil, nil, fmt.Errorf("failed to render the template: %w", err)
 	}
 
 	// Merge templates and inject
@@ -383,21 +337,144 @@ func render(w io.Writer, values *l5dcharts.Values, stage string, options valuesp
 	for _, tmpl := range chart.Templates {
 		t := path.Join(chart.Metadata.Name, tmpl.Name)
 		if _, err := buf.WriteString(renderedTemplates[t]); err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 
-	if stage == "" || stage == controlPlaneStage {
-		overrides, err := renderOverrides(vals, false)
+	return &buf, vals, nil
+}
+
+func updateDefaultValues(installed healthcheck.GatewayAPICRDs, defaultValues map[string]interface{}) map[string]interface{} {
+	if installed == healthcheck.GatewayAPIAbsent {
+		// if GW API is not installed, default to false
+		defaultValues["installGatewayAPI"] = false
+	} else if installed == healthcheck.GatewayAPILinkerd {
+		// if it is installed by Linkerd, default to true
+		defaultValues["installGatewayAPI"] = true
+	} else if installed == healthcheck.GatewayAPIExternal {
+		// if it is external, default to false as we are not managing it
+		defaultValues["installGatewayAPI"] = false
+	}
+
+	return defaultValues
+}
+
+func validateFinalValues(installed healthcheck.GatewayAPICRDs, finalValues map[string]interface{}) error {
+	installing := false
+
+	if installGatewayAPI, ok := finalValues["installGatewayAPI"]; ok {
+		installing = installGatewayAPI == true
+	}
+
+	if enableHttpRoutes, ok := finalValues["enableHttpRoutes"]; ok {
+		installing = enableHttpRoutes == true
+	}
+
+	if installed == healthcheck.GatewayAPIAbsent {
+		if !installing {
+			// if we are not installing GW API Resources and they are not present, error
+			return healthcheck.GatewayAPICRDsMissingError()
+		}
+	} else if installed == healthcheck.GatewayAPILinkerd {
+		if !installing {
+			// if they are installed and managed by Linkerd, we cannot uninstall them
+			return errors.New("Linkerd is providing GW API, but your current install configuration will remove it")
+		}
+	} else if installed == healthcheck.GatewayAPIExternal {
+		if installing {
+			// if they are installed but are external, we cannot be installing as well
+			return errors.New("Linkerd cannot install the Gateway API CRDs because they are already installed by an external source. Please set `installGatewayAPI` to `false`.")
+		}
+	}
+
+	return nil
+}
+
+func renderCRDs(ctx context.Context, k *k8s.KubernetesAPI, w io.Writer, options valuespkg.Options, format string) error {
+	files := []*loader.BufferedFile{
+		{Name: chartutil.ChartfileName},
+	}
+	for _, template := range TemplatesCrdFiles {
+		files = append(files, &loader.BufferedFile{Name: template})
+	}
+	if err := chartspkg.FilesReader(charts.Templates, l5dcharts.HelmChartDirCrds+"/", files); err != nil {
+		return err
+	}
+
+	// Load defaults from values.yaml
+	valuesFile := &loader.BufferedFile{Name: l5dcharts.HelmChartDirCrds + "/values.yaml"}
+	if err := chartspkg.ReadFile(charts.Templates, "", valuesFile); err != nil {
+		return err
+	}
+	// Ensure the map is not nil, even if the default `values.yaml` is empty ---
+	// if there are no values in the YAML file, `yaml.Unmarshal` will not
+	// allocate the map, and the subsequent assignment to `cliVersion` will
+	// panic because the map is nil.
+	defaultValues := make(map[string]interface{})
+	err := yaml.Unmarshal(valuesFile.Data, &defaultValues)
+	if err != nil {
+		return err
+	}
+	defaultValues["cliVersion"] = k8s.CreatedByAnnotationValue()
+
+	// Create values override
+	valuesOverrides, err := options.MergeValues(nil)
+	if err != nil {
+		return err
+	}
+
+	// If any of the Gateway API CRDs are installed, we default to rendering the
+	// Gateway API CRDs.
+	if k != nil {
+		installed, err := healthcheck.CheckGatewayAPICRDs(ctx, k)
 		if err != nil {
 			return err
 		}
-		buf.WriteString(yamlSep)
-		buf.WriteString(string(overrides))
+
+		defaultValues = updateDefaultValues(installed, defaultValues)
+		finalValues := chartspkg.MergeMaps(defaultValues, valuesOverrides)
+
+		if err := validateFinalValues(installed, finalValues); err != nil {
+			return err
+		}
 	}
 
-	_, err = w.Write(buf.Bytes())
-	return err
+	buf, _, err := renderChartToBuffer(files, defaultValues, valuesOverrides)
+	if err != nil {
+		return err
+	}
+
+	return pkgcmd.RenderYAMLAs(buf, w, format)
+}
+
+func renderControlPlane(w io.Writer, values *l5dcharts.Values, valuesOverrides map[string]interface{}, format string) error {
+	files := []*loader.BufferedFile{
+		{Name: chartutil.ChartfileName},
+	}
+	for _, template := range TemplatesControlPlane {
+		files = append(files, &loader.BufferedFile{Name: template})
+	}
+	if err := chartspkg.FilesReader(charts.Templates, l5dcharts.HelmChartDirCP+"/", files); err != nil {
+		return err
+	}
+
+	valuesMap, err := values.ToMap()
+	if err != nil {
+		return err
+	}
+	buf, vals, err := renderChartToBuffer(files, valuesMap, valuesOverrides)
+	if err != nil {
+		return err
+	}
+
+	overrides, err := renderOverrides(vals, false)
+	if err != nil {
+		return err
+	}
+	buf.WriteString(yamlSep)
+	buf.WriteString(string(overrides))
+
+	return pkgcmd.RenderYAMLAs(buf, w, format)
 }
 
 // renderOverrides outputs the Secret/linkerd-config-overrides resource which
@@ -419,17 +496,6 @@ func renderOverrides(values chartutil.Values, stringData bool) ([]byte, error) {
 	// Remove unnecessary fields, including fields added by helm's `chartutil.CoalesceValues`
 	delete(values, "configs")
 	delete(values, "partials")
-	delete(values, "stage")
-
-	// Get Namespace from values
-	valuesTree, err := tree.MarshalToTree(values)
-	if err != nil {
-		return nil, err
-	}
-	namespace, err := valuesTree.GetString("namespace")
-	if err != nil {
-		return nil, fmt.Errorf("could not retrieve global.namespace from values: %v", err)
-	}
 
 	overrides, err := tree.Diff(defaults, values)
 	if err != nil {
@@ -445,9 +511,9 @@ func renderOverrides(values chartutil.Values, stringData bool) ([]byte, error) {
 		TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "linkerd-config-overrides",
-			Namespace: namespace,
+			Namespace: controlPlaneNamespace,
 			Labels: map[string]string{
-				k8s.ControllerNSLabel: namespace,
+				k8s.ControllerNSLabel: controlPlaneNamespace,
 			},
 		},
 	}
@@ -470,7 +536,6 @@ func renderOverrides(values chartutil.Values, stringData bool) ([]byte, error) {
 func errAfterRunningChecks(cniEnabled bool) error {
 	checks := []healthcheck.CategoryID{
 		healthcheck.KubernetesAPIChecks,
-		healthcheck.LinkerdPreInstallGlobalResourcesChecks,
 	}
 	hc := healthcheck.NewHealthChecker(checks, &healthcheck.Options{
 		ControlPlaneNamespace: controlPlaneNamespace,
@@ -482,59 +547,35 @@ func errAfterRunningChecks(cniEnabled bool) error {
 		CNIEnabled:            cniEnabled,
 	})
 
-	var k8sAPIError error
-	errMsgs := []string{}
+	var err error
 	hc.RunChecks(func(result *healthcheck.CheckResult) {
 		if result.Err != nil {
-			if ce, ok := result.Err.(*healthcheck.CategoryError); ok {
-				if ce.Category == healthcheck.KubernetesAPIChecks {
-					k8sAPIError = ce
-				} else if re, ok := ce.Err.(*healthcheck.ResourceError); ok {
-					// resource error, print in kind.group/name format
-					for _, res := range re.Resources {
-						errMsgs = append(errMsgs, res.String())
-					}
-				} else {
-					// unknown category error, just print it
-					errMsgs = append(errMsgs, result.Err.Error())
-				}
-			} else {
-				// unknown error, just print it
-				errMsgs = append(errMsgs, result.Err.Error())
-			}
+			err = result.Err
 		}
 	})
 
-	// errors from the KubernetesAPIChecks category take precedence
-	if k8sAPIError != nil {
-		return k8sAPIError
-	}
-
-	if len(errMsgs) > 0 {
-		return errors.New(strings.Join(errMsgs, "\n"))
-	}
-
-	return nil
+	return err
 }
 
-func errIfLinkerdConfigConfigMapExists(ctx context.Context) error {
-	kubeAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+// getApiServerPorts looks at the 'kubernetes' service in the 'default'
+// namespace and returns the ClusterIP port for the API Server (by default 443),
+// and the port that the API Server backend is expecting TLS connections on (by
+// default 6443.)
+func getApiServerPorts(ctx context.Context, api *k8s.KubernetesAPI) string {
+	service, err := api.CoreV1().Services("default").Get(ctx, "kubernetes", metav1.GetOptions{})
 	if err != nil {
-		return err
+		return ""
 	}
 
-	_, err = kubeAPI.CoreV1().Namespaces().Get(ctx, controlPlaneNamespace, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-
-	_, _, err = healthcheck.FetchCurrentConfiguration(ctx, kubeAPI, controlPlaneNamespace)
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			return nil
+	ports := make([]string, 0)
+	for _, port := range service.Spec.Ports {
+		ports = append(ports, strconv.Itoa(int(port.Port)))
+		// We only care about int ports since string ports (e.g targetPort: web)
+		// correspond to a named port in a pod spec.
+		if port.TargetPort.Type == intstr.Int {
+			ports = append(ports, strconv.Itoa(port.TargetPort.IntValue()))
 		}
-		return err
 	}
 
-	return fmt.Errorf("'linkerd-config' config map already exists")
+	return strings.Join(ports, ",")
 }

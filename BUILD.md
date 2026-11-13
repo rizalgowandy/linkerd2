@@ -22,17 +22,16 @@ about testing from source can be found in the [TEST.md](TEST.md) guide.
     - [Formatting](#formatting)
     - [Building the CLI for development](#building-the-cli-for-development)
     - [Running the control plane for development](#running-the-control-plane-for-development)
-    - [Running the Tap APIService for development](#running-the-tap-apiservice-for-development)
+    - [Running the Tap APIService for development](#debugging-the-tap-apiservice-for-development)
     - [Generating CLI docs](#generating-cli-docs)
   - [Web](#web)
     - [First time setup](#first-time-setup)
     - [Run web standalone](#run-web-standalone)
     - [Webpack dev server](#webpack-dev-server)
-    - [Javascript dependencies](#javascript-dependencies)
+    - [JavaScript dependencies](#javascript-dependencies)
     - [Translations](#translations)
   - [Rust](#rust)
     - [Docker](#docker)
-  - [Multi-architecture builds](#multi-architecture-builds)
 - [Dependencies](#dependencies)
   - [Updating protobuf dependencies](#updating-protobuf-dependencies)
   - [Updating ServiceProfile generated
@@ -40,9 +39,7 @@ about testing from source can be found in the [TEST.md](TEST.md) guide.
 - [Linkerd Helm Chart](#linkerd-helm-chart)
   - [Extensions Helm charts](#extensions-helm-charts)
   - [Making changes to the chart templates](#making-changes-to-the-chart-templates)
-  - [Generating Helm charts docs](#generating-helm-charts-docs)
-  - [Using helm-docs](#using-helm-docs)
-  - [Annotating values.yml](#annotating-values.yml)
+  - [Annotating values.yaml](#annotating-valuesyaml)
   - [Markdown templates](#markdown-templates)
 
 ## Repo layout
@@ -63,7 +60,7 @@ its extensions are written in Go. The dashboard UI is a React application.
   - [`identity`](controller/identity): Provides a CA to distribute certificates
     to proxies for them to establish mTLS connections between them.
 - [`viz extension`](viz)
-  - ['metrics-api`](viz/metrics-api): Accepts requests from API clients such as
+  - [`metrics-api`](viz/metrics-api): Accepts requests from API clients such as
     cli and web, serving metrics from the proxies in the cluster through
     Prometheus queries.
   - [`tap`](viz/tap/api): Provides a live pipeline of requests.
@@ -73,13 +70,10 @@ its extensions are written in Go. The dashboard UI is a React application.
   - [`web`](web): Provides a UI dashboard to view and drive the control plane.
 - [`multicluster extension`](multicluster)
   - [`linkerd-gateway`]: Accepts requests from other clusters and forwards them
-    to the appropriate destionation in the local cluster.
+    to the appropriate destination in the local cluster.
   - [`linkerd-service-mirror-xxx`](multicluster/service-mirror): Controller
     observing the labeling of exported services in the target cluster, each one
     for which it will create a mirrored service in the local cluster.
-- [`jaeger extension`](jaeger)
-  - [`jaeger-injector`](jaeger/injector): Mutating webhook triggered by pods
-    creation, that expands the proxy container for it to produce tracing spans.
 
 ### Data Plane (Rust)
 
@@ -153,7 +147,7 @@ production installation, documented in [Getting
 Started](https://linkerd.io/2/getting-started/).
 
 Note that you need to have first installed docker buildx, as explained
-[here](https://github.com/docker/buildx).
+[buildx docs](https://github.com/docker/buildx).
 
 ```bash
 # create the k3d cluster
@@ -166,6 +160,7 @@ bin/docker-build
 bin/image-load --k3d
 
 # install linkerd
+bin/linkerd install --crds | kubectl apply -f -
 bin/linkerd install | kubectl apply -f -
 
 # wait for the core components to be ready, then install linkerd-viz
@@ -200,25 +195,21 @@ bin/linkerd viz -n emojivoto tap deploy voting
 #### Deploying Control Plane components with Tracing
 
 Control Plane components have the `trace-collector` flag used to enable
-[Distributed Tracing](https://opentracing.io/docs/overview/what-is-tracing/) for
-development purposes. It can be enabled globally i.e Control plane components
-and their proxies by using the `--set controlPlaneTracing=true` installation
-flag.
+[Distributed Tracing](https://opentracing.io/docs/overview/what-is-tracing/)
+for development purposes. It can be enabled globally i.e Control plane
+components and their proxies by using the
+`--set controller.tracing.enable=true` installation flag.
 
-This will configure all the components to send the traces at
-`collector.{{.Values.controlPlaneTracingNamespace}}.svc.{{.Values.ClusterDomain}}:55678`
+This will configure all the components to send the traces to the collector you
+have configured for your cluster.
 
 ```bash
 
 # install Linkerd with tracing
-linkerd install --set controlPlaneTracing=true | kubectl apply -f -
-
-# install the Jaeger extension
-linkerd jaeger install | kubectl apply -f -
-
-# restart the control plane components so that the jaeger-injector enables
-# tracing in their proxies
-kubectl -n linkerd rollout restart deploy
+linkerd install \
+  --set controller.tracing.enable=true \
+  --set controller.tracing.collector.endpoint=<your trace collector endpoint> \
+  | kubectl apply -f -
 ```
 
 ### Publishing images
@@ -263,7 +254,7 @@ That is equivalent to running `linkerd check` using the code on your branch.
 To analyze and lint the Go code using golangci-lint, run:
 
 ```bash
-bin/lint
+golangci-lint run
 ```
 
 #### Formatting
@@ -279,21 +270,18 @@ the `bin/fmt` script.
 
 The script for building the CLI binaries using docker is
 `bin/docker-build-cli-bin`. This will also be called indirectly when calling
-`bin/docker-build`. By default it creates binaries for Linux, Darwin and
-Windows. For Linux it will create a binary targeted at your current
-architecture. For targeting different architectures, check [Multi-architecture
-Builds](#multi-architecture-builds) below).
+`bin/docker-build`. By default it creates binaries for your current host's
+OS/arch.
 
-For local development and a faster edit-build-test cycle you might want to just
-target your local OS and architecture. For those situations you can just call
-`bin/build-cli-bin`.
+To cross-build targeting a different OS or architecture, set the environment
+variable `DOCKER_TARGET` according to any of the final stages available in
+[cli/Dockerfile](cli/Dockerfile).
 
-If you want to build all the controller images, plus only the CLI for your OS
-and architecture, just call:
+For local development and a faster edit-build-test cycle you can build directly
+without going through a docker container by calling `bin/build-cli-bin`.
 
-```bash
-LINKERD_LOCAL_BUILD_CLI=1 bin/docker-build
-```
+If you set the environment variable `LINKERD_LOCAL_BUILD_CLI=1` then
+`bin/docker-build` will use this last method for the step that builds the CLI.
 
 #### Running the control plane for development
 
@@ -315,14 +303,13 @@ You can send test requests to the destination service using the
 bin/go-run controller/script/destination-client -path hello.default.svc.cluster.local:80
 ```
 
-##### Running the Tap APIService for development
+##### Debugging the Tap APIService for development
 
-```bash
-openssl req -nodes -x509 -newkey rsa:4096 -keyout $HOME/key.pem -out $HOME/crt.pem -subj "/C=US"
-bin/go-run controller/cmd tap --disable-common-names --tls-cert=$HOME/crt.pem --tls-key=$HOME/key.pem
-
-curl -k https://localhost:8089/apis/tap.linkerd.io/v1alpha1
-```
+The Tap APIService is a Kubernetes extension API server, so it can be
+challenging to run outside the cluster. The most straightforward workflow is to
+simply test changes by building and loading the container image as explained in
+the [comprehensive configuration](#comprehensive) section above (in order to
+just build this component use `bin/docker-build-tap`).
 
 #### Generating CLI docs
 
@@ -371,17 +358,13 @@ To develop with a webpack dev server:
     - `web` on :7777. This is the golang process that serves the dashboard.
     - `webpack-dev-server` on :8080 to manage rebuilding/reloading of the
       javascript.
-    - `controller` is port-forwarded from the Kubernetes cluster via `kubectl`
-      on :8185
-    - `grafana` is port-forwarded from the Kubernetes cluster via `kubectl` on
-      :3000
-    - `metrics-api` is port-forwarded from the Kubernets cluster via `kubectl`
+    - `metrics-api` is port-forwarded from the Kubernetes cluster via `kubectl`
       on :8085
 
 2. Go to [http://localhost:7777](http://localhost:7777) to see everything
    running.
 
-#### Javascript dependencies
+#### JavaScript dependencies
 
 To add a JS dependency:
 
@@ -408,6 +391,12 @@ yarn lingui extract
 yarn lingui compile # done automatically in bin/web run
 ```
 
+Finally, make sure the new locale is also referred in the following places:
+
+- Under the `lingui` section in `package.json`
+- In the `make-plural/plurals` import in `index.js`
+- In the `langOptions` object in `index.js`
+
 ### Rust
 
 All Rust development happens in the
@@ -422,23 +411,25 @@ proxy binary:
 bin/docker-build-proxy
 ```
 
-### Multi-architecture builds
+#### Locally built proxy
 
-Besides the default Linux/amd64 architecture, you can build controller images
-targeting Linux/arm64 and Linux/arm/v7.
-
-For signaling that you want to build multi-architecture images, set the
-environment variable `DOCKER_MULTIARCH=1`. Do to some limitations on buildx, if
-you'd like to do that you're also forced to signal buildx to push the images to
-the registry by setting `DOCKER_PUSH=1`. Naturally, you can't push to the
-official registry and will have to override `DOCKER_REGISTRY` with a registry
-that you control.
-
-To summarize, in order to build all the images for multiple architectures and
-push them to your registry located for example at `ghcr.io/user` you can issue:
+If you want to deploy a locally built proxy, you can build it in the
+[`linkerd2-proxy`](https://github.com/linkerd/linkerd2-proxy) repo by running:
 
 ```bash
-DOCKER_MULTIARCH=1 DOCKER_PUSH=1 DOCKER_REGISTRY=ghcr.io/user bin/docker-build
+DOCKER_TAG=cr.l5d.io/linkerd/proxy:dev make docker
+```
+
+Then, in this repo, run:
+
+```bash
+./bin/k3d image import cr.l5d.io/linkerd/proxy:dev
+```
+
+Now, to make a pod use your image, add the following annotations to it:
+
+```yaml
+config.linkerd.io/proxy-version: dev
 ```
 
 ## Dependencies
@@ -468,20 +459,27 @@ bin/update-codegen.sh
 ## Linkerd Helm chart
 
 The Linkerd control plane chart is located in the
-[`charts/linkerd2`](charts/linkerd2) folder. The [`charts/patch`](charts/patch)
-chart consists of the Linkerd proxy specification, which is used by the proxy
-injector to inject the proxy container. Both charts depend on the partials
-subchart which can be found in the [`charts/partials`](charts/partials) folder.
+[`charts/linkerd-control-plane`](charts/linkerd-control-plane) folder, and the
+CRDs it needs are in the [`charts/linkerd-crds`](charts/linkerd-crds) chart.
+The [`charts/patch`](charts/patch) chart consists of the Linkerd proxy
+specification, which is used by the proxy injector to inject the proxy
+container. All three charts depend on the partials subchart which can be found
+in the [`charts/partials`](charts/partials) folder.
 
-Note that the `charts/linkerd2/values.yaml` file contains a placeholder
-`linkerdVersionValue` that you need to replace with an appropriate string (like
-`edge-20.2.2`) before proceeding.
+Note that the `charts/linkerd-control-plane/values.yaml` file contains a
+placeholder `linkerdVersionValue` that you need to replace with an appropriate
+string (like `edge-20.2.2`) before proceeding.
 
 During development, please use the [`bin/helm`](bin/helm) wrapper script to
 invoke the Helm commands. For example,
 
 ```bash
-bin/helm install charts/linkerd2
+bin/helm install linkerd-crds -n linkerd --create-namespace charts/linkerd-crds
+bin/helm install linkerd-control-plane -n linkerd \
+  --set-file identityTrustAnchorsPEM=ca.crt \
+  --set-file identity.issuer.tls.crtPEM=issuer.crt \
+  --set-file identity.issuer.tls.keyPEM=issuer.key \
+  charts/linkerd-control-plane
 ```
 
 This ensures that you use the same Helm version as that of the Linkerd CI
@@ -489,8 +487,8 @@ system.
 
 For general instructions on how to install the charts check out the
 [docs](https://linkerd.io/2/tasks/install-helm/). You also need to supply or
-generate your own certificates to use the chart, as explained
-[here](https://linkerd.io/2/tasks/generate-certificates/).
+generate your own certificates to use the chart, as explained in the
+[Generate Certificates task](https://linkerd.io/2/tasks/generate-certificates/).
 
 ### Extensions Helm charts
 
@@ -499,49 +497,25 @@ Extensions provide each their own chart:
 - Viz: [`viz/charts/linkerd-viz`](viz/charts/linkerd-viz)
 - Multicluster:
   [`multicluster/charts/linkerd-multicluster`](multicluster/charts/linkerd-multicluster)
-- Jaeger: [`jaeger/charts/linkerd-jaeger`](jaeger/charts/linkerd-jaeger)
 
 ### Making changes to the chart templates
 
 Whenever you make changes to the files under
-[`charts/linkerd2/templates`](charts/linkerd2/templates) or its dependency
-[`charts/partials`](charts/partials), make sure to run
+[`charts/linkerd-control-plane/templates`](charts/linkerd-control-plane/templates)
+or its dependency [`charts/partials`](charts/partials), make sure to run
 [`bin/helm-build`](bin/helm-build) which will refresh the dependencies and lint
 the templates.
 
-### Generating Helm charts docs
+### Annotating values.yaml
 
-Whenever a new chart is created, or updated a README should be generated from
-the chart's values.yml. This can be done by utilizing the bundled
-[helm-docs](https://github.com/norwoodj/helm-docs) binary. For adding additional
-information, such as specific installation instructions a README template is
-required to be created. Check existing charts for examples.
-
-#### Using helm-docs
-
-Example usage:
-
-```sh
-bin/helm-docs
-bin/helm-docs --dry-run #Prints to cli instead
-bin/helm-docs --chart-search-root=./charts #Sets search root for charts
-bin/helm-docs --template-files=README.md.gotmpl #Sets the template file used
-```
-
-Note:
-The tool searches through the current directory and sub-directories by default.
-For additional information checkout their repo above.
-
-#### Annotating values.yml
-
-To allow helm-docs to properly document the values in values.yml a descriptive
+To allow helm-docs to properly document the values in `values.yaml` a descriptive
 comment is required. This can be done in two ways.
 Either comment the value directly above with
 `# -- This is a really nice value` where the double dashes automatically
 annotates the value. Another explicit usage is to type out the value name.
 `# global.MyNiceValue -- I really like this value`
 
-#### Markdown templates
+### Markdown templates
 
 In order to accommodate for extra data that might not have a proper place in the
 ´values.yaml´ file the corresponding ´README.md.gotmpl´ can be modified for each

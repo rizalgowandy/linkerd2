@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -78,7 +77,7 @@ LOOP:
 func (fscw *FsCredsWatcher) UpdateCert(certVal *atomic.Value) error {
 	creds, err := ReadPEMCreds(fscw.keyFilePath, fscw.certFilePath)
 	if err != nil {
-		return fmt.Errorf("failed to read cert from disk: %s", err)
+		return fmt.Errorf("failed to read cert from disk: %w", err)
 	}
 
 	certPEM := creds.EncodePEM()
@@ -93,7 +92,7 @@ func (fscw *FsCredsWatcher) UpdateCert(certVal *atomic.Value) error {
 
 // ProcessEvents reads from the update and error channels and reloads the certs when necessary
 func (fscw *FsCredsWatcher) ProcessEvents(
-	log *logrus.Entry,
+	log *log.Entry,
 	certVal *atomic.Value,
 	updateEvent <-chan struct{},
 	errEvent <-chan error,

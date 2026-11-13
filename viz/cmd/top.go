@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -10,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
 	"github.com/linkerd/linkerd2/pkg/addr"
 	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
@@ -18,8 +18,9 @@ import (
 	"github.com/linkerd/linkerd2/pkg/protohttp"
 	metricsAPI "github.com/linkerd/linkerd2/viz/metrics-api"
 	metricsPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
-	vizpkg "github.com/linkerd/linkerd2/viz/pkg"
 	"github.com/linkerd/linkerd2/viz/pkg/api"
+	hc "github.com/linkerd/linkerd2/viz/pkg/healthcheck"
+	vizutil "github.com/linkerd/linkerd2/viz/pkg/util"
 	tapPb "github.com/linkerd/linkerd2/viz/tap/gen/tap"
 	"github.com/linkerd/linkerd2/viz/tap/pkg"
 	runewidth "github.com/mattn/go-runewidth"
@@ -320,20 +321,48 @@ func NewCmdTop() *cobra.Command {
 
   # display traffic for the web-dlbvj pod in the default namespace
   linkerd viz top pod/web-dlbvj`,
-		Args:      cobra.RangeArgs(1, 2),
-		ValidArgs: vizpkg.ValidTargets,
+		Args: cobra.RangeArgs(1, 2),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// This command requires at most two arguments if we already have
+			// two after requesting autocompletion i.e. [tab][tab]
+			// skip running validArgsFunction
+			if len(args) > 1 {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			if options.namespace == "" {
+				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
+			}
+
+			cc := k8s.NewCommandCompletion(k8sAPI, options.namespace)
+
+			results, err := cc.Complete(args, toComplete)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			return results, cobra.ShellCompDirectiveDefault
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if options.namespace == "" {
 				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
 			}
 
-			api.CheckClientOrExit(healthcheck.Options{
-				ControlPlaneNamespace: controlPlaneNamespace,
-				KubeConfig:            kubeconfigPath,
-				Impersonate:           impersonate,
-				ImpersonateGroup:      impersonateGroup,
-				KubeContext:           kubeContext,
-				APIAddr:               apiAddr,
+			api.CheckClientOrExit(hc.VizOptions{
+				Options: &healthcheck.Options{
+					ControlPlaneNamespace: controlPlaneNamespace,
+					KubeConfig:            kubeconfigPath,
+					Impersonate:           impersonate,
+					ImpersonateGroup:      impersonateGroup,
+					KubeContext:           kubeContext,
+					APIAddr:               apiAddr,
+				},
+				VizNamespaceOverride: vizNamespace,
 			})
 
 			requestParams := pkg.TapRequestParams{
@@ -397,6 +426,9 @@ func NewCmdTop() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&options.routes, "routes", options.routes, "Display data per route instead of per path")
 	cmd.PersistentFlags().StringVarP(&options.labelSelector, "selector", "l", options.labelSelector, "Selector (label query) to filter on, supports '=', '==', and '!='")
 
+	pkgcmd.ConfigureNamespaceFlagCompletion(
+		cmd, []string{"namespace", "to-namespace"},
+		kubeconfigPath, impersonate, impersonateGroup, kubeContext)
 	return cmd
 }
 
@@ -450,7 +482,7 @@ func recvEvents(tapByteStream *bufio.Reader, eventCh chan<- *tapPb.TapEvent, clo
 		event := &tapPb.TapEvent{}
 		err := protohttp.FromByteStreamToProtocolBuffers(tapByteStream, event)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				fmt.Println("Tap stream terminated")
 			} else if !strings.HasSuffix(err.Error(), pkg.ErrClosedResponseBody) {
 				fmt.Println(err.Error())
@@ -546,7 +578,7 @@ func renderTable(table *topTable, requestCh <-chan topRequest, done <-chan struc
 			termbox.Flush()
 		case offset := <-horizontalScroll:
 			if (offset > 0 && scrollpos < 0) || (offset < 0 && scrollpos > (width-tablewidth)) {
-				scrollpos = scrollpos + offset
+				scrollpos += offset
 			}
 		}
 	}
@@ -558,7 +590,7 @@ func newRow(req topRequest) (tableRow, error) {
 	if route == "" {
 		route = metricsAPI.DefaultRouteName
 	}
-	method := req.reqInit.GetMethod().GetRegistered().String()
+
 	source := stripPort(addr.PublicAddressToString(req.event.GetSource()))
 	if pod := req.event.SourceMeta.Labels["pod"]; pod != "" {
 		source = pod
@@ -568,10 +600,12 @@ func newRow(req topRequest) (tableRow, error) {
 		destination = pod
 	}
 
-	latency, err := ptypes.Duration(req.rspEnd.GetSinceRequestInit())
+	err := req.rspEnd.GetSinceRequestInit().CheckValid()
 	if err != nil {
-		return tableRow{}, fmt.Errorf("error parsing duration %v: %s", req.rspEnd.GetSinceRequestInit(), err)
+		return tableRow{}, fmt.Errorf("error parsing duration %v: %w", req.rspEnd.GetSinceRequestInit(), err)
 	}
+	latency := req.rspEnd.GetSinceRequestInit().AsDuration()
+
 	// TODO: Once tap events have a classification field, we should use that field
 	// instead of determining success here.
 	success := req.rspInit.GetHttpStatus() < 500
@@ -604,7 +638,7 @@ func newRow(req topRequest) (tableRow, error) {
 
 	return tableRow{
 		path:        path,
-		method:      method,
+		method:      vizutil.HTTPMethodToString(req.reqInit.GetMethod()),
 		route:       route,
 		source:      source,
 		destination: destination,

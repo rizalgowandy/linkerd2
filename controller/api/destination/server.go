@@ -1,8 +1,8 @@
 package destination
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -21,26 +21,54 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
-	coreinformers "k8s.io/client-go/informers/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+)
+
+// DefaultStreamQueueCapacity defines the default maximum number of pending
+// updates buffered per stream before the stream is closed.
+const DefaultStreamQueueCapacity = 100
+
+var (
+	// errIPConflict is a sentinel error returned when multiple services are
+	// indexed by the same underlying IP address (clusterIP).
+	errIPConflict = status.Error(codes.Unavailable, "found multiple services with conflicting cluster IP")
 )
 
 type (
+	Config struct {
+		ControllerNS,
+		IdentityTrustDomain,
+		ClusterDomain string
+
+		ForceOpaqueTransport,
+		EnableH2Upgrade,
+		EnableEndpointSlices,
+		EnableIPv6,
+		ExtEndpointZoneWeights bool
+
+		MeshedHttp2ClientParams *pb.Http2ClientParams
+
+		DefaultOpaquePorts map[uint32]struct{}
+
+		StreamQueueCapacity int
+	}
+
 	server struct {
-		endpoints     *watcher.EndpointsWatcher
-		opaquePorts   *watcher.OpaquePortsWatcher
-		profiles      *watcher.ProfileWatcher
-		trafficSplits *watcher.TrafficSplitWatcher
-		nodes         coreinformers.NodeInformer
+		pb.UnimplementedDestinationServer
 
-		enableH2Upgrade     bool
-		controllerNS        string
-		identityTrustDomain string
-		clusterDomain       string
-		defaultOpaquePorts  map[uint32]struct{}
+		config Config
 
-		k8sAPI   *k8s.API
-		log      *logging.Entry
-		shutdown <-chan struct{}
+		workloads         *watcher.WorkloadWatcher
+		endpoints         *watcher.EndpointsWatcher
+		opaquePorts       *watcher.OpaquePortsWatcher
+		profiles          *watcher.ProfileWatcher
+		clusterStore      *watcher.ClusterStore
+		federatedServices *federatedServiceWatcher
+
+		k8sAPI      *k8s.API
+		metadataAPI *k8s.MetadataAPI
+		log         *logging.Entry
+		shutdown    <-chan struct{}
 	}
 )
 
@@ -58,13 +86,10 @@ type (
 // API.
 func NewServer(
 	addr string,
-	controllerNS string,
-	identityTrustDomain string,
-	enableH2Upgrade bool,
-	enableEndpointSlices bool,
+	config Config,
 	k8sAPI *k8s.API,
-	clusterDomain string,
-	defaultOpaquePorts map[uint32]struct{},
+	metadataAPI *k8s.MetadataAPI,
+	clusterStore *watcher.ClusterStore,
 	shutdown <-chan struct{},
 ) (*grpc.Server, error) {
 	log := logging.WithFields(logging.Fields{
@@ -78,59 +103,66 @@ func NewServer(
 		return nil, err
 	}
 
-	endpoints := watcher.NewEndpointsWatcher(k8sAPI, log, enableEndpointSlices)
-	opaquePorts := watcher.NewOpaquePortsWatcher(k8sAPI, log, defaultOpaquePorts)
-	profiles := watcher.NewProfileWatcher(k8sAPI, log)
-	trafficSplits := watcher.NewTrafficSplitWatcher(k8sAPI, log)
+	workloads, err := watcher.NewWorkloadWatcher(k8sAPI, metadataAPI, log, config.EnableEndpointSlices, config.DefaultOpaquePorts)
+	if err != nil {
+		return nil, err
+	}
+	endpoints, err := watcher.NewEndpointsWatcher(k8sAPI, metadataAPI, log, config.EnableEndpointSlices, config.EnableIPv6, "local")
+	if err != nil {
+		return nil, err
+	}
+	opaquePorts, err := watcher.NewOpaquePortsWatcher(k8sAPI, log, config.DefaultOpaquePorts)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := watcher.NewProfileWatcher(k8sAPI, log)
+	if err != nil {
+		return nil, err
+	}
+	federatedServices, err := newFederatedServiceWatcher(k8sAPI, metadataAPI, &config, clusterStore, endpoints, log)
+	if err != nil {
+		return nil, err
+	}
 
 	srv := server{
+		pb.UnimplementedDestinationServer{},
+		config,
+		workloads,
 		endpoints,
 		opaquePorts,
 		profiles,
-		trafficSplits,
-		k8sAPI.Node(),
-		enableH2Upgrade,
-		controllerNS,
-		identityTrustDomain,
-		clusterDomain,
-		defaultOpaquePorts,
+		clusterStore,
+		federatedServices,
 		k8sAPI,
+		metadataAPI,
 		log,
 		shutdown,
 	}
 
-	s := prometheus.NewGrpcServer()
+	s := prometheus.NewGrpcServer(grpc.MaxConcurrentStreams(0))
 	// linkerd2-proxy-api/destination.Destination (proxy-facing)
 	pb.RegisterDestinationServer(s, &srv)
 	return s, nil
 }
 
 func (s *server) Get(dest *pb.GetDestination, stream pb.Destination_GetServer) error {
-	client, _ := peer.FromContext(stream.Context())
 	log := s.log
+
+	client, _ := peer.FromContext(stream.Context())
 	if client != nil {
-		log = s.log.WithField("remote", client.Addr)
+		log = log.WithField("remote", client.Addr)
 	}
-	log.Debugf("Get %s", dest.GetPath())
 
 	var token contextToken
 	if dest.GetContextToken() != "" {
+		log.Debugf("Dest token: %q", dest.GetContextToken())
 		token = s.parseContextToken(dest.GetContextToken())
-		log.Debugf("Dest token: %v", token)
+		log = log.WithFields(logging.Fields{"context-pod": token.Pod, "context-ns": token.Ns})
 	}
 
-	translator := newEndpointTranslator(
-		s.controllerNS,
-		s.identityTrustDomain,
-		s.enableH2Upgrade,
-		dest.GetPath(),
-		token.NodeName,
-		s.defaultOpaquePorts,
-		s.nodes,
-		stream,
-		log,
-	)
+	log.Debugf("Get %s", dest.GetPath())
 
+	streamEnd := make(chan struct{})
 	// The host must be fully-qualified or be an IP address.
 	host, port, err := getHostAndPort(dest.GetPath())
 	if err != nil {
@@ -143,27 +175,136 @@ func (s *server) Get(dest *pb.GetDestination, stream pb.Destination_GetServer) e
 		return status.Errorf(codes.InvalidArgument, "IP queries not supported by Get API: host=%s", host)
 	}
 
-	service, instanceID, err := parseK8sServiceName(host, s.clusterDomain)
+	service, instanceID, err := parseK8sServiceName(host, s.config.ClusterDomain)
 	if err != nil {
 		log.Debugf("Invalid service %s", dest.GetPath())
 		return status.Errorf(codes.InvalidArgument, "Invalid authority: %s", dest.GetPath())
 	}
 
-	err = s.endpoints.Subscribe(service, port, instanceID, translator)
+	svc, err := s.k8sAPI.Svc().Lister().Services(service.Namespace).Get(service.Name)
 	if err != nil {
-		if _, ok := err.(watcher.InvalidService); ok {
-			log.Debugf("Invalid service %s", dest.GetPath())
-			return status.Errorf(codes.InvalidArgument, "Invalid authority: %s", dest.GetPath())
+		if kerrors.IsNotFound(err) {
+			log.Debugf("Service not found %s", service)
+			return status.Errorf(codes.NotFound, "Service %s.%s not found", service.Name, service.Namespace)
 		}
-		log.Errorf("Failed to subscribe to %s: %s", dest.GetPath(), err)
-		return err
+		log.Debugf("Failed to get service %s: %v", service, err)
+		return status.Errorf(codes.Internal, "Failed to get service %s", dest.GetPath())
 	}
-	defer s.endpoints.Unsubscribe(service, port, instanceID, translator)
+
+	if isFederatedService(svc) {
+		// Federated service
+		remoteDiscovery := svc.Annotations[labels.RemoteDiscoveryAnnotation]
+		localDiscovery := svc.Annotations[labels.LocalDiscoveryAnnotation]
+		log.Debugf("Federated service discovery, remote:[%s] local:[%s]", remoteDiscovery, localDiscovery)
+		err := s.federatedServices.Subscribe(svc.Name, svc.Namespace, port, token.NodeName, instanceID, stream, streamEnd)
+		if err != nil {
+			log.Errorf("Failed to subscribe to federated service %q: %s", dest.GetPath(), err)
+			return err
+		}
+		defer s.federatedServices.Unsubscribe(svc.Name, svc.Namespace, stream)
+	} else if cluster, found := svc.Labels[labels.RemoteDiscoveryLabel]; found {
+		log.Debug("Remote discovery service detected")
+		// Remote discovery
+		remoteSvc, found := svc.Labels[labels.RemoteServiceLabel]
+		if !found {
+			log.Debugf("Remote discovery service missing remote service name %s", service)
+			return status.Errorf(codes.FailedPrecondition, "Remote discovery service missing remote service name %s", dest.GetPath())
+		}
+		remoteWatcher, remoteConfig, found := s.clusterStore.Get(cluster)
+		if !found {
+			log.Errorf("Failed to get remote cluster %s", cluster)
+			return status.Errorf(codes.NotFound, "Remote cluster not found: %s", cluster)
+		}
+		translator, err := newEndpointTranslator(
+			s.config.ControllerNS,
+			remoteConfig.TrustDomain,
+			s.config.ForceOpaqueTransport,
+			s.config.EnableH2Upgrade,
+			s.config.ExtEndpointZoneWeights,
+			s.config.MeshedHttp2ClientParams,
+			fmt.Sprintf("%s.%s.svc.%s:%d", remoteSvc, service.Namespace, remoteConfig.ClusterDomain, port),
+			token.NodeName,
+			s.config.DefaultOpaquePorts,
+			s.metadataAPI,
+			stream,
+			streamEnd,
+			log,
+			s.config.StreamQueueCapacity,
+		)
+		if err != nil {
+			return status.Errorf(codes.Internal, "Failed to create endpoint translator: %s", err)
+		}
+		translator.Start()
+		defer translator.Stop()
+
+		filterKey := watcher.FilterKey{
+			Hostname:                instanceID,
+			NodeName:                token.NodeName,
+			EnableEndpointFiltering: false, // Disable endpoint filtering for remote discovery.
+		}
+
+		err = remoteWatcher.Subscribe(watcher.ServiceID{Namespace: service.Namespace, Name: remoteSvc}, port, filterKey, translator)
+		if err != nil {
+			var ise watcher.InvalidService
+			if errors.As(err, &ise) {
+				log.Debugf("Invalid remote discovery service %s", dest.GetPath())
+				return status.Errorf(codes.InvalidArgument, "Invalid authority: %s", dest.GetPath())
+			}
+			log.Errorf("Failed to subscribe to remote discovery service %q in cluster %s: %s", dest.GetPath(), cluster, err)
+			return err
+		}
+		defer remoteWatcher.Unsubscribe(watcher.ServiceID{Namespace: service.Namespace, Name: remoteSvc}, port, filterKey, translator, false)
+
+	} else {
+		log.Debug("Local discovery service detected")
+		// Local discovery
+		translator, err := newEndpointTranslator(
+			s.config.ControllerNS,
+			s.config.IdentityTrustDomain,
+			s.config.ForceOpaqueTransport,
+			s.config.EnableH2Upgrade,
+			s.config.ExtEndpointZoneWeights,
+			s.config.MeshedHttp2ClientParams,
+			dest.GetPath(),
+			token.NodeName,
+			s.config.DefaultOpaquePorts,
+			s.metadataAPI,
+			stream,
+			streamEnd,
+			log,
+			s.config.StreamQueueCapacity,
+		)
+		if err != nil {
+			return status.Errorf(codes.Internal, "Failed to create endpoint translator: %s", err)
+		}
+		translator.Start()
+		defer translator.Stop()
+
+		filterKey := watcher.FilterKey{
+			Hostname:                instanceID,
+			NodeName:                token.NodeName,
+			EnableEndpointFiltering: true, // Enable endpoint filtering for local discovery.
+		}
+
+		err = s.endpoints.Subscribe(service, port, filterKey, translator)
+		if err != nil {
+			var ise watcher.InvalidService
+			if errors.As(err, &ise) {
+				log.Debugf("Invalid service %s", dest.GetPath())
+				return status.Errorf(codes.InvalidArgument, "Invalid authority: %s", dest.GetPath())
+			}
+			log.Errorf("Failed to subscribe to %s: %s", dest.GetPath(), err)
+			return err
+		}
+		defer s.endpoints.Unsubscribe(service, port, filterKey, translator, false)
+	}
 
 	select {
 	case <-s.shutdown:
 	case <-stream.Context().Done():
 		log.Debugf("Get %s cancelled", dest.GetPath())
+	case <-streamEnd:
+		log.Errorf("Get %s stream aborted", dest.GetPath())
 	}
 
 	return nil
@@ -171,137 +312,158 @@ func (s *server) Get(dest *pb.GetDestination, stream pb.Destination_GetServer) e
 
 func (s *server) GetProfile(dest *pb.GetDestination, stream pb.Destination_GetProfileServer) error {
 	log := s.log
+
 	client, _ := peer.FromContext(stream.Context())
 	if client != nil {
 		log = log.WithField("remote", client.Addr)
 	}
-	log.Debugf("GetProfile(%+v)", dest)
 
-	path := dest.GetPath()
-	// The host must be fully-qualified or be an IP address.
-	host, port, err := getHostAndPort(path)
-	if err != nil {
-		log.Debugf("Invalid authority %s", path)
-		return status.Errorf(codes.InvalidArgument, "invalid authority: %s", err)
+	var token contextToken
+	if dest.GetContextToken() != "" {
+		log.Debugf("Dest token: %q", dest.GetContextToken())
+		token = s.parseContextToken(dest.GetContextToken())
+		log = log.WithFields(logging.Fields{"context-pod": token.Pod, "context-ns": token.Ns})
 	}
 
-	// The stream will subscribe to profile updates for `service`.
-	var service watcher.ServiceID
-	// If `host` is an IP, `fqn` must be constructed from the namespace and
-	// name of the service that the IP maps to.
-	var fqn string
+	log.Debugf("Getting profile for %s", dest.GetPath())
+
+	// The host must be fully-qualified or be an IP address.
+	host, port, err := getHostAndPort(dest.GetPath())
+	if err != nil {
+		log.Debugf("Invalid address %q", dest.GetPath())
+		return status.Errorf(codes.InvalidArgument, "invalid authority: %q: %q", dest.GetPath(), err)
+	}
 
 	if ip := net.ParseIP(host); ip != nil {
-		// Get the service that the IP currently maps to.
-		svcID, err := getSvcID(s.k8sAPI, ip.String(), log)
+		err = s.getProfileByIP(token, ip, port, log, stream)
 		if err != nil {
-			return err
+			var ise watcher.InvalidService
+			if errors.As(err, &ise) {
+				log.Debugf("Invalid service %s", dest.GetPath())
+				return status.Errorf(codes.InvalidArgument, "Invalid authority: %s", dest.GetPath())
+			}
+			log.Errorf("Failed to subscribe to profile by ip %q: %q", dest.GetPath(), err)
 		}
-		if svcID != nil {
-			service = *svcID
-			fqn = fmt.Sprintf("%s.%s.svc.%s", service.Name, service.Namespace, s.clusterDomain)
-		} else {
-			// If the IP does not map to a service, check if it maps to a pod
-			pod, err := getPod(s.k8sAPI, ip.String(), port, log)
-			if err != nil {
-				return err
-			}
-			var endpoint *pb.WeightedAddr
-			opaquePorts := make(map[uint32]struct{})
-			if pod != nil {
-				// If the IP maps to a pod, we create a single endpoint and
-				// return it in the DestinationProfile response
-				podSet := podToAddressSet(s.k8sAPI, pod).WithPort(port)
-				podID := watcher.PodID{
-					Namespace: pod.Namespace,
-					Name:      pod.Name,
-				}
-				if err != nil {
-					log.Errorf("failed to set opaque port annotation on pod: %s", err)
-				}
-				var ok bool
-				opaquePorts, ok, err = getPodOpaquePortsAnnotations(pod)
-				if err != nil {
-					log.Errorf("failed to get opaque ports annotation for pod: %s", err)
-				}
-				// If the opaque ports annotation was not set, then set the
-				// endpoint's opaque ports to the default value.
-				if !ok {
-					opaquePorts = s.defaultOpaquePorts
-				}
+		return err
+	}
 
-				skippedInboundPorts, err := getPodSkippedInboundPortsAnnotations(pod)
-				if err != nil {
-					log.Errorf("failed to get ignored inbound ports annotation for pod: %s", err)
-				}
-
-				endpoint, err = toWeightedAddr(podSet.Addresses[podID], opaquePorts, skippedInboundPorts, s.enableH2Upgrade, s.identityTrustDomain, s.controllerNS, log)
-				if err != nil {
-					return err
-				}
-				// `Get` doesn't include the namespace in the per-endpoint
-				// metadata, so it needs to be special-cased.
-				endpoint.MetricLabels["namespace"] = pod.Namespace
-			}
-
-			// When the IP does not map to a service, the default profile is
-			// sent without subscribing for future updates. If the IP mapped
-			// to a pod, then the endpoint will be set in the response.
-			translator := newProfileTranslator(stream, log, "", port, endpoint)
-
-			// If there are opaque ports then update the profile translator
-			// with a service profile that has those values
-			//
-			// TODO: Remove endpoint from profileTranslator and set it here
-			// similar to opaque ports
-			if len(opaquePorts) != 0 {
-				sp := sp.ServiceProfile{}
-				sp.Spec.OpaquePorts = opaquePorts
-				translator.Update(&sp)
-			} else {
-				translator.Update(nil)
-			}
-
-			select {
-			case <-s.shutdown:
-			case <-stream.Context().Done():
-				log.Debugf("GetProfile(%+v) cancelled", dest)
-			}
-
-			return nil
+	err = s.getProfileByName(token, host, port, log, stream)
+	if err != nil {
+		var ise watcher.InvalidService
+		if errors.As(err, &ise) {
+			log.Debugf("Invalid service %s", dest.GetPath())
+			return status.Errorf(codes.InvalidArgument, "Invalid authority: %s", dest.GetPath())
 		}
-	} else {
-		service, _, err = parseK8sServiceName(host, s.clusterDomain)
+		log.Errorf("Failed to subscribe to profile by name %q: %q", dest.GetPath(), err)
+	}
+	return err
+}
+
+func (s *server) getProfileByIP(
+	token contextToken,
+	ip net.IP,
+	port uint32,
+	log *logging.Entry,
+	stream pb.Destination_GetProfileServer,
+) error {
+	// Get the service that the IP currently maps to.
+	svcID, err := getSvcID(s.k8sAPI, ip.String(), s.log)
+	if err != nil {
+		return err
+	}
+
+	if svcID == nil {
+		return s.subscribeToEndpointProfile(nil, "", ip.String(), port, log, stream)
+	}
+
+	fqn := fmt.Sprintf("%s.%s.svc.%s", svcID.Name, svcID.Namespace, s.config.ClusterDomain)
+	return s.subscribeToServiceProfile(*svcID, token, fqn, port, log, stream)
+}
+
+func (s *server) getProfileByName(
+	token contextToken,
+	host string,
+	port uint32,
+	log *logging.Entry,
+	stream pb.Destination_GetProfileServer,
+) error {
+	service, hostname, err := parseK8sServiceName(host, s.config.ClusterDomain)
+	if err != nil {
+		s.log.Debugf("Invalid service %s", host)
+		return status.Errorf(codes.InvalidArgument, "invalid service %q: %q", host, err)
+	}
+
+	// If the pod name (instance ID) is not empty, it means we parsed a DNS
+	// name. When we fetch the profile using a pod's DNS name, we want to
+	// return an endpoint in the profile response.
+	if hostname != "" {
+		return s.subscribeToEndpointProfile(&service, hostname, "", port, log, stream)
+	}
+
+	return s.subscribeToServiceProfile(service, token, host, port, log, stream)
+}
+
+// Resolves a profile for a service, sending updates to the provided stream.
+//
+// This function does not return until the stream is closed.
+func (s *server) subscribeToServiceProfile(
+	service watcher.ID,
+	token contextToken,
+	fqn string,
+	port uint32,
+	log *logging.Entry,
+	stream pb.Destination_GetProfileServer,
+) error {
+	log = log.
+		WithField("ns", service.Namespace).
+		WithField("svc", service.Name).
+		WithField("port", port)
+
+	canceled := stream.Context().Done()
+
+	svc, err := s.k8sAPI.Svc().Lister().Services(service.Namespace).Get(service.Name)
+	if err != nil {
+		log.Warnf("Failed to get service %s/%s: %s", service.Namespace, service.Name, err)
+		return err
+	}
+	if !s.svcDefinesPort(svc, port) {
+		log.Warnf("Service %s/%s does not define port %d", service.Namespace, service.Name, port)
+		// When the port is not defined on the service, we wish to return a
+		// Forbidden filter policy.  However, this policy is only defined in the
+		// client policy API, not in the service profile API. Therefore, we
+		// return an empty destination profile which will cause the proxy to
+		// use the client policy API instead.
+		empty := &pb.DestinationProfile{}
+		err = stream.Send(empty)
 		if err != nil {
-			log.Debugf("Invalid service %s", path)
-			return status.Errorf(codes.InvalidArgument, "invalid service: %s", err)
+			log.Warnf("Failed to send empty profile for %s: %s", fqn, err)
 		}
-		fqn = host
+		select {
+		case <-s.shutdown:
+		case <-canceled:
+			log.Debugf("GetProfile %s cancelled", fqn)
+		}
+		return nil
 	}
 
 	// We build up the pipeline of profile updaters backwards, starting from
 	// the translator which takes profile updates, translates them to protobuf
 	// and pushes them onto the gRPC stream.
-	translator := newProfileTranslator(stream, log, fqn, port, nil)
-
-	// The traffic split adaptor merges profile updates with traffic split
-	// updates and publishes the result to the profile translator.
-	tsAdaptor := newTrafficSplitAdaptor(translator, service, port, s.clusterDomain)
-
-	// Subscribe the adaptor to traffic split updates.
-	err = s.trafficSplits.Subscribe(service, tsAdaptor)
+	streamEnd := make(chan struct{})
+	translator, err := newProfileTranslatorWithCapacity(service, stream, log, fqn, port, streamEnd, s.config.StreamQueueCapacity)
 	if err != nil {
-		log.Warnf("Failed to subscribe to traffic split for %s: %s", path, err)
-		return err
+		return status.Errorf(codes.Internal, "Failed to create profile translator: %s", err)
 	}
-	defer s.trafficSplits.Unsubscribe(service, tsAdaptor)
+	translator.Start()
+	defer translator.Stop()
 
 	// The opaque ports adaptor merges profile updates with service opaque
 	// port annotation updates; it then publishes the result to the traffic
 	// split adaptor.
-	opaquePortsAdaptor := newOpaquePortsAdaptor(tsAdaptor)
+	opaquePortsAdaptor := newOpaquePortsAdaptor(translator)
 
-	// Subscribe the adaptor to service updates.
+	// Create an adaptor that merges service-level opaque port configurations
+	// onto profile updates.
 	err = s.opaquePorts.Subscribe(service, opaquePortsAdaptor)
 	if err != nil {
 		log.Warnf("Failed to subscribe to service updates for %s: %s", service, err)
@@ -309,51 +471,163 @@ func (s *server) GetProfile(dest *pb.GetDestination, stream pb.Destination_GetPr
 	}
 	defer s.opaquePorts.Unsubscribe(service, opaquePortsAdaptor)
 
-	// The fallback accepts updates from a primary and secondary source and
-	// passes the appropriate profile updates to the adaptor.
-	primary, secondary := newFallbackProfileListener(opaquePortsAdaptor)
+	// Ensure that (1) nil values are turned into a default policy and (2)
+	// subsequent updates that refer to same service profile object are
+	// deduplicated to prevent sending redundant updates.
+	dup := newDedupProfileListener(opaquePortsAdaptor, log)
+	defaultProfile := sp.ServiceProfile{}
+	listener := newDefaultProfileListener(&defaultProfile, dup, log)
 
-	// If we have a context token, we create two subscriptions: one with the
-	// context token which sends updates to the primary listener and one without
-	// the context token which sends updates to the secondary listener.  It is
-	// up to the fallbackProfileListener to merge updates from the primary and
-	// secondary listeners and send the appropriate updates to the stream.
-	if dest.GetContextToken() != "" {
-		ctxToken := s.parseContextToken(dest.GetContextToken())
-
-		profile, err := profileID(fqn, ctxToken, s.clusterDomain)
-		if err != nil {
-			log.Debugf("Invalid service %s", path)
-			return status.Errorf(codes.InvalidArgument, "invalid profile ID: %s", err)
-		}
-
-		err = s.profiles.Subscribe(profile, primary)
-		if err != nil {
-			log.Warnf("Failed to subscribe to profile %s: %s", path, err)
-			return err
-		}
-		defer s.profiles.Unsubscribe(profile, primary)
+	// The primary lookup uses the context token to determine the requester's
+	// namespace. If there's no namespace in the token, start a single
+	// subscription.
+	if token.Ns == "" {
+		return s.subscribeToServiceWithoutContext(fqn, listener, canceled, log, streamEnd)
 	}
+	return s.subscribeToServicesWithContext(fqn, token, listener, canceled, log, streamEnd)
+}
 
-	profile, err := profileID(fqn, contextToken{}, s.clusterDomain)
+// subscribeToServicesWithContext establishes two profile watches: a "backup"
+// watch (ignoring the client namespace) and a preferred "primary" watch
+// assuming the client's context. Once updates are received for both watches, we
+// select over both watches to send profile updates to the stream. A nil update
+// may be sent if both the primary and backup watches are initialized with a nil
+// value.
+func (s *server) subscribeToServicesWithContext(
+	fqn string,
+	token contextToken,
+	listener watcher.ProfileUpdateListener,
+	canceled <-chan struct{},
+	log *logging.Entry,
+	streamEnd <-chan struct{},
+) error {
+	// We ned to support two subscriptions:
+	// - First, a backup subscription that assumes the context of the server
+	//   namespace.
+	// - And then, a primary subscription that assumes the context of the client
+	//   namespace.
+	primary, backup := newFallbackProfileListener(listener, log)
+
+	// The backup lookup ignores the context token to lookup any
+	// server-namespace-hosted profiles.
+	backupID, err := profileID(fqn, contextToken{}, s.config.ClusterDomain)
 	if err != nil {
-		log.Debugf("Invalid service %s", path)
+		log.Debug("Invalid service")
 		return status.Errorf(codes.InvalidArgument, "invalid profile ID: %s", err)
 	}
-	err = s.profiles.Subscribe(profile, secondary)
+	err = s.profiles.Subscribe(backupID, backup)
 	if err != nil {
-		log.Warnf("Failed to subscribe to profile %s: %s", path, err)
+		log.Warnf("Failed to subscribe to profile: %s", err)
 		return err
 	}
-	defer s.profiles.Unsubscribe(profile, secondary)
+	defer s.profiles.Unsubscribe(backupID, backup)
+
+	primaryID, err := profileID(fqn, token, s.config.ClusterDomain)
+	if err != nil {
+		log.Debug("Invalid service")
+		return status.Errorf(codes.InvalidArgument, "invalid profile ID: %s", err)
+	}
+	err = s.profiles.Subscribe(primaryID, primary)
+	if err != nil {
+		log.Warnf("Failed to subscribe to profile: %s", err)
+		return err
+	}
+	defer s.profiles.Unsubscribe(primaryID, primary)
 
 	select {
 	case <-s.shutdown:
-	case <-stream.Context().Done():
-		log.Debugf("GetProfile(%+v) cancelled", dest)
+	case <-canceled:
+		log.Debugf("GetProfile %s cancelled", fqn)
+	case <-streamEnd:
+		log.Errorf("GetProfile %s stream aborted", fqn)
 	}
-
 	return nil
+}
+
+// subscribeToServiceWithoutContext establishes a single profile watch, assuming
+// no client context. All udpates are published to the provided listener.
+func (s *server) subscribeToServiceWithoutContext(
+	fqn string,
+	listener watcher.ProfileUpdateListener,
+	canceled <-chan struct{},
+	log *logging.Entry,
+	streamEnd <-chan struct{},
+) error {
+	id, err := profileID(fqn, contextToken{}, s.config.ClusterDomain)
+	if err != nil {
+		log.Debug("Invalid service")
+		return status.Errorf(codes.InvalidArgument, "invalid profile ID: %s", err)
+	}
+	err = s.profiles.Subscribe(id, listener)
+	if err != nil {
+		log.Warnf("Failed to subscribe to profile: %s", err)
+		return err
+	}
+	defer s.profiles.Unsubscribe(id, listener)
+
+	select {
+	case <-s.shutdown:
+	case <-canceled:
+		log.Debugf("GetProfile %s cancelled", fqn)
+	case <-streamEnd:
+		log.Errorf("GetProfile %s stream aborted", fqn)
+	}
+	return nil
+}
+
+// Resolves a profile for a single endpoint, sending updates to the provided
+// stream.
+//
+// This function does not return until the stream is closed.
+func (s *server) subscribeToEndpointProfile(
+	service *watcher.ServiceID,
+	hostname,
+	ip string,
+	port uint32,
+	log *logging.Entry,
+	stream pb.Destination_GetProfileServer,
+) error {
+	canceled := stream.Context().Done()
+	streamEnd := make(chan struct{})
+	translator := newEndpointProfileTranslator(
+		s.config.ForceOpaqueTransport,
+		s.config.EnableH2Upgrade,
+		s.config.ControllerNS,
+		s.config.IdentityTrustDomain,
+		s.config.DefaultOpaquePorts,
+		s.config.MeshedHttp2ClientParams,
+		stream,
+		streamEnd,
+		log,
+		s.config.StreamQueueCapacity,
+	)
+	translator.Start()
+	defer translator.Stop()
+
+	var err error
+	ip, err = s.workloads.Subscribe(service, hostname, ip, port, translator)
+	if err != nil {
+		return err
+	}
+	defer s.workloads.Unsubscribe(ip, port, translator)
+
+	select {
+	case <-s.shutdown:
+	case <-canceled:
+		s.log.Debugf("Cancelled")
+	case <-streamEnd:
+		log.Errorf("GetProfile %s:%d stream aborted", ip, port)
+	}
+	return nil
+}
+
+func (s *server) svcDefinesPort(svc *corev1.Service, port uint32) bool {
+	for _, p := range svc.Spec.Ports {
+		if uint32(p.Port) == port {
+			return true
+		}
+	}
+	return false
 }
 
 // getSvcID returns the service that corresponds to a Cluster IP address if one
@@ -374,7 +648,7 @@ func getSvcID(k8sAPI *k8s.API, clusterIP string, log *logging.Entry) (*watcher.S
 			conflictingServices = append(conflictingServices, fmt.Sprintf("%s:%s", service.Namespace, service.Name))
 		}
 		log.Warnf("found conflicting %s cluster IP: %s", clusterIP, strings.Join(conflictingServices, ","))
-		return nil, status.Errorf(codes.FailedPrecondition, "found %d services with conflicting cluster IP %s", len(services), clusterIP)
+		return nil, errIPConflict
 	}
 	if len(services) == 0 {
 		return nil, nil
@@ -386,97 +660,6 @@ func getSvcID(k8sAPI *k8s.API, clusterIP string, log *logging.Entry) (*watcher.S
 	return service, nil
 }
 
-// getPod returns a pod that maps to the given IP address. The pod can either
-// be in the host network or the pod network. If the pod is in the host
-// network, then it must have a container port that exposes `port` as a host
-// port.
-func getPod(k8sAPI *k8s.API, podIP string, port uint32, log *logging.Entry) (*corev1.Pod, error) {
-	// First we check if the address maps to a pod in the host network.
-	addr := fmt.Sprintf("%s:%d", podIP, port)
-	hostIPPods, err := getIndexedPods(k8sAPI, watcher.HostIPIndex, addr)
-	if err != nil {
-		return nil, status.Error(codes.Unknown, err.Error())
-	}
-	if len(hostIPPods) == 1 {
-		log.Debugf("found %s:%d on the host network", podIP, port)
-		return hostIPPods[0], nil
-	}
-	if len(hostIPPods) > 1 {
-		conflictingPods := []string{}
-		for _, pod := range hostIPPods {
-			conflictingPods = append(conflictingPods, fmt.Sprintf("%s:%s", pod.Namespace, pod.Name))
-		}
-		log.Warnf("found conflicting %s:%d endpoint on the host network: %s", podIP, port, strings.Join(conflictingPods, ","))
-		return nil, status.Errorf(codes.FailedPrecondition, "found %d pods with a conflicting host network endpoint %s:%d", len(hostIPPods), podIP, port)
-	}
-
-	// The address did not map to a pod in the host network, so now we check
-	// if the IP maps to a pod IP in the pod network.
-	podIPPods, err := getIndexedPods(k8sAPI, watcher.PodIPIndex, podIP)
-	if err != nil {
-		return nil, status.Error(codes.Unknown, err.Error())
-	}
-	if len(podIPPods) == 1 {
-		log.Debugf("found %s on the pod network", podIP)
-		return podIPPods[0], nil
-	}
-	if len(podIPPods) > 1 {
-		conflictingPods := []string{}
-		for _, pod := range podIPPods {
-			conflictingPods = append(conflictingPods, fmt.Sprintf("%s:%s", pod.Namespace, pod.Name))
-		}
-		log.Warnf("found conflicting %s IP on the pod network: %s", podIP, strings.Join(conflictingPods, ","))
-		return nil, status.Errorf(codes.FailedPrecondition, "found %d pods with a conflicting pod network IP %s", len(podIPPods), podIP)
-	}
-
-	log.Debugf("no pod found for %s:%d", podIP, port)
-	return nil, nil
-}
-
-func getIndexedPods(k8sAPI *k8s.API, indexName string, podIP string) ([]*corev1.Pod, error) {
-	objs, err := k8sAPI.Pod().Informer().GetIndexer().ByIndex(indexName, podIP)
-	if err != nil {
-		return nil, fmt.Errorf("failed getting %s indexed pods: %s", indexName, err)
-	}
-	pods := make([]*corev1.Pod, 0)
-	for _, obj := range objs {
-		pod := obj.(*corev1.Pod)
-		if !podReceivingTraffic(pod) {
-			continue
-		}
-		pods = append(pods, pod)
-	}
-	return pods, nil
-}
-
-func podReceivingTraffic(pod *corev1.Pod) bool {
-	phase := pod.Status.Phase
-	podTerminated := phase == corev1.PodSucceeded || phase == corev1.PodFailed
-	podTerminating := pod.DeletionTimestamp != nil
-
-	return !podTerminating && !podTerminated
-}
-
-// podToAddressSet converts a Pod spec into a set of Addresses.
-func podToAddressSet(k8sAPI *k8s.API, pod *corev1.Pod) *watcher.AddressSet {
-	ownerKind, ownerName := k8sAPI.GetOwnerKindAndName(context.Background(), pod, true)
-	return &watcher.AddressSet{
-		Addresses: map[watcher.PodID]watcher.Address{
-			{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
-			}: {
-				IP:        pod.Status.PodIP,
-				Port:      0, // Will be set by individual subscriptions
-				Pod:       pod,
-				OwnerName: ownerName,
-				OwnerKind: ownerKind,
-			},
-		},
-		Labels: map[string]string{"namespace": pod.Namespace},
-	}
-}
-
 ////////////
 /// util ///
 ////////////
@@ -484,10 +667,14 @@ func podToAddressSet(k8sAPI *k8s.API, pod *corev1.Pod) *watcher.AddressSet {
 type contextToken struct {
 	Ns       string `json:"ns,omitempty"`
 	NodeName string `json:"nodeName,omitempty"`
+	Pod      string `json:"pod,omitempty"`
 }
 
 func (s *server) parseContextToken(token string) contextToken {
 	ctxToken := contextToken{}
+	if token == "" {
+		return ctxToken
+	}
 	if err := json.Unmarshal([]byte(token), &ctxToken); err != nil {
 		// if json is invalid, means token can have ns:<namespace> form
 		parts := strings.Split(token, ":")
@@ -506,11 +693,11 @@ func (s *server) parseContextToken(token string) contextToken {
 func profileID(authority string, ctxToken contextToken, clusterDomain string) (watcher.ProfileID, error) {
 	host, _, err := getHostAndPort(authority)
 	if err != nil {
-		return watcher.ProfileID{}, fmt.Errorf("invalid authority: %s", err)
+		return watcher.ProfileID{}, fmt.Errorf("invalid authority: %w", err)
 	}
 	service, _, err := parseK8sServiceName(host, clusterDomain)
 	if err != nil {
-		return watcher.ProfileID{}, fmt.Errorf("invalid k8s service name: %s", err)
+		return watcher.ProfileID{}, fmt.Errorf("invalid k8s service name: %w", err)
 	}
 	id := watcher.ProfileID{
 		Name:      fmt.Sprintf("%s.%s.svc.%s", service.Name, service.Namespace, clusterDomain),
@@ -523,18 +710,20 @@ func profileID(authority string, ctxToken contextToken, clusterDomain string) (w
 }
 
 func getHostAndPort(authority string) (string, watcher.Port, error) {
-	hostPort := strings.Split(authority, ":")
-	if len(hostPort) > 2 {
-		return "", 0, fmt.Errorf("Invalid destination %s", authority)
+	if !strings.Contains(authority, ":") {
+		return authority, watcher.Port(80), nil
 	}
-	host := hostPort[0]
-	port := 80
-	if len(hostPort) == 2 {
-		var err error
-		port, err = strconv.Atoi(hostPort[1])
-		if err != nil {
-			return "", 0, fmt.Errorf("Invalid port %s", hostPort[1])
-		}
+
+	host, sport, err := net.SplitHostPort(authority)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid destination: %w", err)
+	}
+	port, err := strconv.Atoi(sport)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port %s: %w", sport, err)
+	}
+	if port <= 0 || port > 65535 {
+		return "", 0, fmt.Errorf("invalid port %d", port)
 	}
 	return host, watcher.Port(port), nil
 }
@@ -590,28 +779,10 @@ func hasSuffix(slice []string, suffix []string) bool {
 	return true
 }
 
-func getPodOpaquePortsAnnotations(pod *corev1.Pod) (map[uint32]struct{}, bool, error) {
-	annotation, ok := pod.Annotations[labels.ProxyOpaquePortsAnnotation]
-	if !ok {
-		return nil, false, nil
-	}
-	opaquePorts := make(map[uint32]struct{})
-	if annotation != "" {
-		for _, portStr := range util.ParseContainerOpaquePorts(annotation, pod.Spec.Containers) {
-			port, err := strconv.ParseUint(portStr, 10, 32)
-			if err != nil {
-				return nil, true, err
-			}
-			opaquePorts[uint32(port)] = struct{}{}
-		}
-	}
-	return opaquePorts, true, nil
-}
-
-func getPodSkippedInboundPortsAnnotations(pod *corev1.Pod) (map[uint32]struct{}, error) {
+func getPodSkippedInboundPortsAnnotations(pod *corev1.Pod) map[uint32]struct{} {
 	annotation, ok := pod.Annotations[labels.ProxyIgnoreInboundPortsAnnotation]
 	if !ok || annotation == "" {
-		return nil, nil
+		return nil
 	}
 
 	return util.ParsePorts(annotation)

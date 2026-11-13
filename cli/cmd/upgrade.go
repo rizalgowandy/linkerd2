@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/linkerd/linkerd2/cli/flag"
-	charts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	l5dcharts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	"github.com/linkerd/linkerd2/pkg/config"
 	flagspkg "github.com/linkerd/linkerd2/pkg/flags"
@@ -27,15 +26,13 @@ import (
 )
 
 const (
-	controlPlaneMessage    = "Don't forget to run `linkerd upgrade control-plane`!"
 	failMessage            = "For troubleshooting help, visit: https://linkerd.io/upgrade/#troubleshooting\n"
 	trustRootChangeMessage = "Rotating the trust anchors will affect existing proxies\nSee https://linkerd.io/2/tasks/rotating_identity_certificates/ for more information"
 )
 
 var (
-	addOnOverwrite bool
-	manifests      string
-	force          bool
+	manifests string
+	force     bool
 )
 
 /* The upgrade commands all follow the same flow:
@@ -48,87 +45,6 @@ var (
  * differ in which flags are available to each, what pre-check validations
  * are done, and which subset of the chart is rendered.
  */
-
-// newCmdUpgradeConfig is a subcommand for `linkerd upgrade config`
-func newCmdUpgradeConfig(values *l5dcharts.Values) *cobra.Command {
-	allStageFlags, allStageFlagSet := makeAllStageFlags(values)
-	var options valuespkg.Options
-
-	cmd := &cobra.Command{
-		Use:   "config [flags]",
-		Args:  cobra.NoArgs,
-		Short: "Output Kubernetes cluster-wide resources to upgrade an existing Linkerd",
-		Long: `Output Kubernetes cluster-wide resources to upgrade an existing Linkerd.
-
-Note that this command should be followed by "linkerd upgrade control-plane".
-
-The upgrade can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd2/README.md
-`,
-		Example: `  # Default upgrade.
-  linkerd upgrade config | kubectl apply -f -`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-
-			k, err := k8sClient(manifests)
-			if err != nil {
-				return err
-			}
-			return upgradeRunE(cmd.Context(), k, allStageFlags, configStage, options)
-		},
-	}
-
-	cmd.Flags().AddFlagSet(allStageFlagSet)
-	flagspkg.AddValueOptionsFlags(cmd.Flags(), &options)
-
-	return cmd
-}
-
-// newCmdUpgradeControlPlane is a subcommand for `linkerd upgrade control-plane`
-func newCmdUpgradeControlPlane(values *l5dcharts.Values) *cobra.Command {
-	var options valuespkg.Options
-
-	allStageFlags, allStageFlagSet := makeAllStageFlags(values)
-	installUpgradeFlags, installUpgradeFlagSet, err := makeInstallUpgradeFlags(values)
-	if err != nil {
-		fmt.Fprint(os.Stderr, err.Error())
-		os.Exit(1)
-	}
-	proxyFlags, proxyFlagSet := makeProxyFlags(values)
-
-	flags := flattenFlags(allStageFlags, installUpgradeFlags, proxyFlags)
-
-	cmd := &cobra.Command{
-		Use:   "control-plane [flags]",
-		Args:  cobra.NoArgs,
-		Short: "Output Kubernetes control plane resources to upgrade an existing Linkerd",
-		Long: `Output Kubernetes control plane resources to upgrade an existing Linkerd.
-
-Note that the default flag values for this command come from the Linkerd control
-plane. The default values displayed in the Flags section below only apply to the
-install command. It should be run after "linkerd upgrade config".
-
-The upgrade can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd2/README.md
-`,
-		Example: `  # Default upgrade.
-  linkerd upgrade control-plane | kubectl apply -f -`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			k, err := k8sClient(manifests)
-			if err != nil {
-				return err
-			}
-			return upgradeRunE(cmd.Context(), k, flags, controlPlaneStage, options)
-		},
-	}
-
-	cmd.Flags().AddFlagSet(allStageFlagSet)
-	cmd.Flags().AddFlagSet(installUpgradeFlagSet)
-	cmd.Flags().AddFlagSet(proxyFlagSet)
-	flagspkg.AddValueOptionsFlags(cmd.Flags(), &options)
-
-	return cmd
-}
-
 func newCmdUpgrade() *cobra.Command {
 	values, err := l5dcharts.NewValues()
 	if err != nil {
@@ -136,15 +52,17 @@ func newCmdUpgrade() *cobra.Command {
 		os.Exit(1)
 	}
 
+	var crds bool
 	var options valuespkg.Options
-	allStageFlags, allStageFlagSet := makeAllStageFlags(values)
+	var output string
+
 	installUpgradeFlags, installUpgradeFlagSet, err := makeInstallUpgradeFlags(values)
 	if err != nil {
 		fmt.Fprint(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 	proxyFlags, proxyFlagSet := makeProxyFlags(values)
-	flags := flattenFlags(allStageFlags, installUpgradeFlags, proxyFlags)
+	flags := flattenFlags(installUpgradeFlags, proxyFlags)
 
 	upgradeFlagSet := makeUpgradeFlags()
 
@@ -159,21 +77,34 @@ plane. The default values displayed in the Flags section below only apply to the
 install command.
 
 The upgrade can be configured by using the --set, --values, --set-string and --set-file flags.
-A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd2/README.md
+A full list of configurable values can be found at https://www.github.com/linkerd/linkerd2/tree/main/charts/linkerd-control-plane/values.yaml
 `,
 
-		Example: `  # Default upgrade.
-  linkerd upgrade | kubectl apply --prune -l linkerd.io/control-plane-ns=linkerd -f -
+		Example: `  # Upgrade CRDs first
+  linkerd upgrade --crds | kubectl apply -f -
 
-  # Similar to install, upgrade may also be broken up into two stages, by user
-  # privilege.`,
+  # Then upgrade the control plane
+  linkerd upgrade | kubectl apply -f -
+
+  # And lastly, remove linkerd resources that no longer exist in the current version
+  linkerd prune | kubectl delete -f -`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			k, err := k8sClient(manifests)
+			k, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to create a kubernetes client: %w", err)
 			}
-			err = upgradeRunE(cmd.Context(), k, flags, "", options)
-			if err != nil {
+
+			if crds {
+				// The CRD chart is not configurable.
+				// TODO(ver): Error if values have been configured?
+				if _, err := upgradeCRDs(cmd.Context(), k, options, output).WriteTo(os.Stdout); err != nil {
+					fmt.Fprintln(os.Stderr, err.Error())
+					os.Exit(1)
+				}
+				return nil
+			}
+
+			if err = upgradeControlPlaneRunE(cmd.Context(), k, flags, options, manifests, output); err != nil {
 				fmt.Fprintln(os.Stderr, err.Error())
 				os.Exit(1)
 			}
@@ -181,37 +112,36 @@ A full list of configurable values can be found at https://www.github.com/linker
 		},
 	}
 
-	cmd.Flags().AddFlagSet(allStageFlagSet)
 	cmd.Flags().AddFlagSet(installUpgradeFlagSet)
 	cmd.Flags().AddFlagSet(proxyFlagSet)
 	cmd.PersistentFlags().AddFlagSet(upgradeFlagSet)
 	flagspkg.AddValueOptionsFlags(cmd.Flags(), &options)
-
-	cmd.AddCommand(newCmdUpgradeConfig(values))
-	cmd.AddCommand(newCmdUpgradeControlPlane(values))
+	cmd.Flags().BoolVar(&crds, "crds", false, "Upgrade Linkerd CRDs")
+	cmd.PersistentFlags().StringVarP(&output, "output", "o", "yaml", "Output format. One of: json|yaml")
 
 	return cmd
 }
 
-func k8sClient(manifestsFile string) (*k8s.KubernetesAPI, error) {
-	// We need a Kubernetes client to fetch configs and issuer secrets.
-	var k *k8s.KubernetesAPI
-	var err error
-	if manifestsFile != "" {
-		readers, err := read(manifestsFile)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to parse manifests from %s: %s", manifestsFile, err)
-		}
+// makeConfigClient is used to re-initialize the Kubernetes client in order
+// to fetch existing configuration. It accepts two arguments: a Kubernetes
+// client, and a path to a manifest file. If the manifest path is empty, the
+// client will not be re-initialized. When non-empty, the client will be
+// replaced by a fake Kubernetes client that will hold the values parsed from
+// the manifest.
+func makeConfigClient(k *k8s.KubernetesAPI, localManifestPath string) (*k8s.KubernetesAPI, error) {
+	if localManifestPath == "" {
+		return k, nil
+	}
 
-		k, err = k8s.NewFakeAPIFromManifests(readers)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to parse Kubernetes objects from manifest %s: %s", manifestsFile, err)
-		}
-	} else {
-		k, err = k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
-		if err != nil {
-			return nil, fmt.Errorf("Failed to create a kubernetes client: %s", err)
-		}
+	// We need a Kubernetes client to fetch configs and issuer secrets.
+	readers, err := read(localManifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse manifests from %s: %w", localManifestPath, err)
+	}
+
+	k, err = k8s.NewFakeAPIFromManifests(readers)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse Kubernetes objects from manifest %s: %w", localManifestPath, err)
 	}
 	return k, nil
 }
@@ -231,16 +161,29 @@ func makeUpgradeFlags() *pflag.FlagSet {
 		&force, "force", false,
 		"Force upgrade operation even when issuer certificate does not work with the trust anchors of all proxies",
 	)
-	upgradeFlags.BoolVar(
-		&addOnOverwrite, "addon-overwrite", false,
-		"Overwrite add-on configuration instead of loading the existing config (or reset to defaults if no new config is specified)",
-	)
 	return upgradeFlags
 }
 
-func upgradeRunE(ctx context.Context, k *k8s.KubernetesAPI, flags []flag.Flag, stage string, options valuespkg.Options) error {
+func upgradeControlPlaneRunE(ctx context.Context, k *k8s.KubernetesAPI, flags []flag.Flag, options valuespkg.Options, localManifestPath string, format string) error {
 
-	buf, err := upgrade(ctx, k, flags, stage, options)
+	crds := bytes.Buffer{}
+	err := renderCRDs(ctx, k, &crds, options, "yaml")
+	if err != nil {
+		return err
+	}
+
+	err = healthcheck.CheckCustomResourceDefinitions(ctx, k, crds.String())
+	if err != nil {
+		return fmt.Errorf("Linkerd CRDs must be installed first. Run linkerd upgrade with the --crds flag:\n%w", err)
+	}
+
+	// Re-initialize client if a local manifest path is used
+	k, err = makeConfigClient(k, localManifestPath)
+	if err != nil {
+		return err
+	}
+
+	buf, err := upgradeControlPlane(ctx, k, flags, options, format)
 	if err != nil {
 		return err
 	}
@@ -250,77 +193,77 @@ func upgradeRunE(ctx context.Context, k *k8s.KubernetesAPI, flags []flag.Flag, s
 			fmt.Fprintf(os.Stderr, "\n%s %s\n\n", warnStatus, trustRootChangeMessage)
 		}
 	}
-	if stage == configStage {
-		fmt.Fprintf(os.Stderr, "%s\n\n", controlPlaneMessage)
-	}
 
-	buf.WriteTo(os.Stdout)
-
-	return nil
+	_, err = buf.WriteTo(os.Stdout)
+	return err
 }
 
-func upgrade(ctx context.Context, k *k8s.KubernetesAPI, flags []flag.Flag, stage string, options valuespkg.Options) (bytes.Buffer, error) {
+func upgradeCRDs(ctx context.Context, k *k8s.KubernetesAPI, options valuespkg.Options, format string) *bytes.Buffer {
+	var buf bytes.Buffer
+	if err := renderCRDs(ctx, k, &buf, options, format); err != nil {
+		upgradeErrorf("Could not render upgrade configuration: %s", err)
+	}
+	return &buf
+}
+
+func upgradeControlPlane(ctx context.Context, k *k8s.KubernetesAPI, flags []flag.Flag, options valuespkg.Options, format string) (*bytes.Buffer, error) {
 	values, err := loadStoredValues(ctx, k)
 	if err != nil {
-		return bytes.Buffer{}, err
-	}
-	// If there is no linkerd-config-overrides secret, assume we are upgrading
-	// from a verion of Linkerd prior to the introduction of this secret.  In
-	// this case we load the values from the legacy linkerd-config configmap.
-	if values == nil {
-		values, err = loadStoredValuesLegacy(ctx, k)
-		if err != nil {
-			return bytes.Buffer{}, err
-		}
+		return nil, fmt.Errorf("failed to load stored values: %w", err)
 	}
 
-	// If values is still nil, then neither the linkerd-config-overrides secret
-	// nor the legacy values were found. This means either means that Linkerd
-	// was installed with Helm or that the installation needs to be repaired.
 	if values == nil {
-		return bytes.Buffer{}, errors.New(
-			`Could not find the Linkerd config. If Linkerd was installed with Helm, please
-use Helm to perform upgrades. If Linkerd was not installed with Helm, please use
-the 'linkerd repair' command to repair the Linkerd config`)
+		return nil, errors.New(
+			`Could not find the linkerd-config-overrides secret.
+			If Linkerd was installed with Helm, please use Helm to perform upgrades`)
 	}
 
 	err = flag.ApplySetFlags(values, flags)
 	if err != nil {
-		return bytes.Buffer{}, err
+		return nil, err
 	}
 
 	if values.Identity.Issuer.Scheme == string(corev1.SecretTypeTLS) {
 		for _, flag := range flags {
 			if (flag.Name() == "identity-issuer-certificate-file" || flag.Name() == "identity-issuer-key-file") && flag.IsSet() {
-				return bytes.Buffer{}, errors.New("cannot update issuer certificates if you are using external cert management solution")
+				return nil, errors.New("cannot update issuer certificates if you are using external cert management solution")
 			}
 		}
 	}
 
 	err = validateValues(ctx, k, values)
 	if err != nil {
-		return bytes.Buffer{}, err
+		return nil, err
 	}
 	if !force && values.Identity.Issuer.Scheme == k8s.IdentityIssuerSchemeLinkerd {
 		err = ensureIssuerCertWorksWithAllProxies(ctx, k, values)
 		if err != nil {
-			return bytes.Buffer{}, err
+			return nil, err
 		}
 	}
 
-	// rendering to a buffer and printing full contents of buffer after
-	// render is complete, to ensure that okStatus prints separately
-	var buf bytes.Buffer
-	if err = render(&buf, values, stage, options); err != nil {
-		upgradeErrorf("Could not render upgrade configuration: %s", err)
+	// Create values override
+	valuesOverrides, err := options.MergeValues(nil)
+	if err != nil {
+		return nil, err
+	}
+	if !isRunAsRoot(valuesOverrides) {
+		err = healthcheck.CheckNodesHaveNonDockerRuntime(ctx, k)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	return buf, nil
+	var buf bytes.Buffer
+	if err = renderControlPlane(&buf, values, valuesOverrides, format); err != nil {
+		upgradeErrorf("Could not render upgrade configuration: %s", err)
+	}
+	return &buf, nil
 }
 
-func loadStoredValues(ctx context.Context, k *k8s.KubernetesAPI) (*charts.Values, error) {
+func loadStoredValues(ctx context.Context, k *k8s.KubernetesAPI) (*l5dcharts.Values, error) {
 	// Load the default values from the chart.
-	values, err := charts.NewValues()
+	values, err := l5dcharts.NewValues()
 	if err != nil {
 		return nil, err
 	}
@@ -376,6 +319,10 @@ func ensureIssuerCertWorksWithAllProxies(ctx context.Context, k *k8s.KubernetesA
 		return err
 	}
 	for _, pod := range meshedPods {
+		// Skip control plane pods since they load their trust anchors from the linkerd-identity-trust-anchors configmap.
+		if pod.Namespace == controlPlaneNamespace {
+			continue
+		}
 		anchors, err := tls.DecodePEMCertPool(pod.Anchors)
 
 		if anchors != nil {

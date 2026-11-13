@@ -2,8 +2,11 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -12,7 +15,6 @@ import (
 
 	httpPb "github.com/linkerd/linkerd2-proxy-api/go/http_types"
 	proxy "github.com/linkerd/linkerd2-proxy-api/go/tap"
-	apiUtil "github.com/linkerd/linkerd2/controller/api/util"
 	netPb "github.com/linkerd/linkerd2/controller/gen/common/net"
 	"github.com/linkerd/linkerd2/controller/k8s"
 	"github.com/linkerd/linkerd2/pkg/addr"
@@ -21,10 +23,12 @@ import (
 	"github.com/linkerd/linkerd2/pkg/util"
 	metricsPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	vizLabels "github.com/linkerd/linkerd2/viz/pkg/labels"
+	pkgUtil "github.com/linkerd/linkerd2/viz/pkg/util"
 	tapPb "github.com/linkerd/linkerd2/viz/tap/gen/tap"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
@@ -37,10 +41,12 @@ const defaultMaxRps = 100.0
 
 // GRPCTapServer describes the gRPC server implementing pb.TapServer
 type GRPCTapServer struct {
+	tapPb.UnimplementedTapServer
 	tapPort             uint
 	k8sAPI              *k8s.API
 	controllerNamespace string
 	trustDomain         string
+	ignoreHeaders       map[string]bool
 }
 
 var (
@@ -48,6 +54,9 @@ var (
 )
 
 // Tap is deprecated, use TapByResource.
+// This API endpoint is marked as deprecated but it's still used.
+//
+//nolint:staticcheck
 func (s *GRPCTapServer) Tap(req *tapPb.TapRequest, stream tapPb.Tap_TapServer) error {
 	return status.Error(codes.Unimplemented, "Tap is deprecated, use TapByResource")
 }
@@ -74,7 +83,7 @@ func (s *GRPCTapServer) TapByResource(req *tapPb.TapByResourceRequest, stream ta
 
 	objects, err := s.k8sAPI.GetObjects(res.GetNamespace(), res.GetType(), res.GetName(), labelSelector)
 	if err != nil {
-		return apiUtil.GRPCError(err)
+		return pkgUtil.GRPCError(err)
 	}
 
 	pods := []*corev1.Pod{}
@@ -83,7 +92,7 @@ func (s *GRPCTapServer) TapByResource(req *tapPb.TapByResourceRequest, stream ta
 	for _, object := range objects {
 		podsFor, err := s.k8sAPI.GetPodsFor(object, false)
 		if err != nil {
-			return apiUtil.GRPCError(err)
+			return pkgUtil.GRPCError(err)
 		}
 
 		for _, pod := range podsFor {
@@ -101,7 +110,7 @@ func (s *GRPCTapServer) TapByResource(req *tapPb.TapByResourceRequest, stream ta
 
 	if len(pods) == 0 {
 		var errs strings.Builder
-		fmt.Fprintf(&errs, "no pods to tap for %s/%s\n", res.GetType(), res.GetName())
+		fmt.Fprintf(&errs, "no pods to tap for type=%q name=%q\n", res.GetType(), res.GetName())
 		if len(tapDisabled) > 0 {
 			fmt.Fprintf(&errs, "%d pods found with tap disabled via the %s annotation:\n", len(tapDisabled), vizLabels.VizTapDisabled)
 			for _, pod := range tapDisabled {
@@ -116,10 +125,10 @@ func (s *GRPCTapServer) TapByResource(req *tapPb.TapByResourceRequest, stream ta
 			}
 			fmt.Fprintln(&errs, "restart these pods to enable tap and make them valid tap targets")
 		}
-		return status.Errorf(codes.NotFound, errs.String())
+		return status.Error(codes.NotFound, errs.String())
 	}
 
-	log.Infof("Tapping %d pods for target: %s", len(pods), res.String())
+	log.Infof("Tapping %d pods for target: %q", len(pods), res.String())
 
 	events := make(chan *tapPb.TapEvent)
 
@@ -131,7 +140,7 @@ func (s *GRPCTapServer) TapByResource(req *tapPb.TapByResourceRequest, stream ta
 
 	match, err := makeByResourceMatch(req.GetMatch())
 	if err != nil {
-		return apiUtil.GRPCError(err)
+		return pkgUtil.GRPCError(err)
 	}
 
 	extract := &proxy.ObserveRequest_Extract{}
@@ -168,7 +177,7 @@ func (s *GRPCTapServer) TapByResource(req *tapPb.TapByResourceRequest, stream ta
 		case event := <-events:
 			err := stream.Send(event)
 			if err != nil {
-				return apiUtil.GRPCError(err)
+				return pkgUtil.GRPCError(err)
 			}
 		}
 	}
@@ -296,9 +305,10 @@ func buildExtractHTTP(extract *tapPb.TapByResourceRequest_Extract_Http) *proxy.O
 // less than 1s, we sleep until the end of the window before calling Observe
 // again.
 func (s *GRPCTapServer) tapProxy(ctx context.Context, maxRps float32, match *proxy.ObserveRequest_Match, extract *proxy.ObserveRequest_Extract, addr string, events chan *tapPb.TapEvent) {
-	tapAddr := fmt.Sprintf("%s:%d", addr, s.tapPort)
+	strPort := strconv.Itoa(int(s.tapPort))
+	tapAddr := net.JoinHostPort(addr, strPort)
 	log.Infof("Establishing tap on %s", tapAddr)
-	conn, err := grpc.DialContext(ctx, tapAddr, grpc.WithInsecure())
+	conn, err := grpc.NewClient(tapAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Error(err)
 		return
@@ -322,11 +332,11 @@ func (s *GRPCTapServer) tapProxy(ctx context.Context, maxRps float32, match *pro
 		}
 		for { // Stream loop
 			event, err := rsp.Recv()
-			if err == io.EOF {
-				log.Debugf("[%s] proxy terminated the stream", addr)
-				break
-			}
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					log.Debugf("[%s] proxy terminated the stream", addr)
+					break
+				}
 				log.Errorf("[%s] encountered an error: %s", addr, err)
 				return
 			}
@@ -412,6 +422,9 @@ func (s *GRPCTapServer) translateEvent(ctx context.Context, orig *proxy.TapEvent
 			var headers []*metricsPb.Headers_Header
 			for _, header := range orig.GetHeaders() {
 				n := header.GetName()
+				if s.ignoreHeaders[n] {
+					continue
+				}
 				b := header.GetValue()
 				h := metricsPb.Headers_Header{Name: n, Value: &metricsPb.Headers_Header_ValueBin{ValueBin: b}}
 				if utf8.Valid(b) {
@@ -531,11 +544,16 @@ func NewGrpcTapServer(
 	controllerNamespace string,
 	trustDomain string,
 	k8sAPI *k8s.API,
-) *GRPCTapServer {
-	k8sAPI.Pod().Informer().AddIndexers(cache.Indexers{ipIndex: indexByIP})
-	k8sAPI.Node().Informer().AddIndexers(cache.Indexers{ipIndex: indexByIP})
+	ignoreHeaders map[string]bool,
+) (*GRPCTapServer, error) {
+	if err := k8sAPI.Pod().Informer().AddIndexers(cache.Indexers{ipIndex: indexByIP}); err != nil {
+		return nil, err
+	}
+	if err := k8sAPI.Node().Informer().AddIndexers(cache.Indexers{ipIndex: indexByIP}); err != nil {
+		return nil, err
+	}
 
-	return newGRPCTapServer(tapPort, controllerNamespace, trustDomain, k8sAPI)
+	return newGRPCTapServer(tapPort, controllerNamespace, trustDomain, k8sAPI, ignoreHeaders), nil
 }
 
 func newGRPCTapServer(
@@ -543,15 +561,17 @@ func newGRPCTapServer(
 	controllerNamespace string,
 	trustDomain string,
 	k8sAPI *k8s.API,
+	ignoreHeaders map[string]bool,
 ) *GRPCTapServer {
 	srv := &GRPCTapServer{
 		tapPort:             tapPort,
 		k8sAPI:              k8sAPI,
 		controllerNamespace: controllerNamespace,
 		trustDomain:         trustDomain,
+		ignoreHeaders:       ignoreHeaders,
 	}
 
-	s := prometheus.NewGrpcServer()
+	s := prometheus.NewGrpcServer(grpc.MaxConcurrentStreams(0))
 	tapPb.RegisterTapServer(s, srv)
 
 	return srv
@@ -598,7 +618,7 @@ func (s *GRPCTapServer) hydrateEventLabels(ctx context.Context, ev *tapPb.TapEve
 
 }
 
-// hydrateIPMeta attempts to determine the metadata labels for `ip` and, if
+// hydrateIPLabels attempts to determine the metadata labels for `ip` and, if
 // successful, adds them to `labels`.
 func (s *GRPCTapServer) hydrateIPLabels(ctx context.Context, ip *netPb.IPAddress, labels map[string]string) error {
 	res, err := s.resourceForIP(ip)
@@ -677,7 +697,7 @@ func getLabelSelector(req *tapPb.TapByResourceRequest) (labels.Selector, error) 
 		var err error
 		labelSelector, err = labels.Parse(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid label selector \"%s\": %s", s, err)
+			return nil, fmt.Errorf("invalid label selector \"%s\": %w", s, err)
 		}
 	}
 	return labelSelector, nil

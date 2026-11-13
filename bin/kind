@@ -2,7 +2,7 @@
 
 set -eu
 
-kindversion=v0.8.1
+kindversion=v0.11.1
 
 bindir=$( cd "${0%/*}" && pwd )
 targetbin=$( cd "$bindir"/.. && pwd )/target/bin
@@ -24,7 +24,7 @@ if [ ! -f "$kindbin" ]; then
   fi
 
   mkdir -p "$targetbin"
-  curl -sfL -o "$kindbin" https://github.com/kubernetes-sigs/kind/releases/download/$kindversion/kind-$os-$arch
+  "$bindir"/scurl -o "$kindbin" https://github.com/kubernetes-sigs/kind/releases/download/$kindversion/kind-$os-$arch
   chmod +x "$kindbin"
 fi
 

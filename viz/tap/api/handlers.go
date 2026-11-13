@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/go-openapi/spec"
@@ -17,17 +18,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/metadata"
+	authV1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/version"
 )
 
 type handler struct {
-	k8sAPI         *k8s.API
-	usernameHeader string
-	groupHeader    string
-	grpcTapServer  pb.TapServer
-	log            *logrus.Entry
+	k8sAPI            *k8s.API
+	usernameHeader    string
+	groupHeader       string
+	extraHeaderPrefix string
+	grpcTapServer     pb.TapServer
+	log               *logrus.Entry
 }
 
 // TODO: share with api_handlers.go
@@ -55,19 +58,18 @@ var (
 
 	resources = []struct {
 		name       string
-		shortname  string
 		namespaced bool
 	}{
-		{"namespaces", "ns", false},
-		{"pods", "po", true},
-		{"replicationcontrollers", "rc", true},
-		{"services", "svc", true},
-		{"daemonsets", "ds", true},
-		{"deployments", "deploy", true},
-		{"replicasets", "rs", true},
-		{"statefulsets", "sts", true},
-		{"jobs", "", true},
-		{"cronjobs", "cj", true},
+		{"namespaces", false},
+		{"pods", true},
+		{"replicationcontrollers", true},
+		{"services", true},
+		{"daemonsets", true},
+		{"deployments", true},
+		{"replicasets", true},
+		{"statefulsets", true},
+		{"jobs", true},
+		{"cronjobs", true},
 	}
 )
 
@@ -114,15 +116,17 @@ func (h *handler) handleTap(w http.ResponseWriter, req *http.Request, p httprout
 	} else if len(path) == 10 {
 		resource = path[7]
 	} else {
-		err := fmt.Errorf("invalid path: %s", req.URL.Path)
+		err := fmt.Errorf("invalid path: %q", req.URL.Path)
 		h.log.Error(err)
 		renderJSONError(w, err, http.StatusBadRequest)
 		return
 	}
 
-	h.log.Debugf("SubjectAccessReview: namespace: %s, resource: %s, name: %s, user: %s, group: %s",
-		namespace, resource, name, req.Header.Get(h.usernameHeader), req.Header[h.groupHeader],
+	h.log.Debugf("SubjectAccessReview: namespace: %q, resource: %q, name: %q, user: %q, group: %q",
+		namespace, resource, name, h.usernameHeader, h.groupHeader,
 	)
+
+	extra := extractExtraHeaders(req.Header, h.extraHeaderPrefix)
 
 	// TODO: it's possible this SubjectAccessReview is redundant, consider
 	// removing, more info at https://github.com/linkerd/linkerd2/issues/3182
@@ -137,10 +141,11 @@ func (h *handler) handleTap(w http.ResponseWriter, req *http.Request, p httprout
 		"tap",
 		name,
 		req.Header.Get(h.usernameHeader),
-		req.Header[h.groupHeader],
+		req.Header.Values(h.groupHeader),
+		extra,
 	)
 	if err != nil {
-		err = fmt.Errorf("tap authorization failed (%s), visit %s for more information", err, pkg.TapRbacURL)
+		err = fmt.Errorf("tap authorization failed (%w), visit %s for more information", err, pkg.TapRbacURL)
 		h.log.Error(err)
 		renderJSONError(w, err, http.StatusForbidden)
 		return
@@ -149,7 +154,7 @@ func (h *handler) handleTap(w http.ResponseWriter, req *http.Request, p httprout
 	tapReq := pb.TapByResourceRequest{}
 	err = protohttp.HTTPRequestToProto(req, &tapReq)
 	if err != nil {
-		err = fmt.Errorf("Error decoding Tap Request proto: %s", err)
+		err = fmt.Errorf("Error decoding Tap Request proto: %w", err)
 		h.log.Error(err)
 		protohttp.WriteErrorToHTTPResponse(w, err)
 		return
@@ -157,7 +162,7 @@ func (h *handler) handleTap(w http.ResponseWriter, req *http.Request, p httprout
 
 	url := pkg.TapReqToURL(&tapReq)
 	if url != req.URL.Path {
-		err = fmt.Errorf("tap request body did not match APIServer URL: %+v != %+v", url, req.URL.Path)
+		err = fmt.Errorf("tap request body did not match APIServer URL: %q != %q", url, req.URL.Path)
 		h.log.Error(err)
 		protohttp.WriteErrorToHTTPResponse(w, err)
 		return
@@ -171,12 +176,37 @@ func (h *handler) handleTap(w http.ResponseWriter, req *http.Request, p httprout
 	}
 
 	serverStream := serverStream{w: flushableWriter, req: req, log: h.log}
+	// This API endpoint is marked as deprecated but it's still used.
+	//nolint:staticcheck
 	err = h.grpcTapServer.TapByResource(&tapReq, &serverStream)
 	if err != nil {
-		h.log.Error(err)
+		h.log.Errorf("TapByResource failed: %q", err)
 		protohttp.WriteErrorToHTTPResponse(flushableWriter, err)
 		return
 	}
+}
+
+func extractExtraHeaders(header http.Header, extraHeaderPrefix string) map[string]authV1.ExtraValue {
+	if extraHeaderPrefix == "" {
+		return nil
+	}
+
+	extraHeaderPrefixLower := strings.ToLower(extraHeaderPrefix)
+	extraHeaderPrefixLen := len(extraHeaderPrefix)
+	extra := make(map[string]authV1.ExtraValue)
+
+	for key, values := range header {
+		if !strings.HasPrefix(strings.ToLower(key), extraHeaderPrefixLower) {
+			continue
+		}
+
+		extraKey, err := url.QueryUnescape(key[extraHeaderPrefixLen:])
+		if err == nil {
+			extra[extraKey] = authV1.ExtraValue(values)
+		}
+	}
+
+	return extra
 }
 
 // GET (not found)
@@ -255,7 +285,6 @@ func handleAPIResourceList(w http.ResponseWriter, _ *http.Request, _ httprouter.
 		resList.APIResources = append(resList.APIResources,
 			metav1.APIResource{
 				Name:       res.name,
-				ShortNames: []string{res.shortname},
 				Namespaced: res.namespaced,
 				Kind:       gvk.Kind,
 				Verbs:      metav1.Verbs{"watch"},

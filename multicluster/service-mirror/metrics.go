@@ -15,20 +15,24 @@ const (
 // ProbeMetricVecs stores metrics about about gateways collected by probe
 // workers.
 type ProbeMetricVecs struct {
-	alive     *prometheus.GaugeVec
-	latencies *prometheus.HistogramVec
-	enqueues  *prometheus.CounterVec
-	dequeues  *prometheus.CounterVec
-	probes    *prometheus.CounterVec
+	gatewayEnabled *prometheus.GaugeVec
+	alive          *prometheus.GaugeVec
+	latency        *prometheus.GaugeVec
+	latencies      *prometheus.HistogramVec
+	enqueues       *prometheus.CounterVec
+	dequeues       *prometheus.CounterVec
+	probes         *prometheus.CounterVec
 }
 
 // ProbeMetrics stores metrics about about a specific gateway collected by a
 // probe worker.
 type ProbeMetrics struct {
-	alive      prometheus.Gauge
-	latencies  prometheus.Observer
-	probes     *prometheus.CounterVec
-	unregister func()
+	gatewayEnabled prometheus.Gauge
+	alive          prometheus.Gauge
+	latency        prometheus.Gauge
+	latencies      prometheus.Observer
+	probes         *prometheus.CounterVec
+	unregister     func()
 }
 
 var endpointRepairCounter *prometheus.CounterVec
@@ -79,6 +83,23 @@ func NewProbeMetricVecs() ProbeMetricVecs {
 		labelNames,
 	)
 
+	gatewayEnabled :=
+		promauto.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "gateway_enabled",
+				Help: "A gauge which is 1 if the gateway is enabled, and 0 if it is not",
+			},
+			labelNames,
+		)
+
+	latency := promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gateway_latency",
+			Help: "A gauge which is the latency of the last probe to the gateway.",
+		},
+		labelNames,
+	)
+
 	latencies := promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "gateway_probe_latency_ms",
@@ -94,11 +115,13 @@ func NewProbeMetricVecs() ProbeMetricVecs {
 		labelNames)
 
 	return ProbeMetricVecs{
-		alive:     alive,
-		latencies: latencies,
-		enqueues:  enqueues,
-		dequeues:  dequeues,
-		probes:    probes,
+		alive:          alive,
+		gatewayEnabled: gatewayEnabled,
+		latency:        latency,
+		latencies:      latencies,
+		enqueues:       enqueues,
+		dequeues:       dequeues,
+		probes:         probes,
 	}
 }
 
@@ -114,10 +137,32 @@ func (mv ProbeMetricVecs) NewWorkerMetrics(remoteClusterName string) (*ProbeMetr
 	if err != nil {
 		return nil, err
 	}
+	gatewayEnabled, err := mv.gatewayEnabled.GetMetricWith(labels)
+	if err != nil {
+		return nil, err
+	}
+	gatewayEnabled.Set(0)
+
+	alive, err := mv.alive.GetMetricWith(labels)
+	if err != nil {
+		return nil, err
+	}
+
+	latency, err := mv.latency.GetMetricWith(labels)
+	if err != nil {
+		return nil, err
+	}
+
+	latencies, err := mv.latencies.GetMetricWith(labels)
+	if err != nil {
+		return nil, err
+	}
 	return &ProbeMetrics{
-		alive:     mv.alive.With(labels),
-		latencies: mv.latencies.With(labels),
-		probes:    curriedProbes,
+		gatewayEnabled: gatewayEnabled,
+		alive:          alive,
+		latency:        latency,
+		latencies:      latencies,
+		probes:         curriedProbes,
 		unregister: func() {
 			mv.unregister(remoteClusterName)
 		},
@@ -127,6 +172,10 @@ func (mv ProbeMetricVecs) NewWorkerMetrics(remoteClusterName string) (*ProbeMetr
 func (mv ProbeMetricVecs) unregister(remoteClusterName string) {
 	labels := prometheus.Labels{
 		gatewayClusterName: remoteClusterName,
+	}
+
+	if !mv.gatewayEnabled.Delete(labels) {
+		logging.Warnf("unable to delete gateway_enabled metric with labels %s", labels)
 	}
 
 	if !mv.alive.Delete(labels) {

@@ -1,9 +1,6 @@
-import { cronJobIcon, daemonsetIcon, deploymentIcon, githubIcon, jobIcon, linkerdWordLogo, namespaceIcon, podIcon, replicaSetIcon, slackIcon, statefulSetIcon } from './util/SvgWrappers.jsx';
-import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
 import AppBar from '@material-ui/core/AppBar';
 import Autocomplete from '@material-ui/lab/Autocomplete';
 import Badge from '@material-ui/core/Badge';
-import BreadcrumbHeader from './BreadcrumbHeader.jsx';
 import Divider from '@material-ui/core/Divider';
 import Drawer from '@material-ui/core/Drawer';
 import EmailIcon from '@material-ui/icons/Email';
@@ -16,7 +13,6 @@ import ListItemIcon from '@material-ui/core/ListItemIcon';
 import ListItemText from '@material-ui/core/ListItemText';
 import MenuItem from '@material-ui/core/MenuItem';
 import MenuList from '@material-ui/core/MenuList';
-import NamespaceConfirmationModal from './NamespaceConfirmationModal.jsx';
 import PropTypes from 'prop-types';
 import React from 'react';
 import ReactRouterPropTypes from 'react-router-prop-types';
@@ -24,24 +20,41 @@ import TextField from '@material-ui/core/TextField';
 import Toolbar from '@material-ui/core/Toolbar';
 import { Trans } from '@lingui/macro';
 import Typography from '@material-ui/core/Typography';
-import Version from './Version.jsx';
 import _isEmpty from 'lodash/isEmpty';
 import _maxBy from 'lodash/maxBy';
 import { faBars } from '@fortawesome/free-solid-svg-icons/faBars';
 import { faCloud } from '@fortawesome/free-solid-svg-icons/faCloud';
 import { faDungeon } from '@fortawesome/free-solid-svg-icons/faDungeon';
 import { faExternalLinkAlt } from '@fortawesome/free-solid-svg-icons/faExternalLinkAlt';
-import { faFilter } from '@fortawesome/free-solid-svg-icons/faFilter';
 import { faMicroscope } from '@fortawesome/free-solid-svg-icons/faMicroscope';
 import { faRandom } from '@fortawesome/free-solid-svg-icons/faRandom';
 import { faSmile } from '@fortawesome/free-regular-svg-icons/faSmile';
 import { faStream } from '@fortawesome/free-solid-svg-icons/faStream';
+import { faPuzzlePiece } from '@fortawesome/free-solid-svg-icons/faPuzzlePiece';
 import grey from '@material-ui/core/colors/grey';
+import { withStyles } from '@material-ui/core/styles';
+import yellow from '@material-ui/core/colors/yellow';
 import { processSingleResourceRollup } from './util/MetricUtils.jsx';
 import { regexFilterString } from './util/Utils.js';
 import { withContext } from './util/AppContext.jsx';
-import { withStyles } from '@material-ui/core/styles';
-import yellow from '@material-ui/core/colors/yellow';
+import Version from './Version.jsx';
+import NamespaceConfirmationModal from './NamespaceConfirmationModal.jsx';
+import BreadcrumbHeader from './BreadcrumbHeader.jsx';
+import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
+import {
+  cronJobIcon,
+  daemonsetIcon,
+  deploymentIcon,
+  githubIcon,
+  jobIcon,
+  linkerdWordLogo,
+  namespaceIcon,
+  podIcon,
+  replicaSetIcon,
+  serviceIcon,
+  slackIcon,
+  statefulSetIcon,
+} from './util/SvgWrappers.jsx';
 
 const jsonFeedUrl = 'https://linkerd.io/dashboard/index.json';
 const multiclusterExtensionName = 'multicluster';
@@ -188,7 +201,6 @@ class NavigationBase extends React.Component {
     this.handleFilterInputChange = this.handleFilterInputChange.bind(this);
     this.handleNamespaceMenuClick = this.handleNamespaceMenuClick.bind(this);
     this.updateWindowDimensions = this.updateWindowDimensions.bind(this);
-    this.handleAutocompleteClick = this.handleAutocompleteClick.bind(this);
 
     this.state = this.getInitialState();
     this.loadFromServer = this.loadFromServer.bind(this);
@@ -285,6 +297,9 @@ class NavigationBase extends React.Component {
     const { releaseVersion, uuid } = this.props;
 
     const versionUrl = `https://versioncheck.linkerd.io/version.json?version=${releaseVersion}&uuid=${uuid}&source=web`;
+
+    // expose for testing
+    // eslint-disable-next-line react/no-unused-class-component-methods
     this.versionPromise = fetch(versionUrl, { credentials: 'include' })
       .then(rsp => rsp.json())
       .then(versionRsp => {
@@ -301,7 +316,7 @@ class NavigationBase extends React.Component {
   }
 
   fetchLatestCommunityUpdate() {
-    this.communityUpdatesPromise = fetch(jsonFeedUrl)
+    fetch(jsonFeedUrl)
       .then(rsp => rsp.json())
       .then(rsp => rsp.data.date)
       .then(rsp => {
@@ -324,6 +339,9 @@ class NavigationBase extends React.Component {
 
   checkMulticlusterExtension() {
     this.api.setCurrentRequests([this.api.fetchExtension(multiclusterExtensionName)]);
+
+    // expose for testing
+    // eslint-disable-next-line react/no-unused-class-component-methods
     this.serverPromise = Promise.all(this.api.getCurrentPromises())
       .then(([extension]) => {
         this.setState({ showGatewayLink: !_isEmpty(extension) });
@@ -341,11 +359,11 @@ class NavigationBase extends React.Component {
     const lastClicked = new Date();
     localStorage.setItem(localStorageKey, lastClicked);
     this.setState({ hideUpdateBadge: true });
-  }
+  };
 
   handleDialogCancel = () => {
     this.setState({ showNamespaceChangeDialog: false });
-  }
+  };
 
   handleDrawerClick = () => {
     const { mobileSidebarOpen } = this.state;
@@ -369,14 +387,15 @@ class NavigationBase extends React.Component {
     this.setState({ showNamespaceChangeDialog: false });
     updateNamespaceInContext(newNamespace);
     history.push(`/namespaces/${newNamespace}`);
-  }
+  };
 
   handleFilterInputChange = event => {
     this.setState({
-      formattedNamespaceFilter: regexFilterString(event.target.value) });
-  }
+      formattedNamespaceFilter: regexFilterString(event.target.value),
+    });
+  };
 
-  handleAutocompleteClick = event => {
+  static handleAutocompleteClick(event) {
     // This is necessary for the mobile sidebar, otherwise the sidebar
     // would close upon click of the namespace change input.
     event.stopPropagation();
@@ -408,13 +427,13 @@ class NavigationBase extends React.Component {
       // update the selectedNamespace in context with no path changes
       updateNamespaceInContext(namespace);
     }
-  }
+  };
 
   handleNamespaceMenuClick = event => {
     // ensure that mobile drawer will not close on click
     event.stopPropagation();
     this.setState({ formattedNamespaceFilter: '' });
-  }
+  };
 
   menuItem(path, title, icon, onClick) {
     const { classes, location, pathPrefix } = this.props;
@@ -455,11 +474,11 @@ class NavigationBase extends React.Component {
     const drawer = (
       <div>
         { !mobileSidebarOpen &&
-        <div className={classes.navToolbar}>
-          <div className={classes.linkerdNavLogo}>
-            <Link to="/namespaces">{linkerdWordLogo}</Link>
+          <div className={classes.navToolbar}>
+            <div className={classes.linkerdNavLogo}>
+              <Link to="/namespaces">{linkerdWordLogo}</Link>
+            </div>
           </div>
-        </div>
         }
         <Divider />
         <MenuList>
@@ -468,11 +487,17 @@ class NavigationBase extends React.Component {
           </Typography>
           { this.menuItem('/namespaces', <Trans>menuItemNamespaces</Trans>, namespaceIcon) }
 
-          { this.menuItem('/controlplane', <Trans>menuItemControlPlane</Trans>,
-            <FontAwesomeIcon icon={faCloud} className={classes.shrinkCloudIcon} />) }
+          { this.menuItem(
+            '/controlplane',
+            <Trans>menuItemControlPlane</Trans>,
+            <FontAwesomeIcon icon={faCloud} className={classes.shrinkCloudIcon} />,
+          ) }
 
-          { showGatewayLink && this.menuItem('/gateways', <Trans>menuItemGateway</Trans>,
-            <FontAwesomeIcon icon={faDungeon} className={classes.shrinkIcon} />) }
+          { showGatewayLink && this.menuItem(
+            '/gateways',
+            <Trans>menuItemGateway</Trans>,
+            <FontAwesomeIcon icon={faDungeon} className={classes.shrinkIcon} />,
+          ) }
 
         </MenuList>
 
@@ -480,7 +505,7 @@ class NavigationBase extends React.Component {
 
         <Autocomplete
           id="namespace-autocomplete"
-          onClick={this.handleAutocompleteClick}
+          onClick={NavigationBase.handleAutocompleteClick}
           disableClearable
           value={{ name: formattedNamespaceName.toUpperCase() }}
           options={filteredNamespaces}
@@ -522,6 +547,8 @@ class NavigationBase extends React.Component {
 
           { this.menuItem(`/namespaces/${selectedNamespace}/deployments`, <Trans>menuItemDeployments</Trans>, deploymentIcon) }
 
+          { this.menuItem(`/namespaces/${selectedNamespace}/services`, <Trans>menuItemServices</Trans>, serviceIcon) }
+
           { this.menuItem(`/namespaces/${selectedNamespace}/jobs`, <Trans>menuItemJobs</Trans>, jobIcon) }
 
           { this.menuItem(`/namespaces/${selectedNamespace}/pods`, <Trans>menuItemPods</Trans>, podIcon) }
@@ -533,14 +560,6 @@ class NavigationBase extends React.Component {
           { this.menuItem(`/namespaces/${selectedNamespace}/statefulsets`, <Trans>menuItemStatefulSets</Trans>, statefulSetIcon) }
         </MenuList>
 
-        <MenuList>
-          <Typography variant="button" component="div" className={classes.sidebarHeading}>
-            <Trans>sidebarHeadingConfiguration</Trans>
-          </Typography>
-
-          { this.menuItem(`/namespaces/${selectedNamespace}/trafficsplits`, <Trans>menuItemTrafficSplits</Trans>, <FontAwesomeIcon icon={faFilter} className={classes.shrinkIcon} />) }
-
-        </MenuList>
         <Divider />
         <MenuList>
           <Typography variant="button" component="div" className={classes.sidebarHeading}>
@@ -554,13 +573,24 @@ class NavigationBase extends React.Component {
         </MenuList>
         <Divider />
         <MenuList>
-          { this.menuItem('/community', <Trans>menuItemCommunity</Trans>,
+          { this.menuItem(
+            '/community',
+            <Trans>menuItemCommunity</Trans>,
             <Badge
               classes={{ badge: classes.badge }}
               invisible={hideUpdateBadge}
               badgeContent="1">
               <FontAwesomeIcon icon={faSmile} className={classes.shrinkIcon} />
-            </Badge>, this.handleCommunityClick) }
+            </Badge>,
+            this.handleCommunityClick,
+          ) }
+
+          { this.menuItem(
+            '/extensions',
+            <Trans>menuItemExtension</Trans>,
+            <Badge classes={{ badge: classes.badge }}><FontAwesomeIcon icon={faPuzzlePiece} className={classes.shrinkIcon} /></Badge>,
+          )
+          }
 
           <MenuItem component="a" href="https://linkerd.io/2/overview/" target="_blank" className={classes.navMenuItem}>
             <ListItemIcon><LibraryBooksIcon className={classes.shrinkIcon} /></ListItemIcon>
@@ -624,11 +654,9 @@ class NavigationBase extends React.Component {
                 {linkerdWordLogo}
               </div>
               { !mobileSidebarOpen && // mobile view but no sidebar
-              <React.Fragment>
                 <IconButton onClick={this.handleDrawerClick} className={classes.bars}>
                   <FontAwesomeIcon icon={faBars} />
                 </IconButton>
-              </React.Fragment>
               }
             </Toolbar>
           </AppBar>

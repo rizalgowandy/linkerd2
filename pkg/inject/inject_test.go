@@ -1,12 +1,11 @@
 package inject
 
 import (
-	"reflect"
 	"testing"
 
+	"github.com/go-test/deep"
 	l5dcharts "github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	"github.com/linkerd/linkerd2/pkg/k8s"
-	"github.com/linkerd/linkerd2/pkg/version"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8sResource "k8s.io/apimachinery/pkg/api/resource"
@@ -40,21 +39,23 @@ func TestGetOverriddenValues(t *testing.T) {
 				Template: corev1.PodTemplateSpec{
 					ObjectMeta: metav1.ObjectMeta{
 						Annotations: map[string]string{
-							k8s.ProxyDisableIdentityAnnotation:               "true",
 							k8s.ProxyImageAnnotation:                         "cr.l5d.io/linkerd/proxy",
 							k8s.ProxyImagePullPolicyAnnotation:               pullPolicy,
-							k8s.ProxyInitImageAnnotation:                     "cr.l5d.io/linkerd/proxy-init",
 							k8s.ProxyControlPortAnnotation:                   "4000",
 							k8s.ProxyInboundPortAnnotation:                   "5000",
 							k8s.ProxyAdminPortAnnotation:                     "5001",
 							k8s.ProxyOutboundPortAnnotation:                  "5002",
+							k8s.ProxyPodInboundPortsAnnotation:               "1234,5678",
 							k8s.ProxyIgnoreInboundPortsAnnotation:            "4222,6222",
 							k8s.ProxyIgnoreOutboundPortsAnnotation:           "8079,8080",
 							k8s.ProxyCPURequestAnnotation:                    "0.15",
 							k8s.ProxyMemoryRequestAnnotation:                 "120",
+							k8s.ProxyEphemeralStorageRequestAnnotation:       "10",
 							k8s.ProxyCPULimitAnnotation:                      "1.5",
 							k8s.ProxyMemoryLimitAnnotation:                   "256",
+							k8s.ProxyEphemeralStorageLimitAnnotation:         "50",
 							k8s.ProxyUIDAnnotation:                           "8500",
+							k8s.ProxyGIDAnnotation:                           "8500",
 							k8s.ProxyLogLevelAnnotation:                      "debug,linkerd=debug",
 							k8s.ProxyLogFormatAnnotation:                     "json",
 							k8s.ProxyEnableExternalProfilesAnnotation:        "false",
@@ -65,6 +66,14 @@ func TestGetOverriddenValues(t *testing.T) {
 							k8s.ProxyInboundConnectTimeout:                   "600ms",
 							k8s.ProxyOpaquePortsAnnotation:                   "4320-4325,3306",
 							k8s.ProxyAwait:                                   "enabled",
+							k8s.ProxySkipSubnetsAnnotation:                   "172.17.0.0/16",
+							k8s.ProxyAccessLogAnnotation:                     "apache",
+							k8s.ProxyShutdownGracePeriodAnnotation:           "30s",
+							k8s.ProxyOutboundDiscoveryCacheUnusedTimeout:     "50000ms",
+							k8s.ProxyInboundDiscoveryCacheUnusedTimeout:      "900s",
+							k8s.ProxyDisableOutboundProtocolDetectTimeout:    "true",
+							k8s.ProxyDisableInboundProtocolDetectTimeout:     "true",
+							k8s.ProxyEnableNativeSidecarAnnotation:           "true",
 						},
 					},
 					Spec: corev1.PodSpec{},
@@ -73,11 +82,11 @@ func TestGetOverriddenValues(t *testing.T) {
 			expected: func() *l5dcharts.Values {
 				values, _ := l5dcharts.NewValues()
 
-				values.Proxy.Cores = 2
-				values.Proxy.DisableIdentity = true
+				values.Proxy.Runtime.Workers.Maximum = 2
 				values.Proxy.Image.Name = "cr.l5d.io/linkerd/proxy"
 				values.Proxy.Image.PullPolicy = pullPolicy
 				values.Proxy.Image.Version = proxyVersionOverride
+				values.Proxy.PodInboundPorts = "1234,5678"
 				values.Proxy.Ports.Control = 4000
 				values.Proxy.Ports.Inbound = 5000
 				values.Proxy.Ports.Admin = 5001
@@ -94,18 +103,28 @@ func TestGetOverriddenValues(t *testing.T) {
 						Limit:   "256",
 						Request: "120",
 					},
+					EphemeralStorage: l5dcharts.Constraints{
+						Limit:   "50",
+						Request: "10",
+					},
 				}
 				values.Proxy.UID = 8500
-				values.ProxyInit.Image.Name = "cr.l5d.io/linkerd/proxy-init"
-				values.ProxyInit.Image.PullPolicy = pullPolicy
-				values.ProxyInit.Image.Version = version.ProxyInitVersion
+				values.Proxy.GID = 8500
 				values.ProxyInit.IgnoreInboundPorts = "4222,6222"
 				values.ProxyInit.IgnoreOutboundPorts = "8079,8080"
+				values.ProxyInit.SkipSubnets = "172.17.0.0/16"
 				values.Proxy.RequireIdentityOnInboundPorts = "8888,9999"
 				values.Proxy.OutboundConnectTimeout = "6000ms"
 				values.Proxy.InboundConnectTimeout = "600ms"
-				values.Proxy.OpaquePorts = "4320,4321,4322,4323,4324,4325,3306"
+				values.Proxy.OpaquePorts = "4320-4325,3306"
 				values.Proxy.Await = true
+				values.Proxy.AccessLog = "apache"
+				values.Proxy.ShutdownGracePeriod = "30000ms"
+				values.Proxy.OutboundDiscoveryCacheUnusedTimeout = "50s"
+				values.Proxy.InboundDiscoveryCacheUnusedTimeout = "900s"
+				values.Proxy.DisableOutboundProtocolDetectTimeout = true
+				values.Proxy.DisableInboundProtocolDetectTimeout = true
+				values.Proxy.NativeSidecar = true
 				return values
 			},
 		},
@@ -122,32 +141,58 @@ func TestGetOverriddenValues(t *testing.T) {
 				return values
 			},
 		},
+		{id: "use tracing annotations",
+			nsAnnotations: make(map[string]string),
+			spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							k8s.TracingSemanticConventionPrefix + k8s.TracingServiceName: "foo",
+						},
+					},
+					Spec: corev1.PodSpec{},
+				},
+			},
+			expected: func() *l5dcharts.Values {
+				values, _ := l5dcharts.NewValues()
+
+				values.Proxy.Tracing.Labels[k8s.TracingServiceName] = "foo"
+				return values
+			},
+		},
 		{id: "use namespace overrides",
 			nsAnnotations: map[string]string{
-				k8s.ProxyDisableIdentityAnnotation:        "true",
-				k8s.ProxyImageAnnotation:                  "cr.l5d.io/linkerd/proxy",
-				k8s.ProxyImagePullPolicyAnnotation:        pullPolicy,
-				k8s.ProxyInitImageAnnotation:              "cr.l5d.io/linkerd/proxy-init",
-				k8s.ProxyControlPortAnnotation:            "4000",
-				k8s.ProxyInboundPortAnnotation:            "5000",
-				k8s.ProxyAdminPortAnnotation:              "5001",
-				k8s.ProxyOutboundPortAnnotation:           "5002",
-				k8s.ProxyIgnoreInboundPortsAnnotation:     "4222,6222",
-				k8s.ProxyIgnoreOutboundPortsAnnotation:    "8079,8080",
-				k8s.ProxyCPURequestAnnotation:             "0.15",
-				k8s.ProxyMemoryRequestAnnotation:          "120",
-				k8s.ProxyCPULimitAnnotation:               "1.5",
-				k8s.ProxyMemoryLimitAnnotation:            "256",
-				k8s.ProxyUIDAnnotation:                    "8500",
-				k8s.ProxyLogLevelAnnotation:               "debug,linkerd=debug",
-				k8s.ProxyLogFormatAnnotation:              "json",
-				k8s.ProxyEnableExternalProfilesAnnotation: "false",
-				k8s.ProxyVersionOverrideAnnotation:        proxyVersionOverride,
-				k8s.ProxyWaitBeforeExitSecondsAnnotation:  "123",
-				k8s.ProxyOutboundConnectTimeout:           "6000ms",
-				k8s.ProxyInboundConnectTimeout:            "600ms",
-				k8s.ProxyOpaquePortsAnnotation:            "4320-4325,3306",
-				k8s.ProxyAwait:                            "enabled",
+				k8s.ProxyImageAnnotation:                      "cr.l5d.io/linkerd/proxy",
+				k8s.ProxyImagePullPolicyAnnotation:            pullPolicy,
+				k8s.ProxyControlPortAnnotation:                "4000",
+				k8s.ProxyInboundPortAnnotation:                "5000",
+				k8s.ProxyAdminPortAnnotation:                  "5001",
+				k8s.ProxyOutboundPortAnnotation:               "5002",
+				k8s.ProxyPodInboundPortsAnnotation:            "1234,5678",
+				k8s.ProxyIgnoreInboundPortsAnnotation:         "4222,6222",
+				k8s.ProxyIgnoreOutboundPortsAnnotation:        "8079,8080",
+				k8s.ProxyCPURequestAnnotation:                 "0.15",
+				k8s.ProxyMemoryRequestAnnotation:              "120",
+				k8s.ProxyCPULimitAnnotation:                   "1.5",
+				k8s.ProxyMemoryLimitAnnotation:                "256",
+				k8s.ProxyUIDAnnotation:                        "8500",
+				k8s.ProxyGIDAnnotation:                        "8500",
+				k8s.ProxyLogLevelAnnotation:                   "debug,linkerd=debug",
+				k8s.ProxyLogFormatAnnotation:                  "json",
+				k8s.ProxyEnableExternalProfilesAnnotation:     "false",
+				k8s.ProxyVersionOverrideAnnotation:            proxyVersionOverride,
+				k8s.ProxyWaitBeforeExitSecondsAnnotation:      "123",
+				k8s.ProxyOutboundConnectTimeout:               "6000ms",
+				k8s.ProxyInboundConnectTimeout:                "600ms",
+				k8s.ProxyOpaquePortsAnnotation:                "4320-4325,3306",
+				k8s.ProxyAwait:                                "enabled",
+				k8s.ProxyAccessLogAnnotation:                  "apache",
+				k8s.ProxyInjectAnnotation:                     "ingress",
+				k8s.ProxyOutboundDiscoveryCacheUnusedTimeout:  "50s",
+				k8s.ProxyInboundDiscoveryCacheUnusedTimeout:   "6000ms",
+				k8s.ProxyDisableOutboundProtocolDetectTimeout: "true",
+				k8s.ProxyDisableInboundProtocolDetectTimeout:  "false",
+				k8s.ProxyEnableNativeSidecarAnnotation:        "true",
 			},
 			spec: appsv1.DeploymentSpec{
 				Template: corev1.PodTemplateSpec{
@@ -157,11 +202,11 @@ func TestGetOverriddenValues(t *testing.T) {
 			expected: func() *l5dcharts.Values {
 				values, _ := l5dcharts.NewValues()
 
-				values.Proxy.Cores = 2
-				values.Proxy.DisableIdentity = true
+				values.Proxy.Runtime.Workers.Maximum = 2
 				values.Proxy.Image.Name = "cr.l5d.io/linkerd/proxy"
 				values.Proxy.Image.PullPolicy = pullPolicy
 				values.Proxy.Image.Version = proxyVersionOverride
+				values.Proxy.PodInboundPorts = "1234,5678"
 				values.Proxy.Ports.Control = 4000
 				values.Proxy.Ports.Inbound = 5000
 				values.Proxy.Ports.Admin = 5001
@@ -180,22 +225,61 @@ func TestGetOverriddenValues(t *testing.T) {
 					},
 				}
 				values.Proxy.UID = 8500
-				values.ProxyInit.Image.Name = "cr.l5d.io/linkerd/proxy-init"
-				values.ProxyInit.Image.PullPolicy = pullPolicy
-				values.ProxyInit.Image.Version = version.ProxyInitVersion
+				values.Proxy.GID = 8500
 				values.ProxyInit.IgnoreInboundPorts = "4222,6222"
 				values.ProxyInit.IgnoreOutboundPorts = "8079,8080"
 				values.Proxy.OutboundConnectTimeout = "6000ms"
 				values.Proxy.InboundConnectTimeout = "600ms"
-				values.Proxy.OpaquePorts = "4320,4321,4322,4323,4324,4325,3306"
+				values.Proxy.OpaquePorts = "4320-4325,3306"
 				values.Proxy.Await = true
+				values.Proxy.AccessLog = "apache"
+				values.Proxy.IsIngress = true
+				values.Proxy.OutboundDiscoveryCacheUnusedTimeout = "50s"
+				values.Proxy.InboundDiscoveryCacheUnusedTimeout = "6s"
+				values.Proxy.DisableOutboundProtocolDetectTimeout = true
+				values.Proxy.DisableInboundProtocolDetectTimeout = false
+				values.Proxy.NativeSidecar = true
 				return values
 			},
 		},
-		{id: "use invalid duration for TCP connect timeouts",
+		{id: "use deprecated beta native sidecar annotation from namespace",
 			nsAnnotations: map[string]string{
-				k8s.ProxyOutboundConnectTimeout: "6000",
-				k8s.ProxyInboundConnectTimeout:  "600",
+				k8s.ProxyEnableNativeSidecarAnnotationBeta: "false",
+			},
+			spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{},
+				},
+			},
+			expected: func() *l5dcharts.Values {
+				values, _ := l5dcharts.NewValues()
+				values.Proxy.NativeSidecar = false
+				return values
+			},
+		},
+		{id: "use deprecated alpha native sidecar annotation from namespace",
+			nsAnnotations: map[string]string{
+				k8s.ProxyEnableNativeSidecarAnnotationAlpha: "false",
+			},
+			spec: appsv1.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{},
+				},
+			},
+			expected: func() *l5dcharts.Values {
+				values, _ := l5dcharts.NewValues()
+				values.Proxy.NativeSidecar = false
+				return values
+			},
+		},
+		{id: "use invalid duration for proxy timeouts",
+			nsAnnotations: map[string]string{
+				k8s.ProxyOutboundConnectTimeout:               "6000",
+				k8s.ProxyInboundConnectTimeout:                "600",
+				k8s.ProxyOutboundDiscoveryCacheUnusedTimeout:  "50",
+				k8s.ProxyInboundDiscoveryCacheUnusedTimeout:   "5000",
+				k8s.ProxyDisableOutboundProtocolDetectTimeout: "9000",
+				k8s.ProxyDisableInboundProtocolDetectTimeout:  "9",
 			},
 			spec: appsv1.DeploymentSpec{
 				Template: corev1.PodTemplateSpec{
@@ -208,11 +292,15 @@ func TestGetOverriddenValues(t *testing.T) {
 				return values
 			},
 		},
-		{id: "use valid duration for TCP connect timeouts",
+		{id: "use valid duration for proxy timeouts",
 			nsAnnotations: map[string]string{
 				// Validate we're converting time values into ms for the proxy to parse correctly.
-				k8s.ProxyOutboundConnectTimeout: "6s5ms",
-				k8s.ProxyInboundConnectTimeout:  "2s5ms",
+				k8s.ProxyOutboundConnectTimeout:               "6s5ms",
+				k8s.ProxyInboundConnectTimeout:                "2s5ms",
+				k8s.ProxyOutboundDiscoveryCacheUnusedTimeout:  "6s5000ms",
+				k8s.ProxyInboundDiscoveryCacheUnusedTimeout:   "6s5000ms",
+				k8s.ProxyDisableOutboundProtocolDetectTimeout: "false",
+				k8s.ProxyDisableInboundProtocolDetectTimeout:  "true",
 			},
 			spec: appsv1.DeploymentSpec{
 				Template: corev1.PodTemplateSpec{
@@ -224,6 +312,10 @@ func TestGetOverriddenValues(t *testing.T) {
 				values, _ := l5dcharts.NewValues()
 				values.Proxy.OutboundConnectTimeout = "6005ms"
 				values.Proxy.InboundConnectTimeout = "2005ms"
+				values.Proxy.OutboundDiscoveryCacheUnusedTimeout = "11s"
+				values.Proxy.InboundDiscoveryCacheUnusedTimeout = "11s"
+				values.Proxy.DisableOutboundProtocolDetectTimeout = false
+				values.Proxy.DisableInboundProtocolDetectTimeout = true
 				return values
 			},
 		},
@@ -238,9 +330,9 @@ func TestGetOverriddenValues(t *testing.T) {
 					},
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{
-							corev1.Container{
+							{
 								Ports: []corev1.ContainerPort{
-									corev1.ContainerPort{
+									{
 										Name:          "mysql",
 										ContainerPort: 3306,
 									},
@@ -266,21 +358,190 @@ func TestGetOverriddenValues(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			resourceConfig := NewResourceConfig(testConfig, OriginUnknown).WithKind("Deployment").WithNsAnnotations(testCase.nsAnnotations)
+			resourceConfig := NewResourceConfig(testConfig, OriginUnknown, "linkerd").
+				WithKind("Deployment").WithNsAnnotations(testCase.nsAnnotations)
 			if err := resourceConfig.parse(data); err != nil {
 				t.Fatal(err)
 			}
 
-			resourceConfig.AppendNamespaceAnnotations()
-			actual, err := resourceConfig.GetOverriddenValues()
+			AppendNamespaceAnnotations(resourceConfig.GetOverrideAnnotations(), resourceConfig.GetNsAnnotations(), resourceConfig.GetWorkloadAnnotations())
+			actual, err := GetOverriddenValues(resourceConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
 			expected := testCase.expected()
-			if !reflect.DeepEqual(actual, expected) {
-				t.Fatalf("Expected values to be \n%v\n but was \n%v", expected.String(), actual.String())
+			if diff := deep.Equal(actual, expected); diff != nil {
+				t.Errorf("%+v", diff)
 			}
+		})
+	}
+}
 
+func TestApplyAnnotationOverridesMissingProxyTracing(t *testing.T) {
+	values := &l5dcharts.Values{
+		Proxy: &l5dcharts.Proxy{
+			Image:   &l5dcharts.Image{},
+			Ports:   &l5dcharts.Ports{},
+			Metrics: &l5dcharts.ProxyMetrics{},
+		},
+		ProxyInit: &l5dcharts.ProxyInit{},
+	}
+
+	annotations := map[string]string{
+		k8s.TracingSemanticConventionPrefix + "http.method": "GET",
+	}
+	labels := map[string]string{
+		k8s.TracingInstanceLabel: "example",
+	}
+
+	ApplyAnnotationOverrides(values, annotations, labels, nil)
+
+	if values.Proxy.Tracing != nil {
+		t.Fatalf("expected tracing to remain nil, got %#v", values.Proxy.Tracing)
+	}
+}
+
+func TestApplyAnnotationOverridesInitializesTracingLabels(t *testing.T) {
+	values := &l5dcharts.Values{
+		Proxy: &l5dcharts.Proxy{
+			Tracing: &l5dcharts.Tracing{},
+			Image:   &l5dcharts.Image{},
+			Ports:   &l5dcharts.Ports{},
+			Metrics: &l5dcharts.ProxyMetrics{},
+		},
+		ProxyInit: &l5dcharts.ProxyInit{},
+	}
+
+	annotations := map[string]string{
+		k8s.TracingSemanticConventionPrefix + "http.target": "/health",
+	}
+	labels := map[string]string{
+		k8s.TracingNameLabel: "workload",
+	}
+
+	ApplyAnnotationOverrides(values, annotations, labels, nil)
+
+	if values.Proxy.Tracing == nil {
+		t.Fatal("expected tracing to be initialized")
+	}
+
+	if got := values.Proxy.Tracing.Labels[k8s.TracingServiceName]; got != "workload" {
+		t.Fatalf("expected tracing service name to be set, got %q", got)
+	}
+
+	if got := values.Proxy.Tracing.Labels["http.target"]; got != "/health" {
+		t.Fatalf("expected tracing semantic convention label to be set, got %q", got)
+	}
+}
+
+func TestMergeAdditionalEnv(t *testing.T) {
+	testCases := []struct {
+		id                  string
+		helmAdditionalEnv   []corev1.EnvVar
+		nsAnnotations       map[string]string
+		workloadAnnotations map[string]string
+		expected            []corev1.EnvVar
+	}{
+		{
+			id: "no annotations, helm only",
+			helmAdditionalEnv: []corev1.EnvVar{
+				{Name: "FOO", Value: "helm"},
+			},
+			nsAnnotations:       map[string]string{},
+			workloadAnnotations: map[string]string{},
+			expected: []corev1.EnvVar{
+				{Name: "FOO", Value: "helm"},
+			},
+		},
+		{
+			id:                "namespace annotation adds env vars",
+			helmAdditionalEnv: nil,
+			nsAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"BAR","value":"ns"}]`,
+			},
+			workloadAnnotations: map[string]string{},
+			expected: []corev1.EnvVar{
+				{Name: "BAR", Value: "ns"},
+			},
+		},
+		{
+			id:                "workload overrides namespace by name",
+			helmAdditionalEnv: nil,
+			nsAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"BACKLOG","value":"4096"},{"name":"OTHER","value":"ns"}]`,
+			},
+			workloadAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"BACKLOG","value":"8192"}]`,
+			},
+			expected: []corev1.EnvVar{
+				{Name: "BACKLOG", Value: "8192"},
+				{Name: "OTHER", Value: "ns"},
+			},
+		},
+		{
+			id: "three-layer merge: helm < namespace < workload",
+			helmAdditionalEnv: []corev1.EnvVar{
+				{Name: "A", Value: "helm"},
+				{Name: "B", Value: "helm"},
+			},
+			nsAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"B","value":"ns"},{"name":"C","value":"ns"}]`,
+			},
+			workloadAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"C","value":"wl"}]`,
+			},
+			expected: []corev1.EnvVar{
+				{Name: "A", Value: "helm"},
+				{Name: "B", Value: "ns"},
+				{Name: "C", Value: "wl"},
+			},
+		},
+		{
+			id:                "invalid JSON in namespace is skipped",
+			helmAdditionalEnv: nil,
+			nsAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `not-json`,
+			},
+			workloadAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"OK","value":"wl"}]`,
+			},
+			expected: []corev1.EnvVar{
+				{Name: "OK", Value: "wl"},
+			},
+		},
+		{
+			id:                "invalid JSON in workload is skipped",
+			helmAdditionalEnv: nil,
+			nsAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `[{"name":"NS","value":"ok"}]`,
+			},
+			workloadAnnotations: map[string]string{
+				k8s.ProxyAdditionalEnvAnnotation: `{bad`,
+			},
+			expected: []corev1.EnvVar{
+				{Name: "NS", Value: "ok"},
+			},
+		},
+		{
+			id:                  "no annotations and no helm",
+			helmAdditionalEnv:   nil,
+			nsAnnotations:       map[string]string{},
+			workloadAnnotations: map[string]string{},
+			expected:            nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.id, func(t *testing.T) {
+			values := &l5dcharts.Values{
+				Proxy: &l5dcharts.Proxy{
+					AdditionalEnv: tc.helmAdditionalEnv,
+				},
+			}
+			MergeAdditionalEnv(values, tc.nsAnnotations, tc.workloadAnnotations)
+			if diff := deep.Equal(values.Proxy.AdditionalEnv, tc.expected); diff != nil {
+				t.Errorf("%+v", diff)
+			}
 		})
 	}
 }

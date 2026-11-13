@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ghodss/yaml"
 	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
@@ -20,12 +20,15 @@ import (
 	"github.com/linkerd/linkerd2/pkg/profiles"
 	"github.com/linkerd/linkerd2/pkg/protohttp"
 	"github.com/linkerd/linkerd2/viz/pkg/api"
+	hc "github.com/linkerd/linkerd2/viz/pkg/healthcheck"
+	vizutil "github.com/linkerd/linkerd2/viz/pkg/util"
 	pb "github.com/linkerd/linkerd2/viz/tap/gen/tap"
 	"github.com/linkerd/linkerd2/viz/tap/pkg"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/yaml"
 )
 
 type profileOptions struct {
@@ -34,12 +37,14 @@ type profileOptions struct {
 	tap           string
 	tapDuration   time.Duration
 	tapRouteLimit uint
+	output        string
 }
 
 func newProfileOptions() *profileOptions {
 	return &profileOptions{
 		tapDuration:   5 * time.Second,
 		tapRouteLimit: 20,
+		output:        "yaml",
 	}
 }
 
@@ -73,14 +78,45 @@ func newCmdProfile() *cobra.Command {
   linkerd viz profile -n emojivoto web-svc --tap deploy/web --tap-duration 10s --tap-route-limit 5
 `,
 		Args: cobra.ExactArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// Skip providing suggestions if one or more arguments are provided
+			// We either have a suggestion selected or more multiple args are provided
+			// which is not allowed for this command.
+			if len(args) > 0 {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			if options.namespace == "" {
+				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
+			}
+
+			cc := k8s.NewCommandCompletion(k8sAPI, options.namespace)
+
+			// Profiles require completion for only services so prepend the service resource
+			// type to the list of args
+			results, err := cc.Complete([]string{k8s.Service}, toComplete)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			return results, cobra.ShellCompDirectiveDefault
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			api.CheckClientOrExit(healthcheck.Options{
-				ControlPlaneNamespace: controlPlaneNamespace,
-				KubeConfig:            kubeconfigPath,
-				Impersonate:           impersonate,
-				ImpersonateGroup:      impersonateGroup,
-				KubeContext:           kubeContext,
-				APIAddr:               apiAddr,
+			api.CheckClientOrExit(hc.VizOptions{
+				Options: &healthcheck.Options{
+					ControlPlaneNamespace: controlPlaneNamespace,
+					KubeConfig:            kubeconfigPath,
+					Impersonate:           impersonate,
+					ImpersonateGroup:      impersonateGroup,
+					KubeContext:           kubeContext,
+					APIAddr:               apiAddr,
+				},
+				VizNamespaceOverride: vizNamespace,
 			})
 			if options.namespace == "" {
 				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
@@ -103,20 +139,25 @@ func newCmdProfile() *cobra.Command {
 			if cd := values.ClusterDomain; cd != "" {
 				clusterDomain = cd
 			}
-			return renderTapOutputProfile(cmd.Context(), k8sAPI, options.tap, options.namespace, options.name, clusterDomain, options.tapDuration, int(options.tapRouteLimit), os.Stdout)
+			return renderTapOutputProfile(cmd.Context(), k8sAPI, options.tap, options.namespace, options.name, clusterDomain, options.tapDuration, int(options.tapRouteLimit), options.output, os.Stdout)
 		},
 	}
 	cmd.PersistentFlags().StringVar(&options.tap, "tap", options.tap, "Output a service profile based on tap data for the given target resource")
 	cmd.PersistentFlags().DurationVar(&options.tapDuration, "tap-duration", options.tapDuration, "Duration over which tap data is collected (for example: \"10s\", \"1m\", \"10m\")")
 	cmd.PersistentFlags().UintVar(&options.tapRouteLimit, "tap-route-limit", options.tapRouteLimit, "Max number of routes to add to the profile")
 	cmd.PersistentFlags().StringVarP(&options.namespace, "namespace", "n", options.namespace, "Namespace of the service")
+	cmd.PersistentFlags().StringVarP(&options.output, "output", "o", options.output, "Output format. One of: yaml, json")
+
+	pkgcmd.ConfigureNamespaceFlagCompletion(
+		cmd, []string{"namespace"},
+		kubeconfigPath, impersonate, impersonateGroup, kubeContext)
 	return cmd
 }
 
 // renderTapOutputProfile performs a tap on the desired resource and generates
 // a service profile with routes pre-populated from the tap data
 // Only inbound tap traffic is considered.
-func renderTapOutputProfile(ctx context.Context, k8sAPI *k8s.KubernetesAPI, tapResource, namespace, name, clusterDomain string, tapDuration time.Duration, routeLimit int, w io.Writer) error {
+func renderTapOutputProfile(ctx context.Context, k8sAPI *k8s.KubernetesAPI, tapResource, namespace, name, clusterDomain string, tapDuration time.Duration, routeLimit int, format string, w io.Writer) error {
 	requestParams := pkg.TapRequestParams{
 		Resource:  tapResource,
 		Namespace: namespace,
@@ -130,9 +171,16 @@ func renderTapOutputProfile(ctx context.Context, k8sAPI *k8s.KubernetesAPI, tapR
 	if err != nil {
 		return err
 	}
-	output, err := yaml.Marshal(profile)
+	var output []byte
+	if format == pkgcmd.YamlOutput {
+		output, err = yaml.Marshal(profile)
+	} else if format == pkgcmd.JsonOutput {
+		output, err = json.Marshal(profile)
+	} else {
+		return errors.New("output format must be one of yaml or json")
+	}
 	if err != nil {
-		return fmt.Errorf("Error writing Service Profile: %s", err)
+		return fmt.Errorf("Error writing Service Profile: %w", err)
 	}
 	w.Write(output)
 	return nil
@@ -168,7 +216,7 @@ func routeSpecFromTap(tapByteStream *bufio.Reader, routeLimit int) []*sp.RouteSp
 		if err != nil {
 			// expected errors when hitting the tapDuration deadline
 			var e net.Error
-			if err != io.EOF &&
+			if !errors.Is(err, io.EOF) &&
 				!(errors.As(err, &e) && e.Timeout()) &&
 				!errors.Is(err, context.DeadlineExceeded) &&
 				!strings.HasSuffix(err.Error(), pkg.ErrClosedResponseBody) {
@@ -213,7 +261,7 @@ func getPathDataFromTap(event *pb.TapEvent) *sp.RouteSpec {
 		return profiles.MkRouteSpec(
 			path,
 			profiles.PathToRegex(path), // for now, no path consolidation
-			ev.RequestInit.GetMethod().GetRegistered().String(),
+			vizutil.HTTPMethodToString(ev.RequestInit.GetMethod()),
 			nil)
 	default:
 		return nil

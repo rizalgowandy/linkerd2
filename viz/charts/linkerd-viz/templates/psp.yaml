@@ -1,12 +1,29 @@
+{{ if .Values.enablePSP -}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: psp
+  namespace: {{ .Release.Namespace }}
+  labels:
+    linkerd.io/extension: viz
+    {{- with .Values.commonLabels }}{{ toYaml . | trim | nindent 4 }}{{- end }}
+rules:
+- apiGroups: ['policy', 'extensions']
+  resources: ['podsecuritypolicies']
+  verbs: ['use']
+  resourceNames:
+  - linkerd-{{.Values.linkerdNamespace}}-control-plane
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: viz-psp
-  namespace: {{.Values.namespace}}
+  namespace: {{ .Release.Namespace }}
   labels:
     linkerd.io/extension: viz
-    namespace: {{.Values.namespace}}
+    namespace: {{.Release.Namespace}}
+    {{- with .Values.commonLabels }}{{ toYaml . | trim | nindent 4 }}{{- end }}
 roleRef:
   kind: Role
   name: psp
@@ -14,17 +31,22 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: tap
-  namespace: {{.Values.namespace}}
+  namespace: {{.Release.Namespace}}
 - kind: ServiceAccount
   name: web
-  namespace: {{.Values.namespace}}
-{{ if .Values.grafana.enabled -}}
-- kind: ServiceAccount
-  name: grafana
-  namespace: {{.Values.namespace}}
-{{ end -}}
+  namespace: {{.Release.Namespace}}
 {{ if .Values.prometheus.enabled -}}
 - kind: ServiceAccount
   name: prometheus
-  namespace: {{.Values.namespace}}
+  namespace: {{.Release.Namespace}}
+{{ end -}}
+- kind: ServiceAccount
+  name: metrics-api
+  namespace: {{.Release.Namespace}}
+- kind: ServiceAccount
+  name: tap-injector
+  namespace: {{.Release.Namespace}}
+- kind: ServiceAccount
+  name: namespace-metadata
+  namespace: {{.Release.Namespace}}
 {{ end -}}

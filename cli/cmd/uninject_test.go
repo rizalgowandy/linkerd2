@@ -62,6 +62,11 @@ func TestUninjectYAML(t *testing.T) {
 			reportFileName: "inject_emojivoto_pod_uninject.report",
 		},
 		{
+			inputFileName:  "inject_emojivoto_pod_nativesidecar.golden.yml",
+			goldenFileName: "inject_emojivoto_pod.input.yml",
+			reportFileName: "inject_emojivoto_pod_uninject.report",
+		},
+		{
 			inputFileName:  "inject_emojivoto_deployment_udp.golden.yml",
 			goldenFileName: "inject_emojivoto_deployment_udp.input.yml",
 			reportFileName: "inject_emojivoto_deployment_udp_uninject.report",
@@ -111,12 +116,14 @@ func TestUninjectYAML(t *testing.T) {
 			output := new(bytes.Buffer)
 			report := new(bytes.Buffer)
 
-			exitCode := runUninjectCmd(read, report, output, values)
+			exitCode := runUninjectCmd(read, report, output, values, "yaml")
 			if exitCode != 0 {
-				t.Errorf("Failed to uninject %s\n", tc.inputFileName)
+				t.Errorf("Failed to uninject %s", tc.inputFileName)
 			}
 
-			testDataDiffer.DiffTestdata(t, tc.goldenFileName, output.String())
+			if err := testDataDiffer.DiffTestYAML(tc.goldenFileName, output.String()); err != nil {
+				t.Error(err)
+			}
 			testDataDiffer.DiffTestdata(t, tc.reportFileName, report.String())
 		})
 	}

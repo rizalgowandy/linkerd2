@@ -12,42 +12,42 @@ import (
 )
 
 const enabled = "true"
-const proxyContainerName = "linkerd-proxy"
-const initContainerName = "linkerd-init"
-const debugContainerName = "linkerd-debug"
 
 // InjectValidator is used as a helper to generate
 // correct injector flags and annotations and verify
 // injected pods
 type InjectValidator struct {
-	NoInitContainer        bool
-	DisableIdentity        bool
-	AutoInject             bool
-	AdminPort              int
-	ControlPort            int
-	EnableDebug            bool
-	EnableExternalProfiles bool
-	ImagePullPolicy        string
-	InboundPort            int
-	InitImage              string
-	InitImageVersion       string
-	OutboundPort           int
-	CPULimit               string
-	CPURequest             string
-	MemoryLimit            string
-	MemoryRequest          string
-	Image                  string
-	LogLevel               string
-	LogFormat              string
-	UID                    int
-	Version                string
-	RequireIdentityOnPorts string
-	SkipOutboundPorts      string
-	OpaquePorts            string
-	SkipInboundPorts       string
-	OutboundConnectTimeout string
-	InboundConnectTimeout  string
-	WaitBeforeExitSeconds  int
+	NoInitContainer         bool
+	NativeSidecar           bool
+	AutoInject              bool
+	AdminPort               int
+	ControlPort             int
+	EnableDebug             bool
+	EnableExternalProfiles  bool
+	ImagePullPolicy         string
+	InboundPort             int
+	OutboundPort            int
+	CPULimit                string
+	EphemeralStorageLimit   string
+	CPURequest              string
+	MemoryLimit             string
+	MemoryRequest           string
+	EphemeralStorageRequest string
+	Image                   string
+	LogLevel                string
+	LogFormat               string
+	UID                     int
+	GID                     int
+	Version                 string
+	RequireIdentityOnPorts  string
+	SkipOutboundPorts       string
+	OpaquePorts             string
+	SkipInboundPorts        string
+	OutboundConnectTimeout  string
+	InboundConnectTimeout   string
+	WaitBeforeExitSeconds   int
+	SkipSubnets             string
+	ShutdownGracePeriod     string
 }
 
 func (iv *InjectValidator) getContainer(pod *v1.PodSpec, name string, isInit bool) *v1.Container {
@@ -57,6 +57,21 @@ func (iv *InjectValidator) getContainer(pod *v1.PodSpec, name string, isInit boo
 	}
 	for _, container := range containers {
 		if container.Name == name {
+			return &container
+		}
+	}
+	return nil
+}
+
+func (iv *InjectValidator) getPodContainer(pod *v1.PodSpec) *v1.Container {
+	var containers []v1.Container
+	if iv.NativeSidecar {
+		containers = pod.InitContainers
+	} else {
+		containers = pod.Containers
+	}
+	for _, container := range containers {
+		if container.Name == k8s.ProxyContainerName {
 			return &container
 		}
 	}
@@ -91,18 +106,18 @@ func (iv *InjectValidator) validatePort(container *v1.Container, portName string
 
 func (iv *InjectValidator) validateDebugContainer(pod *v1.PodSpec) error {
 	if iv.EnableDebug {
-		proxyContainer := iv.getContainer(pod, debugContainerName, false)
+		proxyContainer := iv.getContainer(pod, k8s.DebugContainerName, false)
 		if proxyContainer == nil {
-			return fmt.Errorf("container %s missing", debugContainerName)
+			return fmt.Errorf("container %s missing", k8s.DebugContainerName)
 		}
 	}
 	return nil
 }
 
 func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
-	proxyContainer := iv.getContainer(pod, proxyContainerName, false)
+	proxyContainer := iv.getPodContainer(pod)
 	if proxyContainer == nil {
-		return fmt.Errorf("container %s missing", proxyContainerName)
+		return fmt.Errorf("proxy container %s missing", k8s.ProxyContainerName)
 	}
 
 	if iv.AdminPort != 0 {
@@ -116,7 +131,7 @@ func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
 			return fmt.Errorf("readinessProbe: expected: %d, actual %d", iv.AdminPort, proxyContainer.LivenessProbe.HTTPGet.Port.IntVal)
 		}
 
-		if err := iv.validatePort(proxyContainer, "linkerd-admin", iv.AdminPort); err != nil {
+		if err := iv.validatePort(proxyContainer, k8s.ProxyAdminPortName, iv.AdminPort); err != nil {
 			return err
 		}
 	}
@@ -149,13 +164,17 @@ func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
 		if proxyContainer.ReadinessProbe.HTTPGet.Port.IntVal != int32(iv.AdminPort) {
 			return fmt.Errorf("readinessProbe: expected: %d, actual %d", iv.AdminPort, proxyContainer.LivenessProbe.HTTPGet.Port.IntVal)
 		}
-		if err := iv.validatePort(proxyContainer, "linkerd-proxy", iv.InboundPort); err != nil {
+		if err := iv.validatePort(proxyContainer, k8s.ProxyPortName, iv.InboundPort); err != nil {
 			return err
 		}
 	}
 
 	if iv.OutboundPort != 0 {
-		if err := iv.validateEnvVar(proxyContainer, "LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR", fmt.Sprintf("127.0.0.1:%d", iv.OutboundPort)); err != nil {
+		if err := iv.validateEnvVar(
+			proxyContainer,
+			"LINKERD2_PROXY_OUTBOUND_LISTEN_ADDRS",
+			fmt.Sprintf("127.0.0.1:%d", iv.OutboundPort),
+		); err != nil {
 			return err
 		}
 	}
@@ -205,6 +224,28 @@ func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
 		}
 	}
 
+	if iv.EphemeralStorageLimit != "" {
+		limit := resource.MustParse(iv.EphemeralStorageLimit)
+		if proxyContainer.Resources.Limits.StorageEphemeral() != nil {
+			if !proxyContainer.Resources.Limits.StorageEphemeral().Equal(limit) {
+				return fmt.Errorf("EphemeralStorageLimit: expected %v, actual %v", &limit, proxyContainer.Resources.Limits.StorageEphemeral())
+			}
+		} else {
+			return fmt.Errorf("EphemeralStorageLimit: expected %v, but none", &limit)
+		}
+	}
+
+	if iv.EphemeralStorageRequest != "" {
+		request := resource.MustParse(iv.EphemeralStorageRequest)
+		if proxyContainer.Resources.Requests.StorageEphemeral() != nil {
+			if !proxyContainer.Resources.Requests.StorageEphemeral().Equal(request) {
+				return fmt.Errorf("EphemeralStorageRequest: expected %v, actual %v", &request, proxyContainer.Resources.Requests.StorageEphemeral())
+			}
+		} else {
+			return fmt.Errorf("EphemeralStorageRequest: expected %v, but none", &request)
+		}
+	}
+
 	if iv.Image != "" || iv.Version != "" {
 		image := strings.Split(proxyContainer.Image, ":")
 
@@ -226,7 +267,8 @@ func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
 	}
 
 	if iv.LogLevel != "" {
-		if err := iv.validateEnvVar(proxyContainer, "LINKERD2_PROXY_LOG", iv.LogLevel); err != nil {
+		expectedLogLevel := fmt.Sprintf("%s,[{headers}]=off,[{request}]=off", iv.LogLevel)
+		if err := iv.validateEnvVar(proxyContainer, "LINKERD2_PROXY_LOG", expectedLogLevel); err != nil {
 			return err
 		}
 	}
@@ -243,6 +285,15 @@ func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
 		}
 		if *proxyContainer.SecurityContext.RunAsUser != int64(iv.UID) {
 			return fmt.Errorf("runAsUser: expected %d, actual %d", iv.UID, *proxyContainer.SecurityContext.RunAsUser)
+		}
+	}
+
+	if iv.GID != 0 {
+		if proxyContainer.SecurityContext.RunAsGroup == nil {
+			return fmt.Errorf("no RunAsGroup specified")
+		}
+		if *proxyContainer.SecurityContext.RunAsGroup != int64(iv.GID) {
+			return fmt.Errorf("runAsGroup: expected %d, actual %d", iv.GID, *proxyContainer.SecurityContext.RunAsGroup)
 		}
 	}
 
@@ -271,10 +322,16 @@ func (iv *InjectValidator) validateProxyContainer(pod *v1.PodSpec) error {
 	}
 
 	if iv.WaitBeforeExitSeconds != 0 {
-		expectedCmd := fmt.Sprintf("/bin/bash,-c,sleep %d", iv.WaitBeforeExitSeconds)
+		expectedCmd := fmt.Sprintf("/bin/sleep,%d", iv.WaitBeforeExitSeconds)
 		actual := strings.Join(proxyContainer.Lifecycle.PreStop.Exec.Command, ",")
 		if expectedCmd != strings.Join(proxyContainer.Lifecycle.PreStop.Exec.Command, ",") {
 			return fmt.Errorf("preStopHook: expected %s, actual %s", expectedCmd, actual)
+		}
+	}
+
+	if iv.ShutdownGracePeriod != "" {
+		if err := iv.validateEnvVar(proxyContainer, "LINKERD2_PROXY_SHUTDOWN_GRACE_PERIOD", iv.ShutdownGracePeriod); err != nil {
+			return err
 		}
 	}
 
@@ -285,30 +342,9 @@ func (iv *InjectValidator) validateInitContainer(pod *v1.PodSpec) error {
 	if iv.NoInitContainer {
 		return nil
 	}
-	initContainer := iv.getContainer(pod, initContainerName, true)
+	initContainer := iv.getContainer(pod, k8s.InitContainerName, true)
 	if initContainer == nil {
-		return fmt.Errorf("container %s missing", initContainerName)
-	}
-
-	if iv.InitImage != "" || iv.InitImageVersion != "" {
-
-		image := strings.Split(initContainer.Image, ":")
-
-		if len(image) != 2 {
-			return fmt.Errorf("invalid proxy init image string: %s", initContainer.Image)
-		}
-
-		if iv.InitImage != "" {
-			if image[0] != iv.InitImage {
-				return fmt.Errorf("proxyInitImage: expected %s, actual %s", iv.InitImage, image[0])
-			}
-		}
-
-		if iv.InitImageVersion != "" {
-			if image[1] != iv.InitImageVersion {
-				return fmt.Errorf("proxyInitImageVersion: expected %s, actual %s", iv.InitImageVersion, image[1])
-			}
-		}
+		return fmt.Errorf("container %s missing", k8s.InitContainerName)
 	}
 
 	if iv.InboundPort != 0 {
@@ -338,6 +374,12 @@ func (iv *InjectValidator) validateInitContainer(pod *v1.PodSpec) error {
 
 	if iv.SkipOutboundPorts != "" {
 		if err := iv.validateArg(initContainer, "--outbound-ports-to-ignore", iv.SkipOutboundPorts); err != nil {
+			return err
+		}
+	}
+
+	if iv.SkipSubnets != "" {
+		if err := iv.validateArg(initContainer, "--skip-subnets", iv.SkipSubnets); err != nil {
 			return err
 		}
 	}
@@ -387,6 +429,15 @@ func (iv *InjectValidator) GetFlagsAndAnnotations() ([]string, map[string]string
 	annotations := make(map[string]string)
 	var flags []string
 
+	// native sidecar annotation and flag are set explicitly to avoid relying on defaults that might change
+	if iv.NativeSidecar {
+		annotations[k8s.ProxyEnableNativeSidecarAnnotation] = enabled
+		flags = append(flags, "--native-sidecar")
+	} else {
+		annotations[k8s.ProxyEnableNativeSidecarAnnotation] = "false"
+		flags = append(flags, "--native-sidecar=false")
+	}
+
 	if iv.AutoInject {
 		annotations[k8s.ProxyInjectAnnotation] = k8s.ProxyInjectEnabled
 	}
@@ -399,11 +450,6 @@ func (iv *InjectValidator) GetFlagsAndAnnotations() ([]string, map[string]string
 	if iv.ControlPort != 0 {
 		annotations[k8s.ProxyControlPortAnnotation] = strconv.Itoa(iv.ControlPort)
 		flags = append(flags, fmt.Sprintf("--control-port=%s", strconv.Itoa(iv.ControlPort)))
-	}
-
-	if iv.DisableIdentity {
-		annotations[k8s.IdentityModeDisabled] = enabled
-		flags = append(flags, "--disable-identity")
 	}
 
 	if iv.EnableDebug {
@@ -426,16 +472,6 @@ func (iv *InjectValidator) GetFlagsAndAnnotations() ([]string, map[string]string
 		flags = append(flags, fmt.Sprintf("--inbound-port=%s", strconv.Itoa(iv.InboundPort)))
 	}
 
-	if iv.InitImage != "" {
-		annotations[k8s.ProxyInitImageAnnotation] = iv.InitImage
-		flags = append(flags, fmt.Sprintf("--init-image=%s", iv.InitImage))
-	}
-
-	if iv.InitImageVersion != "" {
-		annotations[k8s.ProxyInitImageVersionAnnotation] = iv.InitImageVersion
-		flags = append(flags, fmt.Sprintf("--init-image-version=%s", iv.InitImageVersion))
-	}
-
 	if iv.OutboundPort != 0 {
 		annotations[k8s.ProxyOutboundPortAnnotation] = strconv.Itoa(iv.OutboundPort)
 		flags = append(flags, fmt.Sprintf("--outbound-port=%s", strconv.Itoa(iv.OutboundPort)))
@@ -456,9 +492,21 @@ func (iv *InjectValidator) GetFlagsAndAnnotations() ([]string, map[string]string
 		flags = append(flags, fmt.Sprintf("--proxy-memory-limit=%s", iv.MemoryLimit))
 	}
 
+	if iv.EphemeralStorageLimit != "" {
+		annotations[k8s.ProxyEphemeralStorageLimitAnnotation] = iv.EphemeralStorageLimit
+		// TODO - `inject` does not support the `--set` flag, so we can't add this
+		// flags = append(flags, "--set", fmt.Sprintf("proxy.resources.ephemeral-storage.limit=%s", iv.EphemeralStorageLimit))
+	}
+
 	if iv.MemoryRequest != "" {
 		annotations[k8s.ProxyMemoryRequestAnnotation] = iv.MemoryRequest
 		flags = append(flags, fmt.Sprintf("--proxy-memory-request=%s", iv.MemoryRequest))
+	}
+
+	if iv.EphemeralStorageRequest != "" {
+		annotations[k8s.ProxyEphemeralStorageRequestAnnotation] = iv.EphemeralStorageRequest
+		// TODO - `inject` does not support the `--set` flag, so we can't add this
+		// flags = append(flags, "--set", fmt.Sprintf("proxy.resources.ephemeral-storage.request=%s", iv.EphemeralStorageRequest))
 	}
 
 	if iv.Image != "" {
@@ -478,6 +526,11 @@ func (iv *InjectValidator) GetFlagsAndAnnotations() ([]string, map[string]string
 	if iv.UID != 0 {
 		annotations[k8s.ProxyUIDAnnotation] = strconv.Itoa(iv.UID)
 		flags = append(flags, fmt.Sprintf("--proxy-uid=%s", strconv.Itoa(iv.UID)))
+	}
+
+	if iv.GID != 0 {
+		annotations[k8s.ProxyGIDAnnotation] = strconv.Itoa(iv.GID)
+		flags = append(flags, fmt.Sprintf("--proxy-gid=%s", strconv.Itoa(iv.GID)))
 	}
 
 	if iv.Version != "" {
@@ -516,6 +569,16 @@ func (iv *InjectValidator) GetFlagsAndAnnotations() ([]string, map[string]string
 		annotations[k8s.ProxyWaitBeforeExitSecondsAnnotation] = strconv.Itoa(iv.WaitBeforeExitSeconds)
 		flags = append(flags, fmt.Sprintf("--wait-before-exit-secondst=%s", strconv.Itoa(iv.WaitBeforeExitSeconds)))
 
+	}
+
+	if iv.SkipSubnets != "" {
+		annotations[k8s.ProxySkipSubnetsAnnotation] = iv.SkipSubnets
+		flags = append(flags, fmt.Sprintf("--skip-subnets=%s", iv.SkipSubnets))
+	}
+
+	if iv.ShutdownGracePeriod != "" {
+		annotations[k8s.ProxyShutdownGracePeriodAnnotation] = iv.ShutdownGracePeriod
+		flags = append(flags, fmt.Sprintf("--shutdown-grace-period=%s", iv.ShutdownGracePeriod))
 	}
 
 	return flags, annotations

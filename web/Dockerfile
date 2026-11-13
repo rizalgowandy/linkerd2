@@ -1,7 +1,7 @@
 ARG BUILDPLATFORM=linux/amd64
 
 # Precompile key slow-to-build dependencies
-FROM --platform=$BUILDPLATFORM golang:1.16.2-alpine as go-deps
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine AS go-deps
 WORKDIR /linkerd-build
 COPY go.mod go.sum ./
 COPY bin/install-deps bin/
@@ -10,8 +10,8 @@ ARG TARGETARCH
 RUN ./bin/install-deps $TARGETARCH
 
 ## bundle web assets
-FROM --platform=$BUILDPLATFORM node:15-buster as webpack-bundle
-RUN curl -o- -L https://yarnpkg.com/install.sh | bash -s -- --version 1.22.10 --network-concurrency 1
+FROM --platform=$BUILDPLATFORM node:20-bookworm AS webpack-bundle
+RUN bin/scurl --retry=2 https://yarnpkg.com/install.sh | bash -s -- --version 1.22.10 --network-concurrency 1
 
 ENV PATH /root/.yarn/bin:$PATH
 ENV ROOT /linkerd-build
@@ -32,7 +32,7 @@ COPY web/app ./web/app
 RUN ./bin/web build
 
 ## compile go server
-FROM go-deps as golang
+FROM go-deps AS golang
 WORKDIR /linkerd-build
 RUN mkdir -p web
 COPY web/main.go web
@@ -43,11 +43,13 @@ COPY viz/pkg viz/pkg
 COPY viz/tap/gen/tap viz/tap/gen/tap
 COPY viz/tap/pkg viz/tap/pkg
 COPY pkg pkg
+COPY charts charts
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -mod=readonly -o web/web -ldflags "-s -w" ./web
 
 ## package it all up
 FROM scratch
+LABEL org.opencontainers.image.source=https://github.com/linkerd/linkerd2
 WORKDIR /linkerd
 
 COPY LICENSE .

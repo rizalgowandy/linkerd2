@@ -11,17 +11,17 @@ import (
 	"text/tabwriter"
 	"time"
 
-	coreUtil "github.com/linkerd/linkerd2/controller/api/util"
-	"github.com/linkerd/linkerd2/pkg/cmd"
 	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	pb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"github.com/linkerd/linkerd2/viz/metrics-api/util"
-	"github.com/linkerd/linkerd2/viz/pkg"
 	"github.com/linkerd/linkerd2/viz/pkg/api"
+	hc "github.com/linkerd/linkerd2/viz/pkg/healthcheck"
+	pkgUtil "github.com/linkerd/linkerd2/viz/pkg/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	v1 "k8s.io/api/core/v1"
 )
 
 type statOptions struct {
@@ -36,6 +36,11 @@ type statOptions struct {
 }
 
 type statOptionsBase struct {
+	// namespace is only referenced from the outer struct statOptions (e.g.
+	// options.namespace where options's type is _not_ this struct).
+	// structcheck issues a false positive for this field as it does not think
+	// it's used.
+	//nolint:structcheck
 	namespace    string
 	timeWindow   string
 	outputFormat string
@@ -107,6 +112,8 @@ func NewCmdStat() *cobra.Command {
   * ts/my-split
   * authority
   * au/my-authority
+  * httproute/my-route
+  * route/my-route
   * all
 
   Valid resource types include:
@@ -119,9 +126,12 @@ func NewCmdStat() *cobra.Command {
   * replicasets
   * replicationcontrollers
   * statefulsets
-  * trafficsplits
   * authorities (not supported in --from)
-  * services (only supported if a --from is also specified, or as a --to)
+  * authorizationpolicies (not supported in --from)
+  * httproutes (not supported in --from)
+  * services (not supported in --from)
+  * servers (not supported in --from)
+  * serverauthorizations (not supported in --from)
   * all (all resource types, not supported in --from or --to)
 
 This command will hide resources that have completed, such as pods that are in the Succeeded or Failed phases.
@@ -150,25 +160,64 @@ If no resource name is specified, displays stats about all resources of the spec
   # Get all pods in all namespaces that call the hello1 service in the test namespace.
   linkerd viz stat pods --to svc/hello1 --to-namespace test --all-namespaces
 
+  # Get the web service. With Services, metrics are generated from the outbound metrics
+  # of clients, and thus will not include unmeshed client request metrics.
+  linkerd viz stat svc/web
+
+  # Get the web services and metrics for any traffic coming to the service from the hello1 deployment
+  # in the test namespace.
+  linkerd viz stat svc/web --from deploy/hello1 --from-namespace test
+
+  # Get the web services and metrics for all the traffic that reaches the web-pod1 pod
+  # in the test namespace exclusively.
+  linkerd viz stat svc/web --to pod/web-pod1 --to-namespace test
+
   # Get all services in all namespaces that receive calls from hello1 deployment in the test namespace.
   linkerd viz stat services --from deploy/hello1 --from-namespace test --all-namespaces
-
-  # Get all trafficsplits and their leaf services.
-  linkerd viz stat ts
-
-  # Get the hello-split trafficsplit and its leaf services.
-  linkerd viz stat ts/hello-split
-
-  # Get all trafficsplits and their leaf services, and metrics for any traffic coming to the leaf services from the hello1 deployment.
-  linkerd viz stat ts --from deploy/hello1
 
   # Get all namespaces that receive traffic from the default namespace.
   linkerd viz stat namespaces --from ns/default
 
   # Get all inbound stats to the test namespace.
-  linkerd viz stat ns/test`,
-		Args:      cobra.MinimumNArgs(1),
-		ValidArgs: pkg.ValidTargets,
+  linkerd viz stat ns/test
+
+  # Get all inbound stats to the emoji-grpc server
+  linkerd viz stat server/emoji-grpc
+
+  # Get all inbound stats to the web-public server authorization resource
+  linkerd viz stat serverauthorization/web-public
+
+  # Get all inbound stats to the web-get and web-delete HTTP route resources
+  linkerd viz stat route/web-get route/web-delete
+
+  # Get all inbound stats to the web-authz authorization policy resource
+  linkerd viz stat authorizationpolicy/web-authz
+  `,
+		Args: cobra.MinimumNArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+
+			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			if options.namespace == "" {
+				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
+			}
+
+			if options.allNamespaces {
+				options.namespace = v1.NamespaceAll
+			}
+
+			cc := k8s.NewCommandCompletion(k8sAPI, options.namespace)
+
+			results, err := cc.Complete(args, toComplete)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			return results, cobra.ShellCompDirectiveDefault
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if options.namespace == "" {
 				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
@@ -176,18 +225,21 @@ If no resource name is specified, displays stats about all resources of the spec
 
 			reqs, err := buildStatSummaryRequests(args, options)
 			if err != nil {
-				return fmt.Errorf("error creating metrics request while making stats request: %v", err)
+				return fmt.Errorf("error creating metrics request while making stats request: %w", err)
 			}
 
 			// The gRPC client is concurrency-safe, so we can reuse it in all the following goroutines
 			// https://github.com/grpc/grpc-go/issues/682
-			client := api.CheckClientOrExit(healthcheck.Options{
-				ControlPlaneNamespace: controlPlaneNamespace,
-				KubeConfig:            kubeconfigPath,
-				Impersonate:           impersonate,
-				ImpersonateGroup:      impersonateGroup,
-				KubeContext:           kubeContext,
-				APIAddr:               apiAddr,
+			client := api.CheckClientOrExit(hc.VizOptions{
+				Options: &healthcheck.Options{
+					ControlPlaneNamespace: controlPlaneNamespace,
+					KubeConfig:            kubeconfigPath,
+					Impersonate:           impersonate,
+					ImpersonateGroup:      impersonateGroup,
+					KubeContext:           kubeContext,
+					APIAddr:               apiAddr,
+				},
+				VizNamespaceOverride: vizNamespace,
 			})
 
 			c := make(chan indexedResults, len(reqs))
@@ -229,6 +281,10 @@ If no resource name is specified, displays stats about all resources of the spec
 	cmd.PersistentFlags().StringVarP(&options.outputFormat, "output", "o", options.outputFormat, "Output format; one of: \"table\" or \"json\" or \"wide\"")
 	cmd.PersistentFlags().StringVarP(&options.labelSelector, "selector", "l", options.labelSelector, "Selector (label query) to filter on, supports '=', '==', and '!='")
 	cmd.PersistentFlags().BoolVar(&options.unmeshed, "unmeshed", options.unmeshed, "If present, include unmeshed resources in the output")
+
+	pkgcmd.ConfigureNamespaceFlagCompletion(
+		cmd, []string{"namespace", "to-namespace", "from-namespace"},
+		kubeconfigPath, impersonate, impersonateGroup, kubeContext)
 	return cmd
 }
 
@@ -245,7 +301,7 @@ func respToRows(resp *pb.StatSummaryResponse) []*pb.StatTable_PodGroup_Row {
 func requestStatsFromAPI(client pb.ApiClient, req *pb.StatSummaryRequest) (*pb.StatSummaryResponse, error) {
 	resp, err := client.StatSummary(context.Background(), req)
 	if err != nil {
-		return nil, fmt.Errorf("StatSummary API error: %v", err)
+		return nil, fmt.Errorf("StatSummary API error: %w", err)
 	}
 	if e := resp.GetError(); e != nil {
 		return nil, fmt.Errorf("StatSummary API response error: %v", e.Error)
@@ -278,16 +334,28 @@ type rowStats struct {
 	tcpWriteBytes      float64
 }
 
+type srvStats struct {
+	unauthorizedRate float64
+	server           string
+}
+
 type row struct {
 	meshed string
 	status string
 	*rowStats
 	*tsStats
+	*dstStats
+	*srvStats
 }
 
 type tsStats struct {
 	apex   string
 	leaf   string
+	weight string
+}
+
+type dstStats struct {
+	dst    string
 	weight string
 }
 
@@ -304,7 +372,7 @@ func statHasRequestData(stat *pb.BasicStats) bool {
 }
 
 func isPodOwnerResource(typ string) bool {
-	return typ != k8s.TrafficSplit && typ != k8s.Authority
+	return typ != k8s.Service && typ != k8s.Server && typ != k8s.ServerAuthorization && typ != k8s.AuthorizationPolicy && typ != k8s.HTTPRoute
 }
 
 func writeStatsToBuffer(rows []*pb.StatTable_PodGroup_Row, w *tabwriter.Writer, options *statOptions) {
@@ -312,6 +380,7 @@ func writeStatsToBuffer(rows []*pb.StatTable_PodGroup_Row, w *tabwriter.Writer, 
 	maxNamespaceLength := len(namespaceHeader)
 	maxApexLength := len(apexHeader)
 	maxLeafLength := len(leafHeader)
+	maxDstLength := len(dstHeader)
 	maxWeightLength := len(weightHeader)
 
 	statTables := make(map[string]map[string]*row)
@@ -346,9 +415,7 @@ func writeStatsToBuffer(rows []*pb.StatTable_PodGroup_Row, w *tabwriter.Writer, 
 
 		namespace := r.Resource.Namespace
 		key := fmt.Sprintf("%s/%s", namespace, name)
-		if r.Resource.Type == k8s.TrafficSplit {
-			key = fmt.Sprintf("%s/%s/%s", namespace, name, r.TsStats.Leaf)
-		}
+
 		resourceKey := r.Resource.Type
 
 		if _, ok := statTables[resourceKey]; !ok {
@@ -363,13 +430,16 @@ func writeStatsToBuffer(rows []*pb.StatTable_PodGroup_Row, w *tabwriter.Writer, 
 			maxNamespaceLength = len(namespace)
 		}
 
-		meshedCount := fmt.Sprintf("%d/%d", r.MeshedPodCount, r.RunningPodCount)
-		if resourceKey == k8s.Authority {
-			meshedCount = "-"
-		}
-		statTables[resourceKey][key] = &row{
-			meshed: meshedCount,
-			status: r.Status,
+		statTables[resourceKey][key] = &row{}
+		if resourceKey != k8s.Server && resourceKey != k8s.ServerAuthorization {
+			meshedCount := fmt.Sprintf("%d/%d", r.MeshedPodCount, r.RunningPodCount)
+			if resourceKey == k8s.Service {
+				meshedCount = "-"
+			}
+			statTables[resourceKey][key] = &row{
+				meshed: meshedCount,
+				status: r.Status,
+			}
 		}
 
 		if r.Stats != nil && statHasRequestData(r.Stats) {
@@ -384,27 +454,11 @@ func writeStatsToBuffer(rows []*pb.StatTable_PodGroup_Row, w *tabwriter.Writer, 
 				tcpWriteBytes:      getByteRate(r.GetTcpStats().GetWriteBytesTotal(), r.TimeWindow),
 			}
 		}
-		if r.TsStats != nil {
-			leaf := r.TsStats.Leaf
-			apex := r.TsStats.Apex
-			weight := r.TsStats.Weight
 
-			if len(leaf) > maxLeafLength {
-				maxLeafLength = len(leaf)
-			}
-
-			if len(apex) > maxApexLength {
-				maxApexLength = len(apex)
-			}
-
-			if len(weight) > maxWeightLength {
-				maxWeightLength = len(weight)
-			}
-
-			statTables[resourceKey][key].tsStats = &tsStats{
-				apex:   apex,
-				leaf:   leaf,
-				weight: weight,
+		if r.SrvStats != nil {
+			statTables[resourceKey][key].srvStats = &srvStats{
+				unauthorizedRate: getSuccessRate(r.SrvStats.GetDeniedCount(), r.SrvStats.GetAllowedCount()),
+				server:           r.GetSrvStats().GetSrv().GetName(),
 			}
 		}
 	}
@@ -415,13 +469,13 @@ func writeStatsToBuffer(rows []*pb.StatTable_PodGroup_Row, w *tabwriter.Writer, 
 			fmt.Fprintln(os.Stderr, "No traffic found.")
 			return
 		}
-		printStatTables(statTables, w, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxWeightLength, options)
+		printStatTables(statTables, w, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxDstLength, maxWeightLength, options)
 	case jsonOutput:
 		printStatJSON(statTables, w)
 	}
 }
 
-func printStatTables(statTables map[string]map[string]*row, w *tabwriter.Writer, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxWeightLength int, options *statOptions) {
+func printStatTables(statTables map[string]map[string]*row, w *tabwriter.Writer, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxDstLength, maxWeightLength int, options *statOptions) {
 	usePrefix := false
 	if len(statTables) > 1 {
 		usePrefix = true
@@ -438,7 +492,7 @@ func printStatTables(statTables map[string]map[string]*row, w *tabwriter.Writer,
 			if !usePrefix {
 				resourceTypeLabel = ""
 			}
-			printSingleStatTable(stats, resourceTypeLabel, resourceType, w, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxWeightLength, options)
+			printSingleStatTable(stats, resourceTypeLabel, resourceType, w, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxDstLength, maxWeightLength, options)
 		}
 	}
 }
@@ -449,16 +503,31 @@ func showTCPBytes(options *statOptions, resourceType string) bool {
 }
 
 func showTCPConns(resourceType string) bool {
-	return resourceType != k8s.Authority && resourceType != k8s.TrafficSplit
+	return resourceType != k8s.ServerAuthorization && resourceType != k8s.AuthorizationPolicy && resourceType != k8s.HTTPRoute
 }
 
-func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType string, w *tabwriter.Writer, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxWeightLength int, options *statOptions) {
+func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType string, w *tabwriter.Writer, maxNameLength, maxNamespaceLength, maxLeafLength, maxApexLength, maxDstLength, maxWeightLength int, options *statOptions) {
 	headers := make([]string, 0)
 	nameTemplate := fmt.Sprintf("%%-%ds", maxNameLength)
 	namespaceTemplate := fmt.Sprintf("%%-%ds", maxNamespaceLength)
 	apexTemplate := fmt.Sprintf("%%-%ds", maxApexLength)
 	leafTemplate := fmt.Sprintf("%%-%ds", maxLeafLength)
+	dstTemplate := fmt.Sprintf("%%-%ds", maxDstLength)
 	weightTemplate := fmt.Sprintf("%%-%ds", maxWeightLength)
+
+	hasDstStats := false
+	for _, r := range stats {
+		if r.dstStats != nil {
+			hasDstStats = true
+		}
+	}
+
+	hasTsStats := false
+	for _, r := range stats {
+		if r.tsStats != nil {
+			hasTsStats = true
+		}
+	}
 
 	if options.allNamespaces {
 		headers = append(headers,
@@ -472,13 +541,25 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 		headers = append(headers, "STATUS")
 	}
 
-	if resourceType == k8s.TrafficSplit {
+	if resourceType == k8s.HTTPRoute {
+		headers = append(headers, "SERVER")
+	}
+
+	if hasDstStats {
+		headers = append(headers,
+			fmt.Sprintf(dstTemplate, dstHeader),
+			fmt.Sprintf(weightTemplate, weightHeader))
+	} else if hasTsStats {
 		headers = append(headers,
 			fmt.Sprintf(apexTemplate, apexHeader),
 			fmt.Sprintf(leafTemplate, leafHeader),
 			fmt.Sprintf(weightTemplate, weightHeader))
-	} else {
+	} else if resourceType != k8s.Server && resourceType != k8s.ServerAuthorization && resourceType != k8s.AuthorizationPolicy && resourceType != k8s.HTTPRoute {
 		headers = append(headers, "MESHED")
+	}
+
+	if resourceType == k8s.Server || resourceType == k8s.HTTPRoute {
+		headers = append(headers, "UNAUTHORIZED")
 	}
 
 	headers = append(headers, []string{
@@ -489,7 +570,7 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 		"LATENCY_P99",
 	}...)
 
-	if resourceType != k8s.TrafficSplit {
+	if showTCPConns(resourceType) {
 		headers = append(headers, "TCP_CONN")
 	}
 
@@ -509,29 +590,37 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 		namespace, name := namespaceName(resourceTypeLabel, key)
 		values := make([]interface{}, 0)
 		templateString := "%s\t%s\t%.2f%%\t%.1frps\t%dms\t%dms\t%dms\t"
-		templateStringEmpty := "%s\t%s\t-\t-\t-\t-\t-\t-\t"
+		templateStringEmpty := "%s\t%s\t-\t-\t-\t-\t-\t"
 		if resourceType == k8s.Pod {
 			templateString = "%s\t" + templateString
 			templateStringEmpty = "%s\t" + templateStringEmpty
 		}
 
-		if resourceType == k8s.TrafficSplit {
+		if hasTsStats {
 			templateString = "%s\t%s\t%s\t%s\t%.2f%%\t%.1frps\t%dms\t%dms\t%dms\t"
 			templateStringEmpty = "%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t"
+		} else if hasDstStats {
+			templateString = "%s\t%s\t%s\t%.2f%%\t%.1frps\t%dms\t%dms\t%dms\t"
+			templateStringEmpty = "%s\t%s\t%s\t-\t-\t-\t-\t-\t"
+		} else if resourceType == k8s.ServerAuthorization || resourceType == k8s.AuthorizationPolicy {
+			templateString = "%s\t%.2f%%\t%.1frps\t%dms\t%dms\t%dms\t"
+			templateStringEmpty = "%s\t-\t-\t-\t-\t-\t"
+		} else if resourceType == k8s.Server {
+			templateString = "%s\t%.1frps\t%.2f%%\t%.1frps\t%dms\t%dms\t%dms\t"
+			templateStringEmpty = "%s\t%.1frps\t-\t-\t-\t-\t-\t"
+		} else if resourceType == k8s.HTTPRoute {
+			templateString = "%s\t%s\t%.1frps\t%.2f%%\t%.1frps\t%dms\t%dms\t%dms\t"
+			templateStringEmpty = "%s\t%s\t%.1frps\t-\t-\t-\t-\t-\t"
 		}
 
-		if !showTCPConns(resourceType) {
-			if resourceType == k8s.Authority {
-				// always show TCP Connections as - for Authorities
-				templateString = templateString + "-\t"
-			}
-		} else {
-			templateString = templateString + "%d\t"
+		if showTCPConns(resourceType) {
+			templateString += "%d\t"
+			templateStringEmpty += "-\t"
 		}
 
 		if showTCPBytes(options, resourceType) {
-			templateString = templateString + "%.1fB/s\t%.1fB/s\t"
-			templateStringEmpty = templateStringEmpty + "-\t-\t"
+			templateString += "%.1fB/s\t%.1fB/s\t"
+			templateStringEmpty += "-\t-\t"
 		}
 
 		if options.allNamespaces {
@@ -541,8 +630,8 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 			templateStringEmpty = "%s\t" + templateStringEmpty
 		}
 
-		templateString = templateString + "\n"
-		templateStringEmpty = templateStringEmpty + "\n"
+		templateString += "\n"
+		templateStringEmpty += "\n"
 
 		padding := 0
 		if maxNameLength > len(name) {
@@ -551,6 +640,7 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 
 		apexPadding := 0
 		leafPadding := 0
+		dstPadding := 0
 
 		if stats[key].tsStats != nil {
 			if maxApexLength > len(stats[key].tsStats.apex) {
@@ -559,6 +649,10 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 			if maxLeafLength > len(stats[key].tsStats.leaf) {
 				leafPadding = maxLeafLength - len(stats[key].tsStats.leaf)
 			}
+		} else if stats[key].dstStats != nil {
+			if maxDstLength > len(stats[key].dstStats.dst) {
+				dstPadding = maxDstLength - len(stats[key].dstStats.dst)
+			}
 		}
 
 		values = append(values, name+strings.Repeat(" ", padding))
@@ -566,15 +660,34 @@ func printSingleStatTable(stats map[string]*row, resourceTypeLabel, resourceType
 			values = append(values, stats[key].status)
 		}
 
-		if resourceType == k8s.TrafficSplit {
+		if hasTsStats {
 			values = append(values,
 				stats[key].tsStats.apex+strings.Repeat(" ", apexPadding),
 				stats[key].tsStats.leaf+strings.Repeat(" ", leafPadding),
 				stats[key].tsStats.weight,
 			)
-		} else {
+		} else if hasDstStats {
+			values = append(values,
+				stats[key].dstStats.dst+strings.Repeat(" ", dstPadding),
+				stats[key].dstStats.weight,
+			)
+		} else if resourceType != k8s.ServerAuthorization && resourceType != k8s.Server && resourceType != k8s.AuthorizationPolicy && resourceType != k8s.HTTPRoute {
 			values = append(values, []interface{}{
 				stats[key].meshed,
+			}...)
+		}
+
+		if resourceType == k8s.HTTPRoute {
+			values = append(values, stats[key].srvStats.server)
+		}
+
+		if resourceType == k8s.Server || resourceType == k8s.HTTPRoute {
+			var unauthorizedRate float64
+			if stats[key].srvStats != nil {
+				unauthorizedRate = stats[key].srvStats.unauthorizedRate
+			}
+			values = append(values, []interface{}{
+				unauthorizedRate,
 			}...)
 		}
 
@@ -629,7 +742,9 @@ type jsonStats struct {
 	TCPWriteBytes  *float64 `json:"tcp_write_bytes_rate,omitempty"`
 	Apex           string   `json:"apex,omitempty"`
 	Leaf           string   `json:"leaf,omitempty"`
+	Dst            string   `json:"dst,omitempty"`
 	Weight         string   `json:"weight,omitempty"`
+	Unauthorized   *float64 `json:"unauthorized,omitempty"`
 }
 
 func printStatJSON(statTables map[string]map[string]*row, w *tabwriter.Writer) {
@@ -645,9 +760,7 @@ func printStatJSON(statTables map[string]map[string]*row, w *tabwriter.Writer) {
 					Kind:      resourceType,
 					Name:      name,
 				}
-				if resourceType != k8s.TrafficSplit {
-					entry.Meshed = stats[key].meshed
-				}
+
 				if stats[key].rowStats != nil {
 					entry.Success = &stats[key].successRate
 					entry.Rps = &stats[key].requestRate
@@ -665,7 +778,16 @@ func printStatJSON(statTables map[string]map[string]*row, w *tabwriter.Writer) {
 				if stats[key].tsStats != nil {
 					entry.Apex = stats[key].apex
 					entry.Leaf = stats[key].leaf
-					entry.Weight = stats[key].weight
+					entry.Weight = stats[key].tsStats.weight
+				} else if stats[key].dstStats != nil {
+					entry.Dst = stats[key].dstStats.dst
+					entry.Weight = stats[key].dstStats.weight
+				}
+
+				if resourceType == k8s.Server {
+					if stats[key].srvStats != nil {
+						entry.Unauthorized = &stats[key].srvStats.unauthorizedRate
+					}
 				}
 				entries = append(entries, entry)
 			}
@@ -689,20 +811,20 @@ func getNamePrefix(resourceType string) string {
 }
 
 func buildStatSummaryRequests(resources []string, options *statOptions) ([]*pb.StatSummaryRequest, error) {
-	targets, err := coreUtil.BuildResources(options.namespace, resources)
+	targets, err := pkgUtil.BuildResources(options.namespace, resources)
 	if err != nil {
 		return nil, err
 	}
 
 	var toRes, fromRes *pb.Resource
 	if options.toResource != "" {
-		toRes, err = coreUtil.BuildResource(options.toNamespace, options.toResource)
+		toRes, err = pkgUtil.BuildResource(options.toNamespace, options.toResource)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if options.fromResource != "" {
-		fromRes, err = coreUtil.BuildResource(options.fromNamespace, options.fromResource)
+		fromRes, err = pkgUtil.BuildResource(options.fromNamespace, options.fromResource)
 		if err != nil {
 			return nil, err
 		}
@@ -743,6 +865,7 @@ func buildStatSummaryRequests(resources []string, options *statOptions) ([]*pb.S
 		}
 		requests = append(requests, req)
 	}
+
 	return requests, nil
 }
 
@@ -784,7 +907,7 @@ func (o *statOptions) validateConflictingFlags() error {
 		return fmt.Errorf("--to-namespace and --from-namespace flags are mutually exclusive")
 	}
 
-	if o.allNamespaces && o.namespace != cmd.GetDefaultNamespace(kubeconfigPath, kubeContext) {
+	if o.allNamespaces && o.namespace != pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext) {
 		return fmt.Errorf("--all-namespaces and --namespace flags are mutually exclusive")
 	}
 
@@ -804,7 +927,7 @@ func (o *statOptions) validateNamespaceFlags() error {
 
 	// Note: technically, this allows you to say `stat ns --namespace <default-namespace-from-kubectl-context>`, but that
 	// seems like an edge case.
-	if o.namespace != cmd.GetDefaultNamespace(kubeconfigPath, kubeContext) {
+	if o.namespace != pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext) {
 		return fmt.Errorf("--namespace flag is incompatible with namespace resource type")
 	}
 
@@ -832,7 +955,7 @@ func renderStats(buffer bytes.Buffer, options *statOptionsBase) string {
 		if len(b) > padding {
 			out = string(b[padding:])
 		}
-		out = strings.Replace(out, "\n"+strings.Repeat(" ", padding), "\n", -1)
+		out = strings.ReplaceAll(out, "\n"+strings.Repeat(" ", padding), "\n")
 	}
 
 	return out

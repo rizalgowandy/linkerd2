@@ -21,12 +21,12 @@ if [ ! -f "$kubectlbin" ]; then
     os=linux
     case $(uname -m) in
       x86_64) arch=amd64 ;;
-      arm) dpkg --print-architecture | grep -q arm64 && arch=arm64 || arch=arm ;;
+      arm) dpkg --print-architecture | grep -q arm64 && arch=arm64 ;;
     esac
   fi
 
   mkdir -p "$targetbin"
-  curl -sfL -o "$kubectlbin" https://storage.googleapis.com/kubernetes-release/release/$kubectlversion/bin/$os/$arch/kubectl${exe}
+  "$bindir"/scurl -o "$kubectlbin" https://storage.googleapis.com/kubernetes-release/release/$kubectlversion/bin/$os/$arch/kubectl${exe}
   chmod +x "$kubectlbin"
 fi
 

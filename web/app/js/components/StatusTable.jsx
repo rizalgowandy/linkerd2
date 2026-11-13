@@ -1,4 +1,3 @@
-import BaseTable from './BaseTable.jsx';
 import PropTypes from 'prop-types';
 import React from 'react';
 import Tooltip from '@material-ui/core/Tooltip';
@@ -6,8 +5,9 @@ import { Trans } from '@lingui/macro';
 import _get from 'lodash/get';
 import _merge from 'lodash/merge';
 import classNames from 'classnames';
-import { statusClassNames } from './util/theme.js';
 import { withStyles } from '@material-ui/core/styles';
+import { statusClassNames } from './util/theme.js';
+import BaseTable from './BaseTable.jsx';
 
 const styles = theme => _merge({}, statusClassNames(theme), {
   statusTableDot: {
@@ -44,25 +44,27 @@ const columnConfig = {
   },
 };
 
-const StatusDot = ({ status, columnName, classes }) => (
-  <Tooltip
-    placement="top"
-    title={(
-      <div>
-        <div>{status.name}</div>
-        <div>{_get(columnConfig, [columnName, 'dotExplanation'])(status)}</div>
-        <div>Uptime: {status.uptime} ({status.uptimeSec}s)</div>
-      </div>
+const StatusDot = function({ status, columnName, classes }) {
+  return (
+    <Tooltip
+      placement="top"
+      title={(
+        <div>
+          <div>{status.name}</div>
+          <div>{_get(columnConfig, [columnName, 'dotExplanation'])(status)}</div>
+          <div>Uptime: {status.uptime} ({status.uptimeSec}s)</div>
+        </div>
     )}>
-    <div
-      className={classNames(
-        classes.statusTableDot,
-        classes[status.value],
-      )}
-      key={status.name}>&nbsp;
-    </div>
-  </Tooltip>
-);
+      <div
+        className={classNames(
+          classes.statusTableDot,
+          classes[status.value],
+        )}
+        key={status.name}>&nbsp;
+      </div>
+    </Tooltip>
+  );
+};
 
 StatusDot.propTypes = {
   columnName: PropTypes.string.isRequired,
@@ -102,7 +104,7 @@ const columns = {
   },
 };
 
-const StatusTable = ({ classes, statusColumnTitle, data }) => {
+const StatusTable = function({ classes, statusColumnTitle, data }) {
   const tableCols = [
     columns.resourceName,
     columns.pods,
@@ -122,7 +124,12 @@ const StatusTable = ({ classes, statusColumnTitle, data }) => {
 StatusTable.propTypes = {
   data: PropTypes.arrayOf(PropTypes.shape({
     name: PropTypes.string.isRequired,
-    pods: PropTypes.arrayOf(PropTypes.object).isRequired, // TODO: What's the real shape here.
+    pods: PropTypes.shape({
+      name: PropTypes.string.isRequired,
+      value: PropTypes.string.isRequired,
+      uptime: PropTypes.string.isRequired,
+      uptimeSec: PropTypes.number.isRequired,
+    }).isRequired,
     added: PropTypes.bool,
   })).isRequired,
   statusColumnTitle: PropTypes.string.isRequired,

@@ -19,8 +19,10 @@ limitations under the License.
 package v1alpha2
 
 import (
-	v1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
-	"github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned/scheme"
+	http "net/http"
+
+	serviceprofilev1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
+	scheme "github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned/scheme"
 	rest "k8s.io/client-go/rest"
 )
 
@@ -39,12 +41,24 @@ func (c *LinkerdV1alpha2Client) ServiceProfiles(namespace string) ServiceProfile
 }
 
 // NewForConfig creates a new LinkerdV1alpha2Client for the given config.
+// NewForConfig is equivalent to NewForConfigAndClient(c, httpClient),
+// where httpClient was generated with rest.HTTPClientFor(c).
 func NewForConfig(c *rest.Config) (*LinkerdV1alpha2Client, error) {
 	config := *c
-	if err := setConfigDefaults(&config); err != nil {
+	setConfigDefaults(&config)
+	httpClient, err := rest.HTTPClientFor(&config)
+	if err != nil {
 		return nil, err
 	}
-	client, err := rest.RESTClientFor(&config)
+	return NewForConfigAndClient(&config, httpClient)
+}
+
+// NewForConfigAndClient creates a new LinkerdV1alpha2Client for the given config and http client.
+// Note the http client provided takes precedence over the configured transport values.
+func NewForConfigAndClient(c *rest.Config, h *http.Client) (*LinkerdV1alpha2Client, error) {
+	config := *c
+	setConfigDefaults(&config)
+	client, err := rest.RESTClientForConfigAndClient(&config, h)
 	if err != nil {
 		return nil, err
 	}
@@ -66,17 +80,15 @@ func New(c rest.Interface) *LinkerdV1alpha2Client {
 	return &LinkerdV1alpha2Client{c}
 }
 
-func setConfigDefaults(config *rest.Config) error {
-	gv := v1alpha2.SchemeGroupVersion
+func setConfigDefaults(config *rest.Config) {
+	gv := serviceprofilev1alpha2.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	config.NegotiatedSerializer = rest.CodecFactoryForGeneratedClient(scheme.Scheme, scheme.Codecs).WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()
 	}
-
-	return nil
 }
 
 // RESTClient returns a RESTClient that is used to communicate

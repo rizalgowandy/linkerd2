@@ -2,10 +2,10 @@ package healthcheck
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,148 +21,210 @@ const (
 	TableOutput = "table"
 	// WideOutput is used to specify the wide output format
 	WideOutput = "wide"
+	// ShortOutput is used to specify the short output format
+	ShortOutput = "short"
+
+	// DefaultHintBaseURL is the default base URL on the linkerd.io website
+	// that all check hints for the latest linkerd version point to. Each
+	// check adds its own `hintAnchor` to specify a location on the page.
+	DefaultHintBaseURL = "https://linkerd.io/2/checks/#"
 )
 
 var (
 	okStatus   = color.New(color.FgGreen, color.Bold).SprintFunc()("\u221A")  // √
 	warnStatus = color.New(color.FgYellow, color.Bold).SprintFunc()("\u203C") // ‼
 	failStatus = color.New(color.FgRed, color.Bold).SprintFunc()("\u00D7")    // ×
+
+	reStableVersion = regexp.MustCompile(`stable-(\d\.\d+)\.`)
 )
+
+// Checks describes the "checks" field on a CheckCLIOutput
+type Checks string
+
+const (
+	// ExtensionMetadataSubcommand is the subcommand name an extension must
+	// support in order to provide config metadata to the "linkerd" CLI.
+	ExtensionMetadataSubcommand = "_extension-metadata"
+
+	// Always run the check, regardless of cluster state
+	Always Checks = "always"
+	// // TODO:
+	// // Cluster informs "linkerd check" to only run this extension if there are
+	// // on-cluster resources.
+	// Cluster Checks = "cluster"
+	// // Never informs "linkerd check" to never run this extension.
+	// Never Checks = "never"
+)
+
+// ExtensionMetadataOutput contains the output of a _extension-metadata subcommand.
+type ExtensionMetadataOutput struct {
+	Name   string `json:"name"`
+	Checks Checks `json:"checks"`
+}
 
 // CheckResults contains a slice of CheckResult structs.
 type CheckResults struct {
 	Results []CheckResult
 }
 
+// CheckOutput groups the check results for all categories
+type CheckOutput struct {
+	Success    bool             `json:"success"`
+	Categories []*CheckCategory `json:"categories"`
+}
+
+// CheckCategory groups a series of check for a category
+type CheckCategory struct {
+	Name   CategoryID `json:"categoryName"`
+	Checks []*Check   `json:"checks"`
+}
+
+// Check is a user-facing version of `healthcheck.CheckResult`, for output via
+// `linkerd check -o json`.
+type Check struct {
+	Description string         `json:"description"`
+	Hint        string         `json:"hint,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Result      CheckResultStr `json:"result"`
+}
+
 // RunChecks submits each of the individual CheckResult structs to the given
 // observer.
-func (cr CheckResults) RunChecks(observer CheckObserver) bool {
+func (cr CheckResults) RunChecks(observer CheckObserver) (bool, bool) {
 	success := true
+	warning := false
 	for _, result := range cr.Results {
 		result := result // Copy loop variable to make lint happy.
-		if result.Err != nil && !result.Warning {
-			success = false
+		if result.Err != nil {
+			if !result.Warning {
+				success = false
+			} else {
+				warning = true
+			}
 		}
 		observer(&result)
 	}
-	return success
+	return success, warning
+}
+
+// PrintChecksResult writes the checks result.
+func PrintChecksResult(wout io.Writer, output string, success bool, warning bool) {
+	if output == JSONOutput {
+		return
+	}
+
+	switch success {
+	case true:
+		fmt.Fprintf(wout, "Status check results are %s\n", okStatus)
+	case false:
+		fmt.Fprintf(wout, "Status check results are %s\n", failStatus)
+	}
 }
 
 // RunChecks runs the checks that are part of hc
-func RunChecks(wout io.Writer, werr io.Writer, hc Runner, output string) bool {
+func RunChecks(wout io.Writer, werr io.Writer, hc Runner, output string) (bool, bool) {
 	if output == JSONOutput {
 		return runChecksJSON(wout, werr, hc)
 	}
-	return runChecksTable(wout, hc)
+
+	return runChecksTable(wout, hc, output)
 }
 
-func runChecksTable(wout io.Writer, hc Runner) bool {
+func runChecksTable(wout io.Writer, hc Runner, output string) (bool, bool) {
 	var lastCategory CategoryID
 	spin := spinner.New(spinner.CharSets[9], 100*time.Millisecond)
 	spin.Writer = wout
 
+	// We set up different printing functions because we need to handle
+	// 2 check formatting output use cases:
+	//  1. the default check output in `table` format
+	//  2. the summarized output in `short` format
 	prettyPrintResults := func(result *CheckResult) {
-		if lastCategory != result.Category {
-			if lastCategory != "" {
-				fmt.Fprintln(wout)
-			}
-
-			fmt.Fprintln(wout, result.Category)
-			fmt.Fprintln(wout, strings.Repeat("-", len(result.Category)))
-
-			lastCategory = result.Category
-		}
+		lastCategory = printCategory(wout, lastCategory, result)
 
 		spin.Stop()
 		if result.Retry {
-			if isatty.IsTerminal(os.Stdout.Fd()) {
-				spin.Suffix = fmt.Sprintf(" %s", result.Err)
-				spin.Color("bold") // this calls spin.Restart()
-			}
+			restartSpinner(spin, result)
 			return
 		}
 
-		status := okStatus
-		if result.Err != nil {
-			status = failStatus
-			if result.Warning {
-				status = warnStatus
-			}
-		}
+		status := getResultStatus(result)
 
-		fmt.Fprintf(wout, "%s %s\n", status, result.Description)
-		if result.Err != nil {
-			fmt.Fprintf(wout, "    %s\n", result.Err)
-			if result.HintURL != "" {
-				fmt.Fprintf(wout, "    see %s for hints\n", result.HintURL)
-			}
-		}
+		printResultDescription(wout, status, result)
 	}
 
-	success := hc.RunChecks(prettyPrintResults)
-	// this empty line separates final results from the checks list in the output
-	fmt.Fprintln(wout, "")
+	prettyPrintResultsShort := func(result *CheckResult) {
+		// bail out early and skip printing if we've got an okStatus
+		if result.Err == nil {
+			return
+		}
 
-	if !success {
-		fmt.Fprintf(wout, "Status check results are %s\n", failStatus)
-	} else {
-		fmt.Fprintf(wout, "Status check results are %s\n", okStatus)
+		lastCategory = printCategory(wout, lastCategory, result)
+
+		spin.Stop()
+		if result.Retry {
+			restartSpinner(spin, result)
+			return
+		}
+
+		status := getResultStatus(result)
+
+		printResultDescription(wout, status, result)
 	}
 
-	return success
+	var (
+		success bool
+		warning bool
+	)
+	switch output {
+	case ShortOutput:
+		success, warning = hc.RunChecks(prettyPrintResultsShort)
+	default:
+		success, warning = hc.RunChecks(prettyPrintResults)
+	}
+
+	// This ensures there is a newline separating check categories from each
+	// other as well as the check result. When running in ShortOutput mode and
+	// there are no warnings, there is no newline printed.
+	if output != ShortOutput || !success || warning {
+		fmt.Fprintln(wout)
+	}
+
+	return success, warning
 }
 
-type checkOutput struct {
-	Success    bool             `json:"success"`
-	Categories []*checkCategory `json:"categories"`
-}
-
-type checkCategory struct {
-	Name   string   `json:"categoryName"`
-	Checks []*check `json:"checks"`
-}
-
-// check is a user-facing version of `healthcheck.CheckResult`, for output via
-// `linkerd check -o json`.
-type check struct {
-	Description string      `json:"description"`
-	Hint        string      `json:"hint,omitempty"`
-	Error       string      `json:"error,omitempty"`
-	Result      checkResult `json:"result"`
-}
-
-type checkResult string
+// CheckResultStr is a string describing the result of a check
+type CheckResultStr string
 
 const (
-	checkSuccess checkResult = "success"
-	checkWarn    checkResult = "warning"
-	checkErr     checkResult = "error"
+	CheckSuccess CheckResultStr = "success"
+	CheckWarn    CheckResultStr = "warning"
+	CheckErr     CheckResultStr = "error"
 )
 
-func runChecksJSON(wout io.Writer, werr io.Writer, hc Runner) bool {
-	var categories []*checkCategory
+func runChecksJSON(wout io.Writer, werr io.Writer, hc Runner) (bool, bool) {
+	var categories []*CheckCategory
 
 	collectJSONOutput := func(result *CheckResult) {
-		categoryName := string(result.Category)
-		if categories == nil || categories[len(categories)-1].Name != categoryName {
-			categories = append(categories, &checkCategory{
-				Name:   categoryName,
-				Checks: []*check{},
+		if categories == nil || categories[len(categories)-1].Name != result.Category {
+			categories = append(categories, &CheckCategory{
+				Name:   result.Category,
+				Checks: []*Check{},
 			})
 		}
 
 		if !result.Retry {
 			currentCategory := categories[len(categories)-1]
 			// ignore checks that are going to be retried, we want only final results
-			status := checkSuccess
+			status := CheckSuccess
 			if result.Err != nil {
-				status = checkErr
+				status = CheckErr
 				if result.Warning {
-					status = checkWarn
+					status = CheckWarn
 				}
 			}
 
-			currentCheck := &check{
+			currentCheck := &Check{
 				Description: result.Description,
 				Result:      status,
 			}
@@ -178,10 +240,10 @@ func runChecksJSON(wout io.Writer, werr io.Writer, hc Runner) bool {
 		}
 	}
 
-	result := hc.RunChecks(collectJSONOutput)
+	success, warning := hc.RunChecks(collectJSONOutput)
 
-	outputJSON := checkOutput{
-		Success:    result,
+	outputJSON := CheckOutput{
+		Success:    success,
 		Categories: categories,
 	}
 
@@ -191,34 +253,62 @@ func runChecksJSON(wout io.Writer, werr io.Writer, hc Runner) bool {
 	} else {
 		fmt.Fprintf(werr, "JSON serialization of the check result failed with %s", err)
 	}
-	return result
+	return success, warning
 }
 
-// ParseJSONCheckOutput parses the output of a check command run with json
-// output mode. The data is expected to be a checkOutput struct serialized
-// to json. In addition to deserializing, this function will convert the result
-// to a CheckResults struct.
-func ParseJSONCheckOutput(data []byte) (CheckResults, error) {
-	var checks checkOutput
-	err := json.Unmarshal(data, &checks)
-	if err != nil {
-		return CheckResults{}, err
+func printResultDescription(wout io.Writer, status string, result *CheckResult) {
+	fmt.Fprintf(wout, "%s %s\n", status, result.Description)
+
+	if result.Err == nil {
+		return
 	}
-	results := []CheckResult{}
-	for _, category := range checks.Categories {
-		for _, check := range category.Checks {
-			var err error
-			if check.Error != "" {
-				err = errors.New(check.Error)
-			}
-			results = append(results, CheckResult{
-				Category:    CategoryID(category.Name),
-				Description: check.Description,
-				Err:         err,
-				HintURL:     check.Hint,
-				Warning:     check.Result == checkWarn,
-			})
+
+	fmt.Fprintf(wout, "    %s\n", result.Err)
+	if result.HintURL != "" {
+		fmt.Fprintf(wout, "    see %s for hints\n", result.HintURL)
+	}
+}
+
+func getResultStatus(result *CheckResult) string {
+	status := okStatus
+	if result.Err != nil {
+		status = failStatus
+		if result.Warning {
+			status = warnStatus
 		}
 	}
-	return CheckResults{results}, nil
+
+	return status
+}
+
+func restartSpinner(spin *spinner.Spinner, result *CheckResult) {
+	if isatty.IsTerminal(os.Stdout.Fd()) {
+		spin.Suffix = fmt.Sprintf(" %s", result.Err)
+		spin.Color("bold") // this calls spin.Restart()
+	}
+}
+
+func printCategory(wout io.Writer, lastCategory CategoryID, result *CheckResult) CategoryID {
+	if lastCategory == result.Category {
+		return lastCategory
+	}
+
+	if lastCategory != "" {
+		fmt.Fprintln(wout)
+	}
+
+	fmt.Fprintln(wout, result.Category)
+	fmt.Fprintln(wout, strings.Repeat("-", len(result.Category)))
+
+	return result.Category
+}
+
+// HintBaseURL returns the base URL on the linkerd.io website that check hints
+// point to, depending on the version
+func HintBaseURL(ver string) string {
+	stableVersion := reStableVersion.FindStringSubmatch(ver)
+	if stableVersion == nil {
+		return DefaultHintBaseURL
+	}
+	return fmt.Sprintf("https://linkerd.io/%s/checks/#", stableVersion[1])
 }

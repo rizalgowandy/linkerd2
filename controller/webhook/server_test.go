@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -14,13 +15,16 @@ import (
 )
 
 var mockHTTPServer = &http.Server{
-	Addr:      ":0",
-	TLSConfig: &tls.Config{},
+	Addr:              ":0",
+	ReadHeaderTimeout: 15 * time.Second,
+	TLSConfig: &tls.Config{
+		MinVersion: tls.VersionTLS13,
+	},
 }
 
 func TestServe(t *testing.T) {
 	t.Run("with empty http request body", func(t *testing.T) {
-		k8sAPI, err := k8s.NewFakeAPI()
+		k8sAPI, err := k8s.NewFakeMetadataAPI(nil)
 		if err != nil {
 			panic(err)
 		}
@@ -46,8 +50,8 @@ func TestShutdown(t *testing.T) {
 
 	go func() {
 		if err := testServer.ListenAndServe(); err != nil {
-			if err != http.ErrServerClosed {
-				t.Errorf("Expected server to be gracefully shutdown with error: %q", http.ErrServerClosed)
+			if !errors.Is(err, http.ErrServerClosed) {
+				t.Errorf("Unexpected error: %s", err)
 			}
 		}
 	}()
@@ -55,6 +59,6 @@ func TestShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := testServer.Shutdown(ctx); err != nil {
-		t.Fatal("Unexpected error: ", err)
+		t.Fatalf("Unexpected error: %s", err)
 	}
 }

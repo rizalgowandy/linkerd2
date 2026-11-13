@@ -1,12 +1,12 @@
-import BaseTable from './BaseTable.jsx';
-import ErrorModal from './ErrorModal.jsx';
 import Grid from '@material-ui/core/Grid';
 import PropTypes from 'prop-types';
 import React from 'react';
-import { StyledProgress } from './util/Progress.jsx';
 import Tooltip from '@material-ui/core/Tooltip';
 import { Trans } from '@lingui/macro';
 import _isEmpty from 'lodash/isEmpty';
+import { StyledProgress } from './util/Progress.jsx';
+import ErrorModal from './ErrorModal.jsx';
+import BaseTable from './BaseTable.jsx';
 import { withContext } from './util/AppContext.jsx';
 
 const getClassification = (meshedPodCount, failedPodCount) => {
@@ -26,14 +26,12 @@ const namespacesColumns = PrefixedLink => [
     sorter: d => d.namespace,
     render: d => {
       return (
-        <React.Fragment>
-          <Grid container alignItems="center" spacing={1}>
-            <Grid item><PrefixedLink to={`/namespaces/${d.namespace}`}>{d.namespace}</PrefixedLink></Grid>
-            { _isEmpty(d.errors) ? null :
-            <Grid item><ErrorModal errors={d.errors} resourceName={d.namespace} resourceType="namespace" /></Grid>
+        <Grid container alignItems="center" spacing={1}>
+          <Grid item><PrefixedLink to={`/namespaces/${d.namespace}`}>{d.namespace}</PrefixedLink></Grid>
+          { _isEmpty(d.errors) ? null :
+          <Grid item><ErrorModal errors={d.errors} resourceName={d.namespace} resourceType="namespace" /></Grid>
           }
-          </Grid>
-        </React.Fragment>
+        </Grid>
       );
     },
   },
@@ -72,14 +70,16 @@ const namespacesColumns = PrefixedLink => [
   },
 ];
 
-const MeshedStatusTable = ({ api, tableRows }) => (
-  <BaseTable
-    tableClassName="metric-table mesh-completion-table"
-    tableRows={tableRows}
-    tableColumns={namespacesColumns(api.PrefixedLink)}
-    defaultOrderBy="namespace"
-    rowKey={d => d.namespace} />
-);
+const MeshedStatusTable = function({ api, tableRows }) {
+  return (
+    <BaseTable
+      tableClassName="metric-table mesh-completion-table"
+      tableRows={tableRows}
+      tableColumns={namespacesColumns(api.PrefixedLink)}
+      defaultOrderBy="namespace"
+      rowKey={d => d.namespace} />
+  );
+};
 
 MeshedStatusTable.propTypes = {
   api: PropTypes.shape({

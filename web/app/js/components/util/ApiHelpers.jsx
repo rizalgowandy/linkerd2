@@ -29,10 +29,11 @@ const makeCancelable = (promise, onSuccess) => {
   let hasCanceled_ = false;
 
   const wrappedPromise = new Promise((resolve, reject) => {
-    return promise.then(
+    promise.then(
       result => hasCanceled_ ? reject({ isCanceled: true }) : resolve(result),
       error => hasCanceled_ ? reject({ isCanceled: true }) : reject(error),
-    );
+    )
+      .catch(error => { reject(error); });
   })
     .then(checkFetchOk)
     .then(onSuccess);
@@ -61,10 +62,10 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
   const servicesPath = '/api/services';
   const edgesPath = '/api/edges';
   const gatewaysPath = '/api/gateways';
-  const l5dExtensionsPath = '/api/extension';
+  const l5dExtensionsPath = '/api/extensions';
 
   const validMetricsWindows = {
-    '10s': '10 minutes',
+    '10s': '10 seconds',
     '1m': '1 minute',
     '10m': '10 minutes',
     '1h': '1 hour',
@@ -147,7 +148,11 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
   };
 
   const fetchExtension = name => {
-    return apiFetch(`${l5dExtensionsPath}?extension_name=${name}`);
+    let extensionPath = l5dExtensionsPath;
+    if (name) {
+      extensionPath += `?extension_name=${name}`;
+    }
+    return apiFetch(extensionPath);
   };
 
   const fetchResourceDefinition = (namespace, resourceType, resourceName) => {
@@ -201,7 +206,7 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
   const prefixLink = to => `${pathPrefix}${to}`;
 
   // prefix all links in the app with `pathPrefix`
-  const PrefixedLink = ({ to, targetBlank, children }) => {
+  const PrefixedLink = function PrefixedLink({ to, targetBlank, children }) {
     const url = prefixLink(to);
 
     return (
@@ -232,7 +237,7 @@ const ApiHelpers = (pathPrefix, defaultMetricsWindow = '1m') => {
   };
 
   // a prefixed link to a Resource Detail page
-  const ResourceLink = ({ resource, linkText }) => {
+  const ResourceLink = function({ resource, linkText }) {
     return (
       <PrefixedLink to={generateResourceURL(resource)}>
         {linkText || `${resource.type}/${resource.name}`}

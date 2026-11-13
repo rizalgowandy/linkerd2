@@ -1,4 +1,3 @@
-import Percentage from './Percentage.js';
 import PropTypes from 'prop-types';
 import _compact from 'lodash/compact';
 import _each from 'lodash/each';
@@ -10,6 +9,7 @@ import _orderBy from 'lodash/orderBy';
 import _reduce from 'lodash/reduce';
 import _size from 'lodash/size';
 import _values from 'lodash/values';
+import Percentage from './Percentage.js';
 
 const srArcClassLabels = {
   good: 'good',
@@ -196,9 +196,10 @@ export const processMultiResourceRollup = (rawMetrics, resourceType) => {
     // selected resource in the Octopus graph.
 
     // The below line checks if the statTable contains trafficsplit data and
-    // returns early if the selected resource is not "all" or "trafficsplit",
+    // returns early if the selected resource is not "all" or "service",
     // since any other resource should not include trafficsplit metrics.
-    if (table.podGroup.rows[0].tsStats && resourceType !== 'all' && resourceType !== 'trafficsplit') {
+    const isTrafficSplit = table.podGroup.rows[0].resource.type === 'trafficsplit';
+    if (isTrafficSplit && resourceType !== 'all') {
       return;
     }
 
@@ -312,4 +313,7 @@ export const processedMetricsPropType = PropTypes.shape({
   totalRequests: PropTypes.number,
   requestRate: PropTypes.number,
   successRate: PropTypes.number,
+  tsStats: PropTypes.shape({
+    weight: PropTypes.string,
+  }),
 });

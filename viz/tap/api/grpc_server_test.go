@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"reflect"
 	"strconv"
 	"testing"
 
+	"github.com/go-test/deep"
 	proxy "github.com/linkerd/linkerd2-proxy-api/go/tap"
 	"github.com/linkerd/linkerd2/controller/api/util"
 	"github.com/linkerd/linkerd2/controller/k8s"
@@ -39,6 +39,7 @@ func (m *mockTapByResourceServer) Send(event *tapPb.TapEvent) error {
 
 // mockProxyTapServer satisfies proxy.tap.TapServer
 type mockProxyTapServer struct {
+	proxy.UnimplementedTapServer
 	mockControllerServer mockTapByResourceServer // for cancellation
 	ctx                  context.Context
 }
@@ -91,7 +92,7 @@ status:
 			},
 		},
 		{
-			err: status.Errorf(codes.NotFound, "no pods to tap for pod/emojivoto-not-meshed\n"),
+			err: status.Errorf(codes.NotFound, "no pods to tap for type=\"pod\" name=\"emojivoto-not-meshed\"\n"),
 			k8sRes: []string{`
 apiVersion: v1
 kind: Pod
@@ -157,7 +158,7 @@ status:
 			},
 		},
 		{
-			err: status.Errorf(codes.NotFound, "no pods to tap for pod/emojivoto-meshed\n"),
+			err: status.Errorf(codes.NotFound, "no pods to tap for type=\"pod\" name=\"emojivoto-meshed\"\n"),
 			k8sRes: []string{`
 apiVersion: v1
 kind: Pod
@@ -185,7 +186,7 @@ status:
 			},
 		},
 		{
-			err: status.Errorf(codes.NotFound, `no pods to tap for pod/emojivoto-meshed-tap-disabled
+			err: status.Errorf(codes.NotFound, `no pods to tap for type="pod" name="emojivoto-meshed-tap-disabled"
 1 pods found with tap disabled via the viz.linkerd.io/disable-tap annotation:
 	* emojivoto-meshed-tap-disabled
 remove this annotation to make these pods valid tap targets
@@ -223,7 +224,7 @@ status:
 			},
 		},
 		{
-			err: status.Errorf(codes.NotFound, `no pods to tap for pod/emojivoto-meshed-tap-not-enabled
+			err: status.Errorf(codes.NotFound, `no pods to tap for type="pod" name="emojivoto-meshed-tap-not-enabled"
 1 pods found with tap not enabled:
 	* emojivoto-meshed-tap-not-enabled
 restart these pods to enable tap and make them valid tap targets
@@ -395,7 +396,7 @@ status:
 			}
 			proxy.RegisterTapServer(s, &mockProxyTapServer)
 
-			lis, err := net.Listen("tcp", ":0")
+			lis, err := net.Listen("tcp", "localhost:0")
 			if err != nil {
 				t.Fatalf("Failed to listen")
 			}
@@ -424,7 +425,7 @@ status:
 				t.Fatalf("Invalid port: %s", port)
 			}
 
-			fakeGrpcServer := newGRPCTapServer(uint(tapPort), "controller-ns", "cluster.local", k8sAPI)
+			fakeGrpcServer := newGRPCTapServer(uint(tapPort), "controller-ns", "cluster.local", k8sAPI, nil)
 
 			k8sAPI.Sync(nil)
 
@@ -445,9 +446,8 @@ status:
 				if !ok {
 					t.Fatalf("FromIncomingContext failed given: %+v", mockProxyTapServer.ctx)
 				}
-
-				if !reflect.DeepEqual(md.Get(pkgK8s.RequireIDHeader), []string{exp.requireID}) {
-					t.Fatalf("Unexpected l5d-require-id header [%+v] expected [%+v]", md.Get(pkgK8s.RequireIDHeader), []string{exp.requireID})
+				if diff := deep.Equal(md.Get(pkgK8s.RequireIDHeader), []string{exp.requireID}); diff != nil {
+					t.Fatalf("Unexpected l5d-require-id header: %+v", diff)
 				}
 			}
 
@@ -663,17 +663,17 @@ status:
 			if err != nil {
 				t.Fatalf("NewFakeAPI returned an error: %s", err)
 			}
-			s := NewGrpcTapServer(4190, "controller-ns", "cluster.local", k8sAPI)
+			s, _ := NewGrpcTapServer(4190, "controller-ns", "cluster.local", k8sAPI, nil)
 			k8sAPI.Sync(nil)
 
 			labels := make(map[string]string)
-			ip, err := addr.ParsePublicIPV4(exp.requestedIP)
+			ip, err := addr.ParsePublicIP(exp.requestedIP)
 			if err != nil {
 				t.Fatalf("Error parsing IP %s: %s", exp.requestedIP, err)
 			}
 			s.hydrateIPLabels(ctx, ip, labels)
-			if !reflect.DeepEqual(labels, exp.labels) {
-				t.Fatalf("Unexpected labels: [%#v], expected: [%#v]", labels, exp.labels)
+			if diff := deep.Equal(labels, exp.labels); diff != nil {
+				t.Fatalf("Unexpected labels: %+v", diff)
 			}
 		})
 	}

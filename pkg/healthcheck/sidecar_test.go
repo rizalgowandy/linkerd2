@@ -1,9 +1,9 @@
 package healthcheck
 
 import (
-	"reflect"
 	"testing"
 
+	"github.com/go-test/deep"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -37,6 +37,16 @@ func TestHasExistingSidecars(t *testing.T) {
 		{
 			podSpec: &corev1.PodSpec{
 				Containers: []corev1.Container{
+					{
+						Name: k8s.ProxyContainerName,
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			podSpec: &corev1.PodSpec{
+				InitContainers: []corev1.Container{
 					{
 						Name: k8s.ProxyContainerName,
 					},
@@ -98,7 +108,7 @@ func TestHasExistingSidecars(t *testing.T) {
 			podSpec: &corev1.PodSpec{
 				InitContainers: []corev1.Container{
 					{
-						Image: "cr.l5d.io/linkerd/proxy-init:1.0.0",
+						Image: "cr.l5d.io/linkerd/proxy:1.0.0",
 					},
 				},
 			},
@@ -115,8 +125,8 @@ func TestHasExistingSidecars(t *testing.T) {
 			expected: true,
 		},
 	} {
-		if !reflect.DeepEqual(HasExistingSidecars(tc.podSpec), tc.expected) {
-			t.Errorf("expected: %v, got: %v", tc.expected, HasExistingSidecars(tc.podSpec))
+		if diff := deep.Equal(tc.expected, HasExistingSidecars(tc.podSpec)); diff != nil {
+			t.Errorf("%+v", diff)
 		}
 	}
 }

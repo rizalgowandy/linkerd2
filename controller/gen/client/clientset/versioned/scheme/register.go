@@ -19,6 +19,16 @@ limitations under the License.
 package scheme
 
 import (
+	externalworkloadv1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/externalworkload/v1beta1"
+	linkv1alpha1 "github.com/linkerd/linkerd2/controller/gen/apis/link/v1alpha1"
+	linkv1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/link/v1alpha2"
+	linkv1alpha3 "github.com/linkerd/linkerd2/controller/gen/apis/link/v1alpha3"
+	policyv1alpha1 "github.com/linkerd/linkerd2/controller/gen/apis/policy/v1alpha1"
+	policyv1beta3 "github.com/linkerd/linkerd2/controller/gen/apis/policy/v1beta3"
+	serverv1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta1"
+	serverv1beta2 "github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta2"
+	serverv1beta3 "github.com/linkerd/linkerd2/controller/gen/apis/server/v1beta3"
+	serverauthorizationv1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/serverauthorization/v1beta1"
 	linkerdv1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
@@ -31,20 +41,30 @@ var Scheme = runtime.NewScheme()
 var Codecs = serializer.NewCodecFactory(Scheme)
 var ParameterCodec = runtime.NewParameterCodec(Scheme)
 var localSchemeBuilder = runtime.SchemeBuilder{
+	externalworkloadv1beta1.AddToScheme,
+	linkv1alpha1.AddToScheme,
+	linkv1alpha2.AddToScheme,
+	linkv1alpha3.AddToScheme,
+	policyv1alpha1.AddToScheme,
+	policyv1beta3.AddToScheme,
+	serverv1beta1.AddToScheme,
+	serverv1beta2.AddToScheme,
+	serverv1beta3.AddToScheme,
+	serverauthorizationv1beta1.AddToScheme,
 	linkerdv1alpha2.AddToScheme,
 }
 
 // AddToScheme adds all types of this clientset into the given scheme. This allows composition
 // of clientsets, like in:
 //
-//   import (
-//     "k8s.io/client-go/kubernetes"
-//     clientsetscheme "k8s.io/client-go/kubernetes/scheme"
-//     aggregatorclientsetscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
-//   )
+//	import (
+//	  "k8s.io/client-go/kubernetes"
+//	  clientsetscheme "k8s.io/client-go/kubernetes/scheme"
+//	  aggregatorclientsetscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
+//	)
 //
-//   kclientset, _ := kubernetes.NewForConfig(c)
-//   _ = aggregatorclientsetscheme.AddToScheme(clientsetscheme.Scheme)
+//	kclientset, _ := kubernetes.NewForConfig(c)
+//	_ = aggregatorclientsetscheme.AddToScheme(clientsetscheme.Scheme)
 //
 // After this, RawExtensions in Kubernetes types will serialize kube-aggregator types
 // correctly.

@@ -1,14 +1,14 @@
 import _cloneDeep from 'lodash/cloneDeep';
 import _each from 'lodash/each';
+import { expect } from 'chai';
 import nsFixtures from '../../test/fixtures/namespaces.json';
 import podFixtures from '../../test/fixtures/podRollup.json';
-import { routerWrap } from '../../test/testHelpers.jsx';
+import { i18nAndRouterWrap } from '../../test/testHelpers.jsx';
 import ServiceMesh from './ServiceMesh.jsx';
 import sinon from 'sinon';
 import sinonStubPromise from 'sinon-stub-promise';
 import Spinner from './util/Spinner.jsx';
 import { mount } from 'enzyme';
-import { i18nWrap } from '../../test/testHelpers.jsx';
 
 sinonStubPromise(sinon);
 
@@ -42,19 +42,19 @@ describe('ServiceMesh', () => {
       statusText: errorMsg
     });
 
-    component = mount(routerWrap(ServiceMesh));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
     return withPromise(() => {
-      expect(component).toIncludeText(errorMsg);
+      expect(component.html()).to.include(errorMsg);
     });
   });
 
   it("renders the spinner before metrics are loaded", () => {
-    component = mount(routerWrap(ServiceMesh));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
-    expect(component.find(Spinner)).toHaveLength(1);
-    expect(component.find("ServiceMesh")).toHaveLength(1);
-    expect(component.find("CallToAction")).toHaveLength(0);
+    expect(component.find(Spinner)).to.have.length(1);
+    expect(component.find("ServiceMesh")).to.have.length(1);
+    expect(component.find("CallToAction")).to.have.length(0);
   });
 
   it("renders a call to action if no metrics are received", () => {
@@ -62,14 +62,14 @@ describe('ServiceMesh', () => {
       ok: true,
       json: () => Promise.resolve({ metrics: [] })
     });
-    component = mount(routerWrap(ServiceMesh));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
     return withPromise(() => {
       component.update();
 
-      expect(component.find("ServiceMesh")).toHaveLength(1);
-      expect(component.find(Spinner)).toHaveLength(0);
-      expect(component.find("CallToAction")).toHaveLength(1);
+      expect(component.find("ServiceMesh")).to.have.length(1);
+      expect(component.find(Spinner)).to.have.length(0);
+      expect(component.find("CallToAction")).to.have.length(1);
     });
   });
 
@@ -78,12 +78,12 @@ describe('ServiceMesh', () => {
       ok: true,
       json: () => Promise.resolve(podFixtures)
     });
-    component = mount(routerWrap(ServiceMesh));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
     return withPromise(() => {
       component.update();
-      expect(component.find("ServiceMesh")).toHaveLength(1);
-      expect(component.find(Spinner)).toHaveLength(0);
+      expect(component.find("ServiceMesh")).to.have.length(1);
+      expect(component.find(Spinner)).to.have.length(0);
     });
   });
 
@@ -92,14 +92,14 @@ describe('ServiceMesh', () => {
       ok: true,
       json: () => Promise.resolve({ metrics: [] })
     });
-    component = mount(i18nWrap(routerWrap(ServiceMesh)));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
     return withPromise(() => {
       component.update();
-      expect(component.find("ServiceMesh")).toHaveLength(1);
-      expect(component.find(Spinner)).toHaveLength(0);
-      expect(component).toIncludeText("Service mesh details");
-      expect(component).toIncludeText("ShinyProductName version");
+      expect(component.find("ServiceMesh")).to.have.length(1);
+      expect(component.find(Spinner)).to.have.length(0);
+      expect(component.html()).to.include("Service mesh details");
+      expect(component.html()).to.include("ShinyProductName version");
     });
   });
 
@@ -108,13 +108,13 @@ describe('ServiceMesh', () => {
       ok: true,
       json: () => Promise.resolve({ metrics: [] })
     });
-    component = mount(i18nWrap(routerWrap(ServiceMesh)));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
     return withPromise(() => {
       component.update();
-      expect(component.find("ServiceMesh")).toHaveLength(1);
-      expect(component.find(Spinner)).toHaveLength(0);
-      expect(component).toIncludeText("Control plane");
+      expect(component.find("ServiceMesh")).to.have.length(1);
+      expect(component.find(Spinner)).to.have.length(0);
+      expect(component.html()).to.include("Control plane");
     });
   });
 
@@ -123,13 +123,13 @@ describe('ServiceMesh', () => {
       ok: true,
       json: () => Promise.resolve({ metrics: [] })
     });
-    component = mount(i18nWrap(routerWrap(ServiceMesh)));
+    component = mount(i18nAndRouterWrap(ServiceMesh));
 
     return withPromise(() => {
       component.update();
-      expect(component.find("ServiceMesh")).toHaveLength(1);
-      expect(component.find(Spinner)).toHaveLength(0);
-      expect(component).toIncludeText("Data plane");
+      expect(component.find("ServiceMesh")).to.have.length(1);
+      expect(component.find(Spinner)).to.have.length(0);
+      expect(component.html()).to.include("Data plane");
     });
   });
 
@@ -139,10 +139,10 @@ describe('ServiceMesh', () => {
         ok: true,
         json: () => Promise.resolve({})
       });
-      component = mount(i18nWrap(routerWrap(ServiceMesh)));
+      component = mount(i18nAndRouterWrap(ServiceMesh));
 
       return withPromise(() => {
-        expect(component).toIncludeText("No namespaces detected");
+        expect(component.html()).to.include("No namespaces detected");
       });
     });
 
@@ -164,30 +164,30 @@ describe('ServiceMesh', () => {
         ok: true,
         json: () => Promise.resolve(nsAllResourcesAdded)
       });
-      component = mount(i18nWrap(routerWrap(ServiceMesh)));
+      component = mount(i18nAndRouterWrap(ServiceMesh));
 
       return withPromise(() => {
-        expect(component).toIncludeText("4 namespaces have no meshed resources.");
+        expect(component.html()).to.include("2 namespaces have no meshed resources.");
       });
     });
 
     it("displays a message if 1 resource has not added to servicemesh", () => {
       let nsOneResourceNotAdded = _cloneDeep(nsFixtures);
-      _each(nsOneResourceNotAdded.ok.statTables[0].podGroup.rows, row => {
+      nsOneResourceNotAdded.ok.statTables[0].podGroup.rows.forEach(row => {
         // set all namespaces to have fully meshed pod counts, except one
-        if (row.resource.name !== "default") {
+        if (row.resource.name !== "shiny-product-unmeshed") {
           row.meshedPodCount = "10";
           row.runningPodCount = "10";
         }
-      });
+      })
       fetchStub.resolves({
         ok: true,
         json: () => Promise.resolve(nsOneResourceNotAdded)
       });
-      component = mount(i18nWrap(routerWrap(ServiceMesh)));
+      component = mount(i18nAndRouterWrap(ServiceMesh));
 
       return withPromise(() => {
-        expect(component).toIncludeText("1 namespace has no meshed resources.");
+        expect(component.html()).to.include("1 namespace has no meshed resources.");
       });
     });
 
@@ -201,10 +201,10 @@ describe('ServiceMesh', () => {
         ok: true,
         json: () => Promise.resolve(nsAllResourcesAdded)
       });
-      component = mount(i18nWrap(routerWrap(ServiceMesh)));
+      component = mount(i18nAndRouterWrap(ServiceMesh));
 
       return withPromise(() => {
-        expect(component).toIncludeText("All namespaces have a ShinyProductName install.");
+        expect(component.html()).to.include("All namespaces have a ShinyProductName install.");
       });
     });
   });

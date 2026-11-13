@@ -2,7 +2,11 @@
 
 set -eu
 
-helmversion=v3.2.1
+if command -v helm >/dev/null ; then
+    exec helm "$@"
+fi
+
+helmversion=v3.18.4
 bindir=$( cd "${0%/*}" && pwd )
 targetbin=$( cd "$bindir"/.. && pwd )/target/bin
 helmbin=$targetbin/helm-$helmversion
@@ -15,16 +19,16 @@ if [ ! -f "$helmbin" ]; then
         os=linux
         case $(uname -m) in
             x86_64) arch=amd64 ;;
-            arm) dpkg --print-architecture | grep -q arm64 && arch=arm64 || arch=arm ;;
+            arm) dpkg --print-architecture | grep -q arm64 && arch=arm64 ;;
         esac
     fi
-    helmcurl="https://get.helm.sh/helm-$helmversion-$os-$arch.tar.gz"
+    helmcurl=https://get.helm.sh/helm-$helmversion-$os-$arch.tar.gz
     targetdir=$os-$arch
     tmp=$(mktemp -d -t helm.XXX)
     mkdir -p "$targetbin"
     (
         cd "$tmp"
-        curl -Lsf -o "./helm.tar.gz" "$helmcurl"
+        "$bindir"/scurl -o "./helm.tar.gz" "$helmcurl"
         tar zf "./helm.tar.gz" -x "$targetdir"
         chmod +x "$targetdir/helm"
     )

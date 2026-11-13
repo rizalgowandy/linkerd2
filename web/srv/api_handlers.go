@@ -11,8 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
 	"github.com/gorilla/websocket"
 	"github.com/julienschmidt/httprouter"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
@@ -23,6 +21,9 @@ import (
 	tapPb "github.com/linkerd/linkerd2/viz/tap/gen/tap"
 	tappkg "github.com/linkerd/linkerd2/viz/tap/pkg"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
@@ -39,11 +40,16 @@ type (
 
 var (
 	defaultResourceType = k8s.Deployment
-	pbMarshaler         = jsonpb.Marshaler{EmitDefaults: true}
+	pbMarshaler         = protojson.MarshalOptions{EmitUnpopulated: true}
 	maxMessageSize      = 2048
 	websocketUpgrader   = websocket.Upgrader{
 		ReadBufferSize:  maxMessageSize,
 		WriteBufferSize: maxMessageSize,
+		// Only allows requests from the same host, to prevent CSRF attacks.
+		// This is the default behavior in gorilla/websocket even if the
+		// CheckOrigin field is not set, but we make it explicit here as a good
+		// practice, avoiding relying on default behavior.
+		CheckOrigin: checkSameOrigin,
 	}
 
 	// Checks whose description matches the following regexp won't be included
@@ -75,7 +81,11 @@ func renderJSON(w http.ResponseWriter, resp interface{}) {
 
 func renderJSONPb(w http.ResponseWriter, msg proto.Message) {
 	w.Header().Set("Content-Type", "application/json")
-	pbMarshaler.Marshal(w, msg)
+	json, err := pbMarshaler.Marshal(msg)
+	if err != nil {
+		renderJSONError(w, err, http.StatusBadRequest)
+	}
+	w.Write(json)
 }
 
 func renderJSONBytes(w http.ResponseWriter, b []byte) {
@@ -167,11 +177,14 @@ func (h *handler) handleAPIStat(w http.ResponseWriter, req *http.Request, p http
 	}
 
 	// Marshal result into json and cache it
-	var resultJSON bytes.Buffer
-	if err := pbMarshaler.Marshal(&resultJSON, result); err != nil {
+	json, err := pbMarshaler.Marshal(result)
+	if err != nil {
 		renderJSONError(w, err, http.StatusInternalServerError)
 		return
 	}
+	var resultJSON bytes.Buffer
+	resultJSON.Write(json)
+
 	h.statCache.SetDefault(req.URL.RawQuery, resultJSON.Bytes())
 
 	renderJSONBytes(w, resultJSON.Bytes())
@@ -269,7 +282,8 @@ func (h *handler) handleAPITap(w http.ResponseWriter, req *http.Request, p httpr
 			// If there was a [403] error when initiating a tap, close the
 			// socket with `ClosePolicyViolation` status code so that the error
 			// renders without the error prefix in the banner
-			if httpErr, ok := err.(protohttp.HTTPError); ok && httpErr.Code == http.StatusForbidden {
+			var he protohttp.HTTPError
+			if errors.Is(err, &he) && he.Code == http.StatusForbidden {
 				err := fmt.Errorf("missing authorization, visit %s to remedy", tappkg.TapRbacURL)
 				websocketError(ws, websocket.ClosePolicyViolation, err)
 				return
@@ -285,20 +299,21 @@ func (h *handler) handleAPITap(w http.ResponseWriter, req *http.Request, p httpr
 		for {
 			event := tapPb.TapEvent{}
 			err := protohttp.FromByteStreamToProtocolBuffers(reader, &event)
-			if err == io.EOF {
-				break
-			}
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
 				websocketError(ws, websocket.CloseInternalServerErr, err)
 				break
 			}
 
-			buf := new(bytes.Buffer)
-			err = pbMarshaler.Marshal(buf, &event)
+			json, err := pbMarshaler.Marshal(&event)
 			if err != nil {
-				websocketError(ws, websocket.CloseInternalServerErr, err)
+				websocketError(ws, websocket.CloseUnsupportedData, err)
 				break
 			}
+			buf := new(bytes.Buffer)
+			buf.Write(json)
 
 			if err := ws.WriteMessage(websocket.TextMessage, buf.Bytes()); err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure) {
@@ -371,7 +386,7 @@ func (h *handler) handleAPICheck(w http.ResponseWriter, req *http.Request, p htt
 	}
 	// TODO (tegioz): ignore runchecks results until we stop filtering checks
 	// in this method (see #3670 for more details)
-	_ = h.hc.RunChecks(collectResults)
+	_, _ = h.hc.RunChecks(collectResults)
 
 	renderJSON(w, map[string]interface{}{
 		"success": success,
@@ -388,7 +403,7 @@ func (h *handler) handleAPIResourceDefinition(w http.ResponseWriter, req *http.R
 		}
 	}
 	if len(missingParams) != 0 {
-		renderJSONError(w, fmt.Errorf("Required params not provided: %s", strings.Join(missingParams, ", ")), http.StatusBadRequest)
+		renderJSONError(w, fmt.Errorf("required params not provided: %s", strings.Join(missingParams, ", ")), http.StatusBadRequest)
 		return
 	}
 
@@ -406,6 +421,8 @@ func (h *handler) handleAPIResourceDefinition(w http.ResponseWriter, req *http.R
 		resource, err = h.k8sAPI.AppsV1().DaemonSets(namespace).Get(req.Context(), resourceName, options)
 	case k8s.Deployment:
 		resource, err = h.k8sAPI.AppsV1().Deployments(namespace).Get(req.Context(), resourceName, options)
+	case k8s.Service:
+		resource, err = h.k8sAPI.CoreV1().Services(namespace).Get(req.Context(), resourceName, options)
 	case k8s.Job:
 		resource, err = h.k8sAPI.BatchV1().Jobs(namespace).Get(req.Context(), resourceName, options)
 	case k8s.Pod:
@@ -414,8 +431,6 @@ func (h *handler) handleAPIResourceDefinition(w http.ResponseWriter, req *http.R
 		resource, err = h.k8sAPI.CoreV1().ReplicationControllers(namespace).Get(req.Context(), resourceName, options)
 	case k8s.ReplicaSet:
 		resource, err = h.k8sAPI.AppsV1().ReplicaSets(namespace).Get(req.Context(), resourceName, options)
-	case k8s.TrafficSplit:
-		resource, err = h.k8sAPI.TsClient.SplitV1alpha1().TrafficSplits(namespace).Get(req.Context(), resourceName, options)
 	default:
 		renderJSONError(w, errors.New("Invalid resource type: "+resourceType), http.StatusBadRequest)
 		return
@@ -434,23 +449,54 @@ func (h *handler) handleAPIResourceDefinition(w http.ResponseWriter, req *http.R
 	w.Write(resourceDefinition)
 }
 
-func (h *handler) handleGetExtension(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+func (h *handler) handleGetExtensions(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
 	ctx := req.Context()
 	extensionName := req.FormValue("extension_name")
 
+	type Extension struct {
+		Name      string `json:"name"`
+		UID       string `json:"uid"`
+		Namespace string `json:"namespace"`
+	}
+
 	resp := map[string]interface{}{}
-	ns, err := h.k8sAPI.GetNamespaceWithExtensionLabel(ctx, extensionName)
-	if err != nil && strings.HasPrefix(err.Error(), "could not find") {
+	if extensionName != "" {
+		ns, err := h.k8sAPI.GetNamespaceWithExtensionLabel(ctx, extensionName)
+		if err != nil && kerrors.IsNotFound(err) {
+			renderJSON(w, resp)
+			return
+		} else if err != nil {
+			renderJSONError(w, err, http.StatusInternalServerError)
+			return
+		}
+
+		resp["data"] = Extension{
+			UID:       string(ns.UID),
+			Name:      ns.GetLabels()[k8s.LinkerdExtensionLabel],
+			Namespace: ns.Name,
+		}
+
 		renderJSON(w, resp)
 		return
-	} else if err != nil {
+	}
+
+	installedExtensions, err := h.k8sAPI.GetAllNamespacesWithExtensionLabel(ctx)
+	if err != nil {
 		renderJSONError(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	resp["extensionName"] = ns.GetLabels()[k8s.LinkerdExtensionLabel]
-	resp["namespace"] = ns.Name
+	extensionList := make([]Extension, len(installedExtensions))
 
+	for i, installedExtension := range installedExtensions {
+		extensionList[i] = Extension{
+			UID:       string(installedExtension.GetObjectMeta().GetUID()),
+			Name:      installedExtension.GetLabels()[k8s.LinkerdExtensionLabel],
+			Namespace: installedExtension.GetName(),
+		}
+	}
+
+	resp["extensions"] = extensionList
 	renderJSON(w, resp)
 }
 

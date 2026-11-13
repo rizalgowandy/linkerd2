@@ -46,9 +46,9 @@ class ErrorModal extends React.Component {
     this.setState({
       truncateErrors: !truncateErrors,
     });
-  }
+  };
 
-  processErrorData = errorsByPod => {
+  static processErrorData(errorsByPod) {
     let shouldTruncate = false;
 
     const byPodAndContainer = _map(errorsByPod, (podErrors, pod) => {
@@ -93,7 +93,7 @@ class ErrorModal extends React.Component {
         <Grid
           container
           direction="row"
-          justify="space-between"
+          justifyContent="space-between"
           alignItems="center">
           <Grid item>
             <Typography variant="subtitle1" gutterBottom>{container}</Typography>
@@ -136,7 +136,7 @@ class ErrorModal extends React.Component {
         </div>
       );
     });
-  }
+  };
 
   renderStatusIcon = errors => {
     let showInit = true;
@@ -160,12 +160,12 @@ class ErrorModal extends React.Component {
         <ErrorIcon color="error" fontSize="small" onClick={this.handleClickOpen} />
       );
     }
-  }
+  };
 
   render() {
     const { open, scroll, truncateErrors } = this.state;
     const { resourceType, resourceName, errors } = this.props;
-    const errorData = this.processErrorData(errors);
+    const errorData = ErrorModal.processErrorData(errors);
 
     return (
       <React.Fragment>

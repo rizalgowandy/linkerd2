@@ -1,22 +1,12 @@
 import { Plural, Trans } from '@lingui/macro';
 import { formatDistanceToNow, subSeconds } from 'date-fns';
-import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
-import BaseTable from './BaseTable.jsx';
-import CallToAction from './CallToAction.jsx';
 import Card from '@material-ui/core/Card';
 import CardContent from '@material-ui/core/CardContent';
-import CheckModal from './CheckModal.jsx';
-import ErrorBanner from './ErrorBanner.jsx';
 import Grid from '@material-ui/core/Grid';
-import MeshedStatusTable from './MeshedStatusTable.jsx';
-import Percentage from './util/Percentage.js';
 import PropTypes from 'prop-types';
 import React from 'react';
-import Spinner from './util/Spinner.jsx';
-import StatusTable from './StatusTable.jsx';
 import Typography from '@material-ui/core/Typography';
 import _compact from 'lodash/compact';
-import _countBy from 'lodash/countBy';
 import _filter from 'lodash/filter';
 import _get from 'lodash/get';
 import _groupBy from 'lodash/groupBy';
@@ -24,15 +14,35 @@ import _isEmpty from 'lodash/isEmpty';
 import _map from 'lodash/map';
 import _mapKeys from 'lodash/mapKeys';
 import _sumBy from 'lodash/sumBy';
+import { withStyles } from '@material-ui/core/styles';
 import { incompleteMeshMessage } from './util/CopyUtils.jsx';
 import { withContext } from './util/AppContext.jsx';
-import { withStyles } from '@material-ui/core/styles';
+import StatusTable from './StatusTable.jsx';
+import Spinner from './util/Spinner.jsx';
+import Percentage from './util/Percentage.js';
+import MeshedStatusTable from './MeshedStatusTable.jsx';
+import ErrorBanner from './ErrorBanner.jsx';
+import CheckModal from './CheckModal.jsx';
+import CallToAction from './CallToAction.jsx';
+import BaseTable from './BaseTable.jsx';
+import { handlePageVisibility, withPageVisibility } from './util/PageVisibility.jsx';
 
 const styles = {
   checkModalWrapper: {
     width: '100%',
   },
 };
+
+const installedExtensionsColumn = [
+  {
+    title: <Trans>columnTitleName</Trans>,
+    dataIndex: 'name',
+  },
+  {
+    title: <Trans>columnTitleNamespace</Trans>,
+    dataIndex: 'namespace',
+  },
+];
 
 const serviceMeshDetailsColumns = [
   {
@@ -72,6 +82,7 @@ class ServiceMesh extends React.Component {
     this.state = {
       pollingInterval: 2000,
       components: [],
+      extensions: [],
       nsStatuses: [],
       pendingRequests: false,
       loaded: false,
@@ -81,6 +92,7 @@ class ServiceMesh extends React.Component {
 
   componentDidMount() {
     this.startServerPolling();
+    this.fetchAllInstalledExtensions();
   }
 
   componentDidUpdate(prevProps) {
@@ -109,7 +121,13 @@ class ServiceMesh extends React.Component {
     ];
   }
 
-  getControllerComponentData = podData => {
+  getInstalledExtensions() {
+    const { extensions } = this.state;
+    const extensionList = !_isEmpty(extensions.extensions) ? extensions.extensions : [];
+    return extensionList;
+  }
+
+  static getControllerComponentData(podData) {
     const podDataByDeploy = _groupBy(_filter(podData.pods, d => d.controlPlane), p => p.deployment);
     const byDeployName = _mapKeys(podDataByDeploy, (_pods, dep) => dep.split('/')[1]);
 
@@ -143,7 +161,7 @@ class ServiceMesh extends React.Component {
     this.setState({ pendingRequests: false });
   }
 
-  extractNsStatuses = nsData => {
+  static extractNsStatuses(nsData) {
     const podsByNs = _get(nsData, ['ok', 'statTables', 0, 'podGroup', 'rows'], []);
     const dataPlaneNamespaces = podsByNs.map(ns => {
       const meshedPods = parseInt(ns.meshedPodCount, 10);
@@ -177,15 +195,29 @@ class ServiceMesh extends React.Component {
       this.api.fetchMetrics(this.api.urlsForResourceNoStats('namespace')),
     ]);
 
+    // expose serverPromise for testing
+    // eslint-disable-next-line react/no-unused-class-component-methods
     this.serverPromise = Promise.all(this.api.getCurrentPromises())
       .then(([pods, nsStats]) => {
         this.setState({
-          components: this.getControllerComponentData(pods),
-          nsStatuses: this.extractNsStatuses(nsStats),
+          components: ServiceMesh.getControllerComponentData(pods),
+          nsStatuses: ServiceMesh.extractNsStatuses(nsStats),
           pendingRequests: false,
           loaded: true,
           error: null,
         });
+      })
+      .catch(this.handleApiError);
+  }
+
+  fetchAllInstalledExtensions() {
+    this.api.setCurrentRequests([this.api.fetchExtension()]);
+
+    // expose serverPromise for testing
+    // eslint-disable-next-line react/no-unused-class-component-methods
+    this.serverPromise = Promise.all(this.api.getCurrentPromises())
+      .then(([extensions]) => {
+        this.setState({ extensions });
       })
       .catch(this.handleApiError);
   }
@@ -216,7 +248,7 @@ class ServiceMesh extends React.Component {
 
     return (
       <React.Fragment>
-        <Grid container justify="space-between">
+        <Grid container justifyContent="space-between">
           <Grid item xs={3}>
             <Typography variant="h6"><Trans>Control plane</Trans></Typography>
           </Grid>
@@ -230,6 +262,23 @@ class ServiceMesh extends React.Component {
           data={components}
           statusColumnTitle="Pod Status"
           shouldLink={false} />
+      </React.Fragment>
+    );
+  }
+
+  renderInstalledExtensions() {
+    return (
+      <React.Fragment>
+        <Grid container justifyContent="space-between">
+          <Grid item xs={3}>
+            <Typography variant="h6"><Trans>Installed Extensions</Trans></Typography>
+          </Grid>
+        </Grid>
+        <BaseTable
+          tableClassName="metric-table"
+          tableRows={this.getInstalledExtensions()}
+          tableColumns={installedExtensionsColumn}
+          rowKey={d => d.uid} />
       </React.Fragment>
     );
   }
@@ -259,10 +308,11 @@ class ServiceMesh extends React.Component {
     if (_isEmpty(nsStatuses)) {
       message = <Trans>noNamespacesDetectedMsg</Trans>;
     } else {
-      const meshedCount = _countBy(nsStatuses, pod => {
-        return pod.meshedPercent.get() > 0;
-      });
-      numUnadded = meshedCount.false || 0;
+      const unmeshedNamespaces = nsStatuses
+        .filter(pod => pod.meshedPercent.get() <= 0)
+        .filter(pod => pod.totalPods > 0)
+        .filter(pod => pod.namespace !== 'kube-system');
+      numUnadded = unmeshedNamespaces.length ?? 0;
       message = numUnadded === 0 ? <Trans>All namespaces have a {productName} install.</Trans> : (
         <Plural
           value={numUnadded}
@@ -275,7 +325,7 @@ class ServiceMesh extends React.Component {
       <Card elevation={3}>
         <CardContent>
           <Typography variant="body2">{message}</Typography>
-          { numUnadded > 0 ? incompleteMeshMessage() : null }
+          {numUnadded > 0 ? incompleteMeshMessage() : null}
         </CardContent>
       </Card>
     );
@@ -287,8 +337,8 @@ class ServiceMesh extends React.Component {
 
     return (
       <div className="page-content">
-        { !error ? null : <ErrorBanner message={error} /> }
-        { !loaded ? <Spinner /> : (
+        {!error ? null : <ErrorBanner message={error} />}
+        {!loaded ? <Spinner /> : (
           <div>
             {this.proxyCount() === 0 ?
               <CallToAction
@@ -298,6 +348,7 @@ class ServiceMesh extends React.Component {
             <Grid container spacing={3}>
               <Grid item xs={8} container direction="column">
                 <Grid item>{this.renderControlPlaneDetails()}</Grid>
+                <Grid item>{this.renderInstalledExtensions()}</Grid>
                 <Grid item>
                   <MeshedStatusTable tableRows={nsStatuses} />
                 </Grid>

@@ -11,14 +11,16 @@ import (
 	"text/tabwriter"
 
 	"github.com/fatih/color"
-	coreUtil "github.com/linkerd/linkerd2/controller/api/util"
 	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
+	"github.com/linkerd/linkerd2/pkg/k8s"
 	pb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
 	"github.com/linkerd/linkerd2/viz/metrics-api/util"
-	"github.com/linkerd/linkerd2/viz/pkg"
 	"github.com/linkerd/linkerd2/viz/pkg/api"
+	hc "github.com/linkerd/linkerd2/viz/pkg/healthcheck"
+	pkgUtil "github.com/linkerd/linkerd2/viz/pkg/util"
 	"github.com/spf13/cobra"
+	v1 "k8s.io/api/core/v1"
 )
 
 var (
@@ -83,8 +85,37 @@ func NewCmdEdges() *cobra.Command {
 
   # Get all edges between pods in all namespaces.
   linkerd viz edges po --all-namespaces`,
-		Args:      cobra.ExactArgs(1),
-		ValidArgs: pkg.ValidTargets,
+		Args: cobra.ExactArgs(1),
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			// This command requires only one argument. If we already have
+			// one after requesting autocompletion i.e. [tab][tab]
+			// skip running validArgsFunction
+			if len(args) > 0 {
+				return []string{}, cobra.ShellCompDirectiveError
+			}
+
+			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			if options.namespace == "" {
+				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
+			}
+
+			if options.allNamespaces {
+				options.namespace = v1.NamespaceAll
+			}
+
+			cc := k8s.NewCommandCompletion(k8sAPI, options.namespace)
+
+			results, err := cc.Complete(args, toComplete)
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+
+			return results, cobra.ShellCompDirectiveDefault
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if options.namespace == "" {
 				options.namespace = pkgcmd.GetDefaultNamespace(kubeconfigPath, kubeContext)
@@ -92,18 +123,21 @@ func NewCmdEdges() *cobra.Command {
 
 			reqs, err := buildEdgesRequests(args, options)
 			if err != nil {
-				return fmt.Errorf("Error creating edges request: %s", err)
+				return fmt.Errorf("Error creating edges request: %w", err)
 			}
 
 			// The gRPC client is concurrency-safe, so we can reuse it in all the following goroutines
 			// https://github.com/grpc/grpc-go/issues/682
-			client := api.CheckClientOrExit(healthcheck.Options{
-				ControlPlaneNamespace: controlPlaneNamespace,
-				KubeConfig:            kubeconfigPath,
-				Impersonate:           impersonate,
-				ImpersonateGroup:      impersonateGroup,
-				KubeContext:           kubeContext,
-				APIAddr:               apiAddr,
+			client := api.CheckClientOrExit(hc.VizOptions{
+				Options: &healthcheck.Options{
+					ControlPlaneNamespace: controlPlaneNamespace,
+					KubeConfig:            kubeconfigPath,
+					Impersonate:           impersonate,
+					ImpersonateGroup:      impersonateGroup,
+					KubeContext:           kubeContext,
+					APIAddr:               apiAddr,
+				},
+				VizNamespaceOverride: vizNamespace,
 			})
 
 			c := make(chan indexedEdgeResults, len(reqs))
@@ -138,6 +172,10 @@ func NewCmdEdges() *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&options.namespace, "namespace", "n", options.namespace, "Namespace of the specified resource")
 	cmd.PersistentFlags().StringVarP(&options.outputFormat, "output", "o", options.outputFormat, "Output format; one of: \"table\" or \"json\" or \"wide\"")
 	cmd.PersistentFlags().BoolVarP(&options.allNamespaces, "all-namespaces", "A", options.allNamespaces, "If present, returns edges across all namespaces, ignoring the \"--namespace\" flag")
+
+	pkgcmd.ConfigureNamespaceFlagCompletion(
+		cmd, []string{"namespace"},
+		kubeconfigPath, impersonate, impersonateGroup, kubeContext)
 	return cmd
 }
 
@@ -163,7 +201,7 @@ func validateEdgesRequestInputs(targets []*pb.Resource, options *edgesOptions) e
 }
 
 func buildEdgesRequests(resources []string, options *edgesOptions) ([]*pb.EdgesRequest, error) {
-	targets, err := coreUtil.BuildResources(options.namespace, resources)
+	targets, err := pkgUtil.BuildResources(options.namespace, resources)
 
 	if err != nil {
 		return nil, err
@@ -201,10 +239,10 @@ func edgesRespToRows(resp *pb.EdgesResponse) []*pb.Edge {
 func requestEdgesFromAPI(client pb.ApiClient, req *pb.EdgesRequest) (*pb.EdgesResponse, error) {
 	resp, err := client.Edges(context.Background(), req)
 	if err != nil {
-		return nil, fmt.Errorf("Edges API error: %+v", err)
+		return nil, fmt.Errorf("Edges API error: %w", err)
 	}
 	if e := resp.GetError(); e != nil {
-		return nil, fmt.Errorf("Edges API response error: %+v", e.Error)
+		return nil, fmt.Errorf("Edges API response error: %s", e.Error)
 	}
 	return resp, nil
 }
@@ -248,56 +286,54 @@ func writeEdgesToBuffer(rows []*pb.Edge, w *tabwriter.Writer, options *edgesOpti
 	maxMsgLength := len(msgHeader)
 
 	edgeRows := []edgeRow{}
-	if len(rows) != 0 {
-		for _, r := range rows {
-			clientID := r.ClientId
-			serverID := r.ServerId
-			msg := r.NoIdentityMsg
-			if msg == "" && options.outputFormat != jsonOutput {
-				msg = okStatus
-			}
-			if len(clientID) > 0 {
-				parts := strings.Split(clientID, ".")
-				clientID = parts[0] + "." + parts[1]
-			}
-			if len(serverID) > 0 {
-				parts := strings.Split(serverID, ".")
-				serverID = parts[0] + "." + parts[1]
-			}
+	for _, r := range rows {
+		clientID := r.ClientId
+		serverID := r.ServerId
+		msg := r.NoIdentityMsg
+		if msg == "" && options.outputFormat != jsonOutput {
+			msg = okStatus
+		}
+		if len(clientID) > 0 {
+			parts := strings.Split(clientID, ".")
+			clientID = parts[0] + "." + parts[1]
+		}
+		if len(serverID) > 0 {
+			parts := strings.Split(serverID, ".")
+			serverID = parts[0] + "." + parts[1]
+		}
 
-			row := edgeRow{
-				client:       clientID,
-				server:       serverID,
-				msg:          msg,
-				src:          r.Src.Name,
-				srcNamespace: r.Src.Namespace,
-				dst:          r.Dst.Name,
-				dstNamespace: r.Dst.Namespace,
-			}
+		row := edgeRow{
+			client:       clientID,
+			server:       serverID,
+			msg:          msg,
+			src:          r.Src.Name,
+			srcNamespace: r.Src.Namespace,
+			dst:          r.Dst.Name,
+			dstNamespace: r.Dst.Namespace,
+		}
 
-			edgeRows = append(edgeRows, row)
+		edgeRows = append(edgeRows, row)
 
-			if len(r.Src.Name) > maxSrcLength {
-				maxSrcLength = len(r.Src.Name)
-			}
-			if len(r.Src.Namespace) > maxSrcNamespaceLength {
-				maxSrcNamespaceLength = len(r.Src.Namespace)
-			}
-			if len(r.Dst.Name) > maxDstLength {
-				maxDstLength = len(r.Dst.Name)
-			}
-			if len(r.Dst.Namespace) > maxDstNamespaceLength {
-				maxDstNamespaceLength = len(r.Dst.Namespace)
-			}
-			if len(clientID) > maxClientLength {
-				maxClientLength = len(clientID)
-			}
-			if len(serverID) > maxServerLength {
-				maxServerLength = len(serverID)
-			}
-			if len(msg) > maxMsgLength {
-				maxMsgLength = len(msg)
-			}
+		if len(r.Src.Name) > maxSrcLength {
+			maxSrcLength = len(r.Src.Name)
+		}
+		if len(r.Src.Namespace) > maxSrcNamespaceLength {
+			maxSrcNamespaceLength = len(r.Src.Namespace)
+		}
+		if len(r.Dst.Name) > maxDstLength {
+			maxDstLength = len(r.Dst.Name)
+		}
+		if len(r.Dst.Namespace) > maxDstNamespaceLength {
+			maxDstNamespaceLength = len(r.Dst.Namespace)
+		}
+		if len(clientID) > maxClientLength {
+			maxClientLength = len(clientID)
+		}
+		if len(serverID) > maxServerLength {
+			maxServerLength = len(serverID)
+		}
+		if len(msg) > maxMsgLength {
+			maxMsgLength = len(msg)
 		}
 	}
 
@@ -373,7 +409,7 @@ func renderEdges(buffer bytes.Buffer, options *edgesOptions) string {
 	default:
 		// strip left padding on the first column
 		out = string(buffer.Bytes()[padding:])
-		out = strings.Replace(out, "\n"+strings.Repeat(" ", padding), "\n", -1)
+		out = strings.ReplaceAll(out, "\n"+strings.Repeat(" ", padding), "\n")
 	}
 
 	return out

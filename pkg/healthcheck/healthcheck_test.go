@@ -6,24 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/ptypes/duration"
-	configPb "github.com/linkerd/linkerd2/controller/gen/config"
+	"github.com/go-test/deep"
 	"github.com/linkerd/linkerd2/pkg/charts/linkerd2"
 	"github.com/linkerd/linkerd2/pkg/identity"
 	"github.com/linkerd/linkerd2/pkg/issuercerts"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/tls"
-	"github.com/linkerd/linkerd2/testutil"
-	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
-	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 type observer struct {
@@ -79,6 +73,89 @@ func (hc *HealthChecker) addCheckAsCategory(
 		}
 	}
 	hc.AppendCategories(testCategory)
+}
+
+func TestGatewayAPICRDChecks(t *testing.T) {
+	externalGatewayAPIManifest := `---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: httproutes.gateway.networking.k8s.io
+spec:
+  versions:
+    - name: v1
+`
+	unsupportedGatewayAPIManifest := `---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: httproutes.gateway.networking.k8s.io
+spec:
+  versions:
+    - name: v1alpha1
+`
+
+	testCases := []struct {
+		name        string
+		resources   []string
+		wantSuccess bool
+		wantErr     string
+	}{
+		{
+			name:        "passes when Gateway API CRDs are installed",
+			resources:   []string{externalGatewayAPIManifest},
+			wantSuccess: true,
+		},
+		{
+			name:        "fails when Gateway API CRDs are missing",
+			wantSuccess: false,
+			wantErr:     "The Gateway API CRDs must be installed prior to installing Linkerd",
+		},
+		{
+			name:        "fails when Gateway API CRDs do not include v1",
+			resources:   []string{unsupportedGatewayAPIManifest},
+			wantSuccess: false,
+			wantErr:     "missing the v1 version",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc // pin
+		t.Run(tc.name, func(t *testing.T) {
+			hc := NewHealthChecker(
+				[]CategoryID{GatewayAPICRDChecks},
+				&Options{},
+			)
+
+			var err error
+			hc.kubeAPI, err = k8s.NewFakeAPI(tc.resources...)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+
+			var gotErr error
+			success, _ := hc.RunChecks(func(result *CheckResult) {
+				gotErr = result.Err
+			})
+			if success != tc.wantSuccess {
+				t.Fatalf("expected success=%v, got %v", tc.wantSuccess, success)
+			}
+
+			if tc.wantErr == "" {
+				if gotErr != nil {
+					t.Fatalf("expected no error, got %s", gotErr)
+				}
+				return
+			}
+
+			if gotErr == nil {
+				t.Fatalf("expected error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(gotErr.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %q", tc.wantErr, gotErr.Error())
+			}
+		})
+	}
 }
 
 func TestHealthChecker(t *testing.T) {
@@ -147,7 +224,7 @@ func TestHealthChecker(t *testing.T) {
 			{
 				description: "skip",
 				check: func(context.Context) error {
-					return &SkipError{Reason: "needs skipping"}
+					return SkipError{Reason: "needs skipping"}
 				},
 				retryDeadline: time.Time{},
 			},
@@ -161,7 +238,7 @@ func TestHealthChecker(t *testing.T) {
 			{
 				description: "skipRpc",
 				check: func(context.Context) error {
-					return &SkipError{Reason: "needs skipping"}
+					return SkipError{Reason: "needs skipping"}
 				},
 				retryDeadline: time.Time{},
 			},
@@ -202,8 +279,8 @@ func TestHealthChecker(t *testing.T) {
 		obs := newObserver()
 		hc.RunChecks(obs.resultFn)
 
-		if !reflect.DeepEqual(obs.results, expectedResults) {
-			t.Fatalf("Expected results %v, but got %v", expectedResults, obs.results)
+		if diff := deep.Equal(obs.results, expectedResults); diff != nil {
+			t.Fatalf("%+v", diff)
 		}
 	})
 
@@ -215,7 +292,7 @@ func TestHealthChecker(t *testing.T) {
 		hc.AppendCategories(passingCheck1)
 		hc.AppendCategories(passingCheck2)
 
-		success := hc.RunChecks(nullObserver)
+		success, _ := hc.RunChecks(nullObserver)
 
 		if !success {
 			t.Fatalf("Expecting checks to be successful, but got [%t]", success)
@@ -231,7 +308,7 @@ func TestHealthChecker(t *testing.T) {
 		hc.AppendCategories(failingCheck)
 		hc.AppendCategories(passingCheck2)
 
-		success := hc.RunChecks(nullObserver)
+		success, _ := hc.RunChecks(nullObserver)
 
 		if success {
 			t.Fatalf("Expecting checks to not be successful, but got [%t]", success)
@@ -252,8 +329,8 @@ func TestHealthChecker(t *testing.T) {
 		obs := newObserver()
 		hc.RunChecks(obs.resultWithHintFn)
 
-		if !reflect.DeepEqual(obs.results, expectedResults) {
-			t.Fatalf("Expected results %v, but got %v", expectedResults, obs.results)
+		if diff := deep.Equal(obs.results, expectedResults); diff != nil {
+			t.Fatalf("%+v", diff)
 		}
 	})
 
@@ -274,8 +351,8 @@ func TestHealthChecker(t *testing.T) {
 		obs := newObserver()
 		hc.RunChecks(obs.resultFn)
 
-		if !reflect.DeepEqual(obs.results, expectedResults) {
-			t.Fatalf("Expected results %v, but got %v", expectedResults, obs.results)
+		if diff := deep.Equal(obs.results, expectedResults); diff != nil {
+			t.Fatalf("%+v", diff)
 		}
 	})
 
@@ -325,8 +402,8 @@ func TestHealthChecker(t *testing.T) {
 
 		hc.RunChecks(observer)
 
-		if !reflect.DeepEqual(observedResults, expectedResults) {
-			t.Fatalf("Expected results %v, but got %v", expectedResults, observedResults)
+		if diff := deep.Equal(observedResults, expectedResults); diff != nil {
+			t.Fatalf("%+v", diff)
 		}
 	})
 
@@ -346,8 +423,8 @@ func TestHealthChecker(t *testing.T) {
 		obs := newObserver()
 		hc.RunChecks(obs.resultFn)
 
-		if !reflect.DeepEqual(obs.results, expectedResults) {
-			t.Fatalf("Expected results %v, but got %v", expectedResults, obs.results)
+		if diff := deep.Equal(obs.results, expectedResults); diff != nil {
+			t.Fatalf("%+v", diff)
 		}
 	})
 }
@@ -479,658 +556,60 @@ status:
 
 }
 
-func TestCheckCapability(t *testing.T) {
-	tests := []struct {
-		k8sConfigs []string
-		err        error
-	}{
-		{
-			[]string{},
-			nil,
-		},
-		{
-			[]string{`apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
+func TestNamespaceExtCfg(t *testing.T) {
+	namespaces := map[string]string{
+		"vizOne": `
+apiVersion: v1
+kind: Namespace
 metadata:
-  name: restricted
-spec:
-  requiredDropCapabilities:
-    - ALL`,
-			},
-			fmt.Errorf("found 1 PodSecurityPolicies, but none provide TEST_CAP, proxy injection will fail if the PSP admission controller is running"),
-		},
-	}
+  name: viz-1
+  labels:
+    linkerd.io/extension: viz
+`,
+		"mcOne": `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mc-1
+  labels:
+    linkerd.io/extension: multicluster
+`,
+		"mcTwo": `
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mc-2
+  labels:
+    linkerd.io/extension: multicluster
+`}
 
-	for i, test := range tests {
-		test := test // pin
-		t.Run(fmt.Sprintf("%d: returns expected capability result", i), func(t *testing.T) {
-			hc := NewHealthChecker(
-				[]CategoryID{},
-				&Options{},
-			)
-
-			var err error
-			hc.kubeAPI, err = k8s.NewFakeAPI(test.k8sConfigs...)
-			if err != nil {
-				t.Fatalf("Unexpected error: %s", err)
-			}
-
-			err = hc.checkCapability(context.Background(), "TEST_CAP")
-			if err != nil || test.err != nil {
-				if (err == nil && test.err != nil) ||
-					(err != nil && test.err == nil) ||
-					(err.Error() != test.err.Error()) {
-					t.Fatalf("Unexpected error (Expected: %s, Got: %s)", test.err, err)
-				}
-			}
-		})
-	}
-}
-
-func TestConfigExists(t *testing.T) {
 	testCases := []struct {
-		k8sConfigs []string
-		results    []string
+		description string
+		k8sConfigs  []string
+		results     []string
 	}{
 		{
-			[]string{},
-			[]string{"linkerd-config control plane Namespace exists: The \"test-ns\" namespace does not exist"},
-		},
-		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist: missing ClusterRoles: linkerd-test-ns-identity, linkerd-test-ns-proxy-injector",
+			description: "successfully passes checks",
+			k8sConfigs:  []string{namespaces["vizOne"], namespaces["mcOne"]},
+			results: []string{
+				"linkerd-extension-checks namespace configuration for extensions",
 			},
 		},
 		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist",
-				"linkerd-config control plane ClusterRoleBindings exist: missing ClusterRoleBindings: linkerd-test-ns-identity, linkerd-test-ns-proxy-injector",
-			},
-		},
-		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-destination
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-identity
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-proxy-injector
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-heartbeat
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist",
-				"linkerd-config control plane ClusterRoleBindings exist",
-				"linkerd-config control plane ServiceAccounts exist",
-				"linkerd-config control plane CustomResourceDefinitions exist: missing CustomResourceDefinitions: serviceprofiles.linkerd.io",
-			},
-		},
-		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-destination
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-identity
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-proxy-injector
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-heartbeat
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-web
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: serviceprofiles.linkerd.io
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist",
-				"linkerd-config control plane ClusterRoleBindings exist",
-				"linkerd-config control plane ServiceAccounts exist",
-				"linkerd-config control plane CustomResourceDefinitions exist",
-				"linkerd-config control plane MutatingWebhookConfigurations exist: missing MutatingWebhookConfigurations: linkerd-proxy-injector-webhook-config",
-			},
-		},
-		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-destination
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-identity
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-proxy-injector
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-heartbeat
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-web
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: serviceprofiles.linkerd.io
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: linkerd-proxy-injector-webhook-config
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist",
-				"linkerd-config control plane ClusterRoleBindings exist",
-				"linkerd-config control plane ServiceAccounts exist",
-				"linkerd-config control plane CustomResourceDefinitions exist",
-				"linkerd-config control plane MutatingWebhookConfigurations exist",
-				"linkerd-config control plane ValidatingWebhookConfigurations exist: missing ValidatingWebhookConfigurations: linkerd-sp-validator-webhook-config",
-			},
-		},
-		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-destination
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-identity
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-proxy-injector
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-heartbeat
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-web
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: serviceprofiles.linkerd.io
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: linkerd-proxy-injector-webhook-config
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  name: linkerd-sp-validator-webhook-config
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist",
-				"linkerd-config control plane ClusterRoleBindings exist",
-				"linkerd-config control plane ServiceAccounts exist",
-				"linkerd-config control plane CustomResourceDefinitions exist",
-				"linkerd-config control plane MutatingWebhookConfigurations exist",
-				"linkerd-config control plane ValidatingWebhookConfigurations exist",
-				"linkerd-config control plane PodSecurityPolicies exist: missing PodSecurityPolicies: linkerd-test-ns-control-plane",
-			},
-		},
-		{
-			[]string{`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRole
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-identity
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ClusterRoleBinding
-apiVersion: rbac.authorization.k8s.io/v1
-metadata:
-  name: linkerd-test-ns-proxy-injector
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-destination
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-identity
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-proxy-injector
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-heartbeat
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: linkerd-web
-  namespace: test-ns
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: serviceprofiles.linkerd.io
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: linkerd-proxy-injector-webhook-config
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  name: linkerd-sp-validator-webhook-config
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-				`
-apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
-metadata:
-  name: linkerd-test-ns-control-plane
-  labels:
-    linkerd.io/control-plane-ns: test-ns
-`,
-			},
-			[]string{
-				"linkerd-config control plane Namespace exists",
-				"linkerd-config control plane ClusterRoles exist",
-				"linkerd-config control plane ClusterRoleBindings exist",
-				"linkerd-config control plane ServiceAccounts exist",
-				"linkerd-config control plane CustomResourceDefinitions exist",
-				"linkerd-config control plane MutatingWebhookConfigurations exist",
-				"linkerd-config control plane ValidatingWebhookConfigurations exist",
-				"linkerd-config control plane PodSecurityPolicies exist",
+			description: "fails invalid configuration",
+			k8sConfigs:  []string{namespaces["vizOne"], namespaces["mcOne"], namespaces["mcTwo"]},
+			results: []string{
+				"linkerd-extension-checks namespace configuration for extensions: some extensions have invalid configuration\n\t* label \"linkerd.io/extension=multicluster\" is present on more than one namespace:\n\t\t* mc-1\n\t\t* mc-2",
 			},
 		},
 	}
 
-	for i, tc := range testCases {
-		tc := tc // pin
-		t.Run(fmt.Sprintf("%d: returns expected config result", i), func(t *testing.T) {
+	for _, tc := range testCases {
+		// pin tc
+		tc := tc
+		t.Run(tc.description, func(t *testing.T) {
 			hc := NewHealthChecker(
-				[]CategoryID{LinkerdConfigChecks},
+				[]CategoryID{LinkerdExtensionChecks},
 				&Options{
 					ControlPlaneNamespace: "test-ns",
 				},
@@ -1144,8 +623,246 @@ metadata:
 
 			obs := newObserver()
 			hc.RunChecks(obs.resultFn)
-			if !reflect.DeepEqual(obs.results, tc.results) {
-				t.Fatalf("Expected results\n%s,\nbut got:\n%s", strings.Join(tc.results, "\n"), strings.Join(obs.results, "\n"))
+			if diff := deep.Equal(obs.results, tc.results); diff != nil {
+				t.Fatalf("%+v", diff)
+			}
+		})
+	}
+}
+
+func TestConfigExists(t *testing.T) {
+
+	namespace := []string{`
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-ns
+`}
+	clusterRoles := []string{`
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: linkerd-test-ns-identity
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`,
+		`
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: linkerd-test-ns-proxy-injector
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`}
+	clusterRoleBindings := []string{`
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: linkerd-test-ns-identity
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`,
+		`
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: linkerd-test-ns-proxy-injector
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`}
+	serviceAccounts := []string{`
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: linkerd-destination
+  namespace: test-ns
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`,
+		`
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: linkerd-identity
+  namespace: test-ns
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`,
+		`
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: linkerd-proxy-injector
+  namespace: test-ns
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`,
+		`
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: linkerd-heartbeat
+  namespace: test-ns
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`}
+	crds := []string{}
+	for _, crd := range []struct{ name, version string }{
+		{name: "authorizationpolicies.policy.linkerd.io", version: "v1alpha1"},
+		{name: "meshtlsauthentications.policy.linkerd.io", version: "v1alpha1"},
+		{name: "networkauthentications.policy.linkerd.io", version: "v1alpha1"},
+		{name: "serverauthorizations.policy.linkerd.io", version: "v1beta1"},
+		{name: "servers.policy.linkerd.io", version: "v1beta1"},
+		{name: "serviceprofiles.linkerd.io", version: "v1alpha2"},
+	} {
+		crds = append(crds, fmt.Sprintf(`
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: %s
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+spec:
+  versions:
+  - name: %s`, crd.name, crd.version))
+	}
+	mutatingWebhooks := []string{`
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: linkerd-proxy-injector-webhook-config
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`}
+	validatingWebhooks := []string{`
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: linkerd-sp-validator-webhook-config
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+`}
+
+	testCases := []struct {
+		k8sConfigs []string
+		results    []string
+	}{
+		{
+			[]string{},
+			[]string{"linkerd-config control plane Namespace exists: The \"test-ns\" namespace does not exist"},
+		},
+		{
+			namespace,
+			[]string{
+				"linkerd-config control plane Namespace exists",
+				"linkerd-config control plane ClusterRoles exist: missing ClusterRoles: linkerd-test-ns-identity, linkerd-test-ns-proxy-injector",
+			},
+		},
+		{
+			multiappend(
+				namespace,
+				clusterRoles,
+			),
+			[]string{
+				"linkerd-config control plane Namespace exists",
+				"linkerd-config control plane ClusterRoles exist",
+				"linkerd-config control plane ClusterRoleBindings exist: missing ClusterRoleBindings: linkerd-test-ns-identity, linkerd-test-ns-proxy-injector",
+			},
+		},
+		{
+			multiappend(
+				namespace,
+				clusterRoles,
+				clusterRoleBindings,
+				serviceAccounts,
+			),
+			[]string{
+				"linkerd-config control plane Namespace exists",
+				"linkerd-config control plane ClusterRoles exist",
+				"linkerd-config control plane ClusterRoleBindings exist",
+				"linkerd-config control plane ServiceAccounts exist",
+				"linkerd-config control plane CustomResourceDefinitions exist: missing authorizationpolicies.policy.linkerd.io, missing meshtlsauthentications.policy.linkerd.io, missing networkauthentications.policy.linkerd.io, missing serverauthorizations.policy.linkerd.io, missing servers.policy.linkerd.io, missing serviceprofiles.linkerd.io",
+			},
+		},
+		{
+			multiappend(
+				namespace,
+				clusterRoles,
+				clusterRoleBindings,
+				serviceAccounts,
+				crds,
+			),
+			[]string{
+				"linkerd-config control plane Namespace exists",
+				"linkerd-config control plane ClusterRoles exist",
+				"linkerd-config control plane ClusterRoleBindings exist",
+				"linkerd-config control plane ServiceAccounts exist",
+				"linkerd-config control plane CustomResourceDefinitions exist",
+				"linkerd-config control plane MutatingWebhookConfigurations exist: missing MutatingWebhookConfigurations: linkerd-proxy-injector-webhook-config",
+			},
+		},
+		{
+			multiappend(
+				namespace,
+				clusterRoles,
+				clusterRoleBindings,
+				serviceAccounts,
+				crds,
+				mutatingWebhooks,
+			),
+			[]string{
+				"linkerd-config control plane Namespace exists",
+				"linkerd-config control plane ClusterRoles exist",
+				"linkerd-config control plane ClusterRoleBindings exist",
+				"linkerd-config control plane ServiceAccounts exist",
+				"linkerd-config control plane CustomResourceDefinitions exist",
+				"linkerd-config control plane MutatingWebhookConfigurations exist",
+				"linkerd-config control plane ValidatingWebhookConfigurations exist: missing ValidatingWebhookConfigurations: linkerd-sp-validator-webhook-config",
+			},
+		},
+		{
+			multiappend(
+				namespace,
+				clusterRoles,
+				clusterRoleBindings,
+				serviceAccounts,
+				crds,
+				mutatingWebhooks,
+				validatingWebhooks,
+			),
+			[]string{
+				"linkerd-config control plane Namespace exists",
+				"linkerd-config control plane ClusterRoles exist",
+				"linkerd-config control plane ClusterRoleBindings exist",
+				"linkerd-config control plane ServiceAccounts exist",
+				"linkerd-config control plane CustomResourceDefinitions exist",
+				"linkerd-config control plane MutatingWebhookConfigurations exist",
+				"linkerd-config control plane ValidatingWebhookConfigurations exist",
+			},
+		},
+	}
+
+	for i, tc := range testCases {
+		tc := tc // pin
+		t.Run(fmt.Sprintf("%d: returns expected config result", i), func(t *testing.T) {
+			hc := NewHealthChecker(
+				[]CategoryID{LinkerdConfigChecks},
+				&Options{
+					ControlPlaneNamespace: "test-ns",
+					CRDManifest:           strings.Join(crds, "\n---\n"),
+				},
+			)
+
+			var err error
+			hc.kubeAPI, err = k8s.NewFakeAPI(tc.k8sConfigs...)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+
+			obs := newObserver()
+			hc.RunChecks(obs.resultFn)
+			if diff := deep.Equal(obs.results, tc.results); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 		})
 	}
@@ -1197,8 +914,117 @@ data:
 
 			obs := newObserver()
 			hc.RunChecks(obs.resultFn)
-			if !reflect.DeepEqual(obs.results, testCase.expected) {
-				t.Fatalf("Expected results %v, but got %v", testCase.expected, obs.results)
+			if diff := deep.Equal(obs.results, testCase.expected); diff != nil {
+				t.Fatalf("%+v", diff)
+			}
+		})
+	}
+}
+
+func TestCheckClusterNetworks(t *testing.T) {
+	var testCases = []struct {
+		checkDescription string
+		k8sConfigs       []string
+		expected         []string
+	}{
+		{
+			checkDescription: "cluster networks contains all node podCIDRs",
+			k8sConfigs: []string{`
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-ns
+`,
+				`
+apiVersion: v1
+kind: Node
+metadata:
+  name: linkerd-test-ns-identity
+spec:
+  podCIDR: 90.10.90.24/24
+`,
+				`
+apiVersion: v1
+kind: Node
+metadata:
+  name: linkerd-test-ns-identity2
+spec:
+  podCIDR: 242.3.64.0/25
+`,
+				`
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: linkerd-config
+  namespace: test-ns
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+data:
+  values: |
+    clusterNetworks: "10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16"
+`,
+			},
+			expected: []string{
+				"linkerd-existence cluster networks contains all node podCIDRs: node has podCIDR(s) [242.3.64.0/25 90.10.90.24/24] which are not contained in the Linkerd clusterNetworks.\n\tTry installing linkerd via --set clusterNetworks=\"242.3.64.0/25\\,90.10.90.24/24\"",
+			},
+		},
+		{
+			checkDescription: "cluster networks contains all node podCIDRs",
+			k8sConfigs: []string{`
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-ns
+`,
+				`
+apiVersion: v1
+kind: Node
+metadata:
+  name: linkerd-test-ns-identity
+spec:
+  podCIDR: 10.0.0.24/24
+`,
+				`
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: linkerd-config
+  namespace: test-ns
+  labels:
+    linkerd.io/control-plane-ns: test-ns
+data:
+  values: |
+    clusterNetworks: "10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16"
+`,
+			},
+			expected: []string{
+				"linkerd-existence cluster networks contains all node podCIDRs",
+			},
+		},
+	}
+
+	for i, tc := range testCases {
+		tc := tc // pin
+		t.Run(fmt.Sprintf("%d: returns expected config result", i), func(t *testing.T) {
+			hc := NewHealthChecker(
+				[]CategoryID{},
+				&Options{
+					ControlPlaneNamespace: "test-ns",
+				},
+			)
+
+			var err error
+			hc.kubeAPI, err = k8s.NewFakeAPI(tc.k8sConfigs...)
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err)
+			}
+
+			obs := newObserver()
+			hc.addCheckAsCategory("linkerd-existence", LinkerdControlPlaneExistenceChecks,
+				tc.checkDescription)
+			hc.RunChecks(obs.resultFn)
+			if diff := deep.Equal(obs.results, tc.expected); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 		})
 	}
@@ -1230,15 +1056,15 @@ func TestCheckDataPlaneProxiesCertificate(t *testing.T) {
 	const currentCertificate = "current-certificate"
 	const oldCertificate = "old-certificate"
 
-	linkerdConfigMap := fmt.Sprintf(`
+	linkerdIdentityTrustRoots := fmt.Sprintf(`
 kind: ConfigMap
 apiVersion: v1
 metadata:
   name: %s
 data:
-  global: |
-    {"identityContext":{"trustAnchorsPem": "%s"}}
-`, k8s.ConfigConfigMapName, currentCertificate)
+  ca-bundle.crt: %s
+
+`, "linkerd-identity-trust-roots", currentCertificate)
 
 	var testCases = []struct {
 		checkDescription string
@@ -1291,14 +1117,14 @@ data:
 			hc.DataPlaneNamespace = testCase.namespace
 
 			var err error
-			hc.kubeAPI, err = k8s.NewFakeAPI(append(testCase.resources, linkerdConfigMap)...)
+			hc.kubeAPI, err = k8s.NewFakeAPI(append(testCase.resources, linkerdIdentityTrustRoots)...)
 			if err != nil {
 				t.Fatalf("Unexpected error: %q", err)
 			}
 
 			err = hc.checkDataPlaneProxiesCertificate(context.Background())
-			if !reflect.DeepEqual(err, testCase.expectedErr) {
-				t.Fatalf("Error %q does not match expected error: %q", err, testCase.expectedErr)
+			if diff := deep.Equal(err, testCase.expectedErr); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 		})
 	}
@@ -1322,7 +1148,7 @@ func TestValidateControlPlanePods(t *testing.T) {
 
 	t.Run("Returns an error if not all pods are running", func(t *testing.T) {
 		pods := []corev1.Pod{
-			pod("linkerd-grafana-5b7d796646-hh46d", corev1.PodRunning, true),
+			pod("linkerd-destination-9849948665-37082", corev1.PodFailed, true),
 			pod("linkerd-identity-6849948664-27982", corev1.PodFailed, true),
 		}
 
@@ -1330,7 +1156,7 @@ func TestValidateControlPlanePods(t *testing.T) {
 		if err == nil {
 			t.Fatal("Expected error, got nothing")
 		}
-		if err.Error() != "No running pods for \"linkerd-identity\"" {
+		if err.Error() != "No running pods for \"linkerd-destination\"" {
 			t.Fatalf("Unexpected error message: %s", err.Error())
 		}
 	})
@@ -1349,6 +1175,7 @@ func TestValidateControlPlanePods(t *testing.T) {
 
 	t.Run("Returns nil if all pods are running and all containers are ready", func(t *testing.T) {
 		pods := []corev1.Pod{
+			pod("linkerd-destination-9849948665-37082", corev1.PodRunning, true),
 			pod("linkerd-identity-6849948664-27982", corev1.PodRunning, true),
 			pod("linkerd-proxy-injector-5f79ff4844-", corev1.PodRunning, true),
 		}
@@ -1359,8 +1186,25 @@ func TestValidateControlPlanePods(t *testing.T) {
 		}
 	})
 
+	// This test is just for ensuring full coverage of the validateControlPlanePods function
+	t.Run("Returns an error if all the controller pods are not ready", func(t *testing.T) {
+		pods := []corev1.Pod{
+			pod("linkerd-destination-9849948665-37082", corev1.PodRunning, false),
+			pod("linkerd-identity-6849948664-27982", corev1.PodRunning, false),
+			pod("linkerd-proxy-injector-5f79ff4844-", corev1.PodRunning, false),
+		}
+
+		err := validateControlPlanePods(pods)
+		if err == nil {
+			t.Fatal("Expected error, got nothing")
+		}
+	})
+
 	t.Run("Returns nil if, HA mode, at least one pod of each control plane component is ready", func(t *testing.T) {
 		pods := []corev1.Pod{
+			pod("linkerd-destination-9843948665-48082", corev1.PodRunning, true),
+			pod("linkerd-destination-9843948665-48083", corev1.PodRunning, false),
+			pod("linkerd-destination-9843948665-48084", corev1.PodFailed, false),
 			pod("linkerd-identity-6849948664-27982", corev1.PodRunning, true),
 			pod("linkerd-identity-6849948664-27983", corev1.PodRunning, false),
 			pod("linkerd-identity-6849948664-27984", corev1.PodFailed, false),
@@ -1375,6 +1219,7 @@ func TestValidateControlPlanePods(t *testing.T) {
 
 	t.Run("Returns nil if all linkerd pods are running and pod list includes non-linkerd pod", func(t *testing.T) {
 		pods := []corev1.Pod{
+			pod("linkerd-destination-9843948665-48082", corev1.PodRunning, true),
 			pod("linkerd-identity-6849948664-27982", corev1.PodRunning, true),
 			pod("linkerd-proxy-injector-5f79ff4844-", corev1.PodRunning, true),
 			pod("hello-43c25d", corev1.PodRunning, true),
@@ -1425,21 +1270,21 @@ func TestValidateDataPlaneNamespace(t *testing.T) {
 			}
 			obs := newObserver()
 			hc.RunChecks(obs.resultFn)
-			if !reflect.DeepEqual(obs.results, expectedResults) {
-				t.Fatalf("Expected results %v, but got %v", expectedResults, obs.results)
+			if diff := deep.Equal(obs.results, expectedResults); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 		})
 	}
 }
 
-func TestValidateDataPlanePods(t *testing.T) {
+func TestCheckDataPlanePods(t *testing.T) {
 
 	t.Run("Returns an error if no inject pods were found", func(t *testing.T) {
-		err := validateDataPlanePods([]corev1.Pod{}, "emojivoto")
+		err := CheckPodsRunning([]corev1.Pod{}, "emojivoto")
 		if err == nil {
 			t.Fatal("Expected error, got nothing")
 		}
-		if err.Error() != "No \"linkerd-proxy\" containers found in the \"emojivoto\" namespace" {
+		if err.Error() != "no \"linkerd-proxy\" containers found in the \"emojivoto\" namespace" {
 			t.Fatalf("Unexpected error message: %s", err.Error())
 		}
 	})
@@ -1496,11 +1341,11 @@ func TestValidateDataPlanePods(t *testing.T) {
 			},
 		}
 
-		err := validateDataPlanePods(pods, "emojivoto")
+		err := CheckPodsRunning(pods, "emojivoto")
 		if err == nil {
 			t.Fatal("Expected error, got nothing")
 		}
-		if err.Error() != "The \"voting-65b9fffd77-rlwsd\" pod is not running" {
+		if err.Error() != "pod \"voting-65b9fffd77-rlwsd\" status is Failed" {
 			t.Fatalf("Unexpected error message: %s", err.Error())
 		}
 	})
@@ -1521,7 +1366,58 @@ func TestValidateDataPlanePods(t *testing.T) {
 			},
 		}
 
-		err := validateDataPlanePods(pods, "emojivoto")
+		err := CheckPodsRunning(pods, "emojivoto")
+		if err != nil {
+			t.Fatalf("Expected no error, got %s", err)
+		}
+	})
+
+	t.Run("Does not return an error if the pod is in Shutdown state", func(t *testing.T) {
+		pods := []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "emoji-d9c7866bb-7v74n"},
+				Status: corev1.PodStatus{
+					Phase:  "Failed",
+					Reason: "Shutdown",
+				},
+			},
+		}
+
+		err := CheckPodsRunning(pods, "emojivoto")
+		if err != nil {
+			t.Fatalf("Expected no error, got %s", err)
+		}
+	})
+
+	t.Run("Does not return an error if the pod is in NodeShutdown state", func(t *testing.T) {
+		pods := []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "emoji-d9c7866bb-7v74n"},
+				Status: corev1.PodStatus{
+					Phase:  "Failed",
+					Reason: "NodeShutdown",
+				},
+			},
+		}
+
+		err := CheckPodsRunning(pods, "emojivoto")
+		if err != nil {
+			t.Fatalf("Expected no error, got %s", err)
+		}
+	})
+
+	t.Run("Does not return an error if the pod is in Terminated state", func(t *testing.T) {
+		pods := []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "emoji-d9c7866bb-7v74n"},
+				Status: corev1.PodStatus{
+					Phase:  "Failed",
+					Reason: "Terminated",
+				},
+			},
+		}
+
+		err := CheckPodsRunning(pods, "emojivoto")
 		if err != nil {
 			t.Fatalf("Expected no error, got %s", err)
 		}
@@ -1579,11 +1475,11 @@ func TestValidateDataPlanePods(t *testing.T) {
 			},
 		}
 
-		err := validateDataPlanePods(pods, "emojivoto")
+		err := CheckPodsRunning(pods, "emojivoto")
 		if err == nil {
 			t.Fatal("Expected error, got nothing")
 		}
-		if err.Error() != "The \"linkerd-proxy\" container in the \"vote-bot-644b8cb6b4-g8nlr\" pod is not ready" {
+		if err.Error() != "container \"linkerd-proxy\" in pod \"vote-bot-644b8cb6b4-g8nlr\" is not ready" {
 			t.Fatalf("Unexpected error message: %s", err.Error())
 		}
 	})
@@ -1640,7 +1536,68 @@ func TestValidateDataPlanePods(t *testing.T) {
 			},
 		}
 
-		err := validateDataPlanePods(pods, "emojivoto")
+		err := CheckPodsRunning(pods, "emojivoto")
+		if err != nil {
+			t.Fatalf("Unexpected error: %s", err)
+		}
+	})
+
+	// This test relates to https://github.com/linkerd/linkerd2/issues/6128
+	t.Run("Returns nil if some pods are in the Succeeded phase and their proxies are no longer ready", func(t *testing.T) {
+		pods := []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "emoji-d9c7866bb-7v74n"},
+				Status: corev1.PodStatus{
+					Phase:  "Succeeded",
+					Reason: "Completed",
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name:  k8s.ProxyContainerName,
+							Ready: false,
+						},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "vote-bot-644b8cb6b4-g8nlr"},
+				Status: corev1.PodStatus{
+					Phase: "Running",
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name:  k8s.ProxyContainerName,
+							Ready: true,
+						},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "voting-65b9fffd77-rlwsd"},
+				Status: corev1.PodStatus{
+					Phase: "Running",
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name:  k8s.ProxyContainerName,
+							Ready: true,
+						},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "web-6cfbccc48-5g8px"},
+				Status: corev1.PodStatus{
+					Phase:  "Succeeded",
+					Reason: "Completed",
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name:  k8s.ProxyContainerName,
+							Ready: false,
+						},
+					},
+				},
+			},
+		}
+
+		err := CheckPodsRunning(pods, "emojivoto")
 		if err != nil {
 			t.Fatalf("Unexpected error: %s", err)
 		}
@@ -1709,15 +1666,14 @@ func TestDataPlanePodLabels(t *testing.T) {
 				expectedErrorMsg: "Some labels on data plane pods should be annotations:\n\t* /emoji-d9c7866bb-7v74n\n\t\tlinkerd.io/inject",
 			},
 		} {
-			tc := tc //pin
+			tc := tc // pin
 			t.Run(tc.description, func(t *testing.T) {
 				err := checkMisconfiguredPodsLabels(tc.pods)
-				fmt.Println(err.Error())
 
 				if err == nil {
 					t.Fatal("Expected error, got nothing")
 				}
-				fmt.Println(err.Error())
+
 				if err.Error() != tc.expectedErrorMsg {
 					t.Fatalf("Unexpected error message: %s", err.Error())
 				}
@@ -1776,7 +1732,7 @@ func TestServicesLabels(t *testing.T) {
 				expectedErrorMsg: "Some labels on data plane services should be annotations:\n\t* /emoji-d9c7866bb-7v74n\n\t\tconfig.alpha.linkerd.io/alpha-setting",
 			},
 		} {
-			tc := tc //pin
+			tc := tc // pin
 			t.Run(tc.description, func(t *testing.T) {
 				err := checkMisconfiguredServiceLabels(tc.services)
 				if err == nil {
@@ -1828,7 +1784,7 @@ func TestServicesAnnotations(t *testing.T) {
 				expectedErrorMsg: "Some annotations on data plane services should be labels:\n\t* /emoji-d9c7866bb-7v74n\n\t\tmirror.linkerd.io/exported",
 			},
 		} {
-			tc := tc //pin
+			tc := tc // pin
 			t.Run(tc.description, func(t *testing.T) {
 				err := checkMisconfiguredServiceAnnotations(tc.services)
 				if err == nil {
@@ -1840,334 +1796,6 @@ func TestServicesAnnotations(t *testing.T) {
 			})
 		}
 	})
-}
-
-func TestLinkerdPreInstallGlobalResourcesChecks(t *testing.T) {
-	hc := NewHealthChecker(
-		[]CategoryID{LinkerdPreInstallGlobalResourcesChecks},
-		&Options{})
-
-	t.Run("global resources don't exist", func(t *testing.T) {
-		var err error
-		hc.kubeAPI, err = k8s.NewFakeAPI()
-		if err != nil {
-			t.Fatalf("Unexpected error: %s", err)
-		}
-
-		observer := newObserver()
-		if !hc.RunChecks(observer.resultFn) {
-			t.Errorf("Expect RunChecks to return true")
-		}
-
-		expected := []string{
-			"pre-linkerd-global-resources no ClusterRoles exist",
-			"pre-linkerd-global-resources no ClusterRoleBindings exist",
-			"pre-linkerd-global-resources no CustomResourceDefinitions exist",
-			"pre-linkerd-global-resources no MutatingWebhookConfigurations exist",
-			"pre-linkerd-global-resources no ValidatingWebhookConfigurations exist",
-			"pre-linkerd-global-resources no PodSecurityPolicies exist",
-		}
-		if !reflect.DeepEqual(observer.results, expected) {
-			testutil.AnnotatedErrorf(t, "Mismatch result", "Mismatch result.\nExpected: %v\n Actual: %v\n", expected, observer.results)
-		}
-	})
-
-	t.Run("global resources exist", func(t *testing.T) {
-		resources := []string{
-			`apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: cluster-role
-  labels:
-    linkerd.io/control-plane-ns: test-ns`,
-			`apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: cluster-role-binding
-  labels:
-    linkerd.io/control-plane-ns: test-ns`,
-			`apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: custom-resource-definition
-  labels:
-    linkerd.io/control-plane-ns: test-ns`,
-			`apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: mutating-webhook-configuration
-  labels:
-    linkerd.io/control-plane-ns: test-ns`,
-			`apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  name: validating-webhook-configuration
-  labels:
-    linkerd.io/control-plane-ns: test-ns`,
-			`apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
-metadata:
-  name: pod-security-policy
-  labels:
-    linkerd.io/control-plane-ns: test-ns`,
-		}
-
-		var err error
-		hc.kubeAPI, err = k8s.NewFakeAPI(resources...)
-		hc.ControlPlaneNamespace = "test-ns"
-		if err != nil {
-			testutil.AnnotatedFatalf(t, "Unexpected error", "Unexpected error: %s", err)
-		}
-
-		observer := newObserver()
-		if hc.RunChecks(observer.resultFn) {
-			testutil.Error(t, "Expect RunChecks to return false")
-		}
-
-		expected := []string{
-			"pre-linkerd-global-resources no ClusterRoles exist: ClusterRoles found but should not exist: cluster-role",
-			"pre-linkerd-global-resources no ClusterRoleBindings exist: ClusterRoleBindings found but should not exist: cluster-role-binding",
-			"pre-linkerd-global-resources no CustomResourceDefinitions exist: CustomResourceDefinitions found but should not exist: custom-resource-definition",
-			"pre-linkerd-global-resources no MutatingWebhookConfigurations exist: MutatingWebhookConfigurations found but should not exist: mutating-webhook-configuration",
-			"pre-linkerd-global-resources no ValidatingWebhookConfigurations exist: ValidatingWebhookConfigurations found but should not exist: validating-webhook-configuration",
-			"pre-linkerd-global-resources no PodSecurityPolicies exist: PodSecurityPolicies found but should not exist: pod-security-policy",
-		}
-		if !reflect.DeepEqual(observer.results, expected) {
-			t.Errorf("Mismatch result.\nExpected: %v\n Actual: %v\n", expected, observer.results)
-		}
-	})
-}
-
-func getWebhookAndKubeSystemNamespace(nsLabel string, failurePolicy string) []string {
-	return []string{fmt.Sprintf(`
-apiVersion: v1
-kind: Namespace
-metadata:
-  creationTimestamp: null
-  labels:
-    %s
-  name: kube-system`, nsLabel),
-		fmt.Sprintf(`
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: linkerd-proxy-injector-webhook-config
-  labels:
-    linkerd.io/control-plane-component: proxy-injector
-    linkerd.io/control-plane-ns: linkerd
-webhooks:
-- name: linkerd-proxy-injector.linkerd.io
-  namespaceSelector:
-    matchExpressions:
-    - key: config.linkerd.io/admission-webhooks
-      operator: NotIn
-      values:
-      - disabled
-  clientConfig:
-    service:
-      name: linkerd-proxy-injector
-      namespace: linkerd
-      path: "/"
-    caBundle: cHJveHkgaW5qZWN0b3IgQ0EgYnVuZGxl
-  failurePolicy: %s
-  rules:
-  - operations: [ "CREATE" ]
-    apiGroups: [""]
-    apiVersions: ["v1"]
-    resources: ["pods"]
-  sideEffects: None`, failurePolicy),
-	}
-}
-
-func TestKubeSystemNamespaceInHA(t *testing.T) {
-	testCases := []struct {
-		testDescription string
-		k8sConfigs      []string
-		expectedOutput  string
-	}{
-		{
-			"passes when webhook policy is Ignore is not enabled",
-			getWebhookAndKubeSystemNamespace("", "Ignore"),
-			"",
-		},
-		{
-			"passes when webhook policy is Fail and namespace has required metadata",
-			getWebhookAndKubeSystemNamespace("config.linkerd.io/admission-webhooks: disabled", "Fail"),
-			"l5d-injection-disabled pod injection disabled on kube-system",
-		},
-		{
-			"fails when webhook policy is Fail and admission hooks are enabled",
-			getWebhookAndKubeSystemNamespace("config.linkerd.io/admission-webhooks: enabled", "Fail"),
-			"l5d-injection-disabled pod injection disabled on kube-system: kube-system namespace needs to have the label config.linkerd.io/admission-webhooks: disabled if injector webhook failure policy is Fail",
-		},
-		{
-			"fails when webhook policy is Fail and metadata is missing",
-			getWebhookAndKubeSystemNamespace("", "Fail"),
-			"l5d-injection-disabled pod injection disabled on kube-system: kube-system namespace needs to have the label config.linkerd.io/admission-webhooks: disabled if injector webhook failure policy is Fail",
-		},
-	}
-
-	for _, tc := range testCases {
-		tc := tc // pin
-		t.Run(tc.testDescription, func(t *testing.T) {
-
-			hc := NewHealthChecker([]CategoryID{}, &Options{})
-			hc.ControlPlaneNamespace = "linkerd"
-
-			hc.kubeAPI, _ = k8s.NewFakeAPI(tc.k8sConfigs...)
-			hc.addCheckAsCategory("l5d-injection-disabled", LinkerdHAChecks, "pod injection disabled on kube-system")
-
-			obs := newObserver()
-			hc.RunChecks(obs.resultFn)
-
-			if tc.expectedOutput == "" {
-				if len(obs.results) != 0 {
-					t.Fatalf("Expected not output, but got %v", obs.results)
-				}
-			} else {
-				expectedResults := []string{
-					tc.expectedOutput,
-				}
-
-				if !reflect.DeepEqual(obs.results, expectedResults) {
-					t.Fatalf("Expected results %v, but got %v", expectedResults, obs.results)
-				}
-			}
-		})
-	}
-
-}
-
-func TestFetchLinkerdConfigMap(t *testing.T) {
-	testCases := []struct {
-		k8sConfigs []string
-		expected   *configPb.All
-		err        error
-	}{
-		{
-			[]string{`
-kind: ConfigMap
-apiVersion: v1
-metadata:
-  name: linkerd-config
-  namespace: linkerd
-data:
-  global: |
-    {"linkerdNamespace":"linkerd","cniEnabled":false,"version":"install-control-plane-version","identityContext":{"trustDomain":"cluster.local","trustAnchorsPem":"fake-trust-anchors-pem","issuanceLifetime":"86400s","clockSkewAllowance":"20s"}}
-  proxy: |
-    {"proxyImage":{"imageName":"cr.l5d.io/linkerd/proxy","pullPolicy":"IfNotPresent"},"proxyInitImage":{"imageName":"cr.l5d.io/linkerd/proxy-init","pullPolicy":"IfNotPresent"},"controlPort":{"port":4190},"ignoreInboundPorts":[],"ignoreOutboundPorts":[],"inboundPort":{"port":4143},"adminPort":{"port":4191},"outboundPort":{"port":4140},"resource":{"requestCpu":"","requestMemory":"","limitCpu":"","limitMemory":""},"proxyUid":"2102","logLevel":{"level":"warn,linkerd=info"},"disableExternalProfiles":true,"proxyVersion":"install-proxy-version","proxy_init_image_version":"v1.3.11","debugImage":{"imageName":"cr.l5d.io/linkerd/debug","pullPolicy":"IfNotPresent"},"debugImageVersion":"install-debug-version"}
-  install: |
-    {"cliVersion":"dev-undefined","flags":[]}`,
-			},
-			&configPb.All{
-				Global: &configPb.Global{
-					LinkerdNamespace: "linkerd",
-					Version:          "install-control-plane-version",
-					IdentityContext: &configPb.IdentityContext{
-						TrustDomain:     "cluster.local",
-						TrustAnchorsPem: "fake-trust-anchors-pem",
-						IssuanceLifetime: &duration.Duration{
-							Seconds: 86400,
-						},
-						ClockSkewAllowance: &duration.Duration{
-							Seconds: 20,
-						},
-					},
-				}, Proxy: &configPb.Proxy{
-					ProxyImage: &configPb.Image{
-						ImageName:  "cr.l5d.io/linkerd/proxy",
-						PullPolicy: "IfNotPresent",
-					},
-					ProxyInitImage: &configPb.Image{
-						ImageName:  "cr.l5d.io/linkerd/proxy-init",
-						PullPolicy: "IfNotPresent",
-					},
-					ControlPort: &configPb.Port{
-						Port: 4190,
-					},
-					InboundPort: &configPb.Port{
-						Port: 4143,
-					},
-					AdminPort: &configPb.Port{
-						Port: 4191,
-					},
-					OutboundPort: &configPb.Port{
-						Port: 4140,
-					},
-					Resource: &configPb.ResourceRequirements{},
-					ProxyUid: 2102,
-					LogLevel: &configPb.LogLevel{
-						Level: "warn,linkerd=info",
-					},
-					DisableExternalProfiles: true,
-					ProxyVersion:            "install-proxy-version",
-					ProxyInitImageVersion:   "v1.3.11",
-					DebugImage: &configPb.Image{
-						ImageName:  "cr.l5d.io/linkerd/debug",
-						PullPolicy: "IfNotPresent",
-					},
-					DebugImageVersion: "install-debug-version",
-				}, Install: &configPb.Install{
-					CliVersion: "dev-undefined",
-				}},
-			nil,
-		},
-		{
-			[]string{`
-kind: ConfigMap
-apiVersion: v1
-metadata:
-  name: linkerd-config
-  namespace: linkerd
-data:
-  global: |
-    {"linkerdNamespace":"ns","identityContext":null}
-  proxy: "{}"
-  install: "{}"`,
-			},
-			&configPb.All{Global: &configPb.Global{LinkerdNamespace: "ns", IdentityContext: nil}, Proxy: &configPb.Proxy{}, Install: &configPb.Install{}},
-			nil,
-		},
-		{
-			[]string{`
-kind: ConfigMap
-apiVersion: v1
-metadata:
-  name: linkerd-config
-  namespace: linkerd
-data:
-  global: "{}"
-  proxy: "{}"
-  install: "{}"`,
-			},
-			&configPb.All{Global: &configPb.Global{}, Proxy: &configPb.Proxy{}, Install: &configPb.Install{}},
-			nil,
-		},
-		{
-			nil,
-			nil,
-			k8sErrors.NewNotFound(schema.GroupResource{Resource: "configmaps"}, "linkerd-config"),
-		},
-	}
-
-	for i, tc := range testCases {
-		tc := tc // pin
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			clientset, err := k8s.NewFakeAPI(tc.k8sConfigs...)
-			if err != nil {
-				t.Fatalf("Unexpected error: %s", err)
-			}
-
-			_, configs, err := FetchLinkerdConfigMap(context.Background(), clientset, "linkerd")
-			if !reflect.DeepEqual(err, tc.err) {
-				t.Fatalf("Expected \"%+v\", got \"%+v\"", tc.err, err)
-			}
-
-			if !proto.Equal(configs, tc.expected) {
-				t.Fatalf("Unexpected config:\nExpected:\n%+v\nGot:\n%+v", tc.expected, configs)
-			}
-		})
-	}
 }
 
 func TestFetchCurrentConfiguration(t *testing.T) {
@@ -2193,38 +1821,36 @@ data:
   global: |
     {"linkerdNamespace":"linkerd","cniEnabled":false,"version":"install-control-plane-version","identityContext":{"trustDomain":"cluster.local","trustAnchorsPem":"fake-trust-anchors-pem","issuanceLifetime":"86400s","clockSkewAllowance":"20s"}}
   proxy: |
-    {"proxyImage":{"imageName":"cr.l5d.io/linkerd/proxy","pullPolicy":"IfNotPresent"},"proxyInitImage":{"imageName":"cr.l5d.io/linkerd/proxy-init","pullPolicy":"IfNotPresent"},"controlPort":{"port":4190},"ignoreInboundPorts":[],"ignoreOutboundPorts":[],"inboundPort":{"port":4143},"adminPort":{"port":4191},"outboundPort":{"port":4140},"resource":{"requestCpu":"","requestMemory":"","limitCpu":"","limitMemory":""},"proxyUid":"2102","logLevel":{"level":"warn,linkerd=info"},"disableExternalProfiles":true,"proxyVersion":"install-proxy-version","proxy_init_image_version":"v1.3.11","debugImage":{"imageName":"cr.l5d.io/linkerd/debug","pullPolicy":"IfNotPresent"},"debugImageVersion":"install-debug-version"}
+    {"proxyImage":{"imageName":"cr.l5d.io/linkerd/proxy","pullPolicy":"IfNotPresent"},"proxyInitImage":{"imageName":"cr.l5d.io/linkerd/proxy-init","pullPolicy":"IfNotPresent"},"controlPort":{"port":4190},"ignoreInboundPorts":[],"ignoreOutboundPorts":[],"inboundPort":{"port":4143},"adminPort":{"port":4191},"outboundPort":{"port":4140},"resource":{"requestCpu":"","requestMemory":"","limitCpu":"","limitMemory":""},"proxyUid":"2102","proxyGid":"2102","logLevel":{"level":"warn,linkerd=info"},"disableExternalProfiles":true,"proxyVersion":"install-proxy-version","proxy_init_image_version":"v2.3.0","debugImage":{"imageName":"cr.l5d.io/linkerd/debug","pullPolicy":"IfNotPresent"},"debugImageVersion":"install-debug-version"}
   install: |
     {"cliVersion":"dev-undefined","flags":[]}
   values: |
     controllerImage: ControllerImage
     controllerReplicas: 1
     controllerUID: 2103
+    controllerGID: 2103
     debugContainer: null
     destinationProxyResources: null
     destinationResources: null
     disableHeartBeat: false
     enableH2Upgrade: true
     enablePodAntiAffinity: false
+    nodeAffinity: null
     cliVersion: CliVersion
     clusterDomain: cluster.local
     clusterNetworks: ClusterNetworks
     cniEnabled: false
     controlPlaneTracing: false
-    controllerImageVersion: ControllerImageVersion
     controllerLogLevel: ControllerLogLevel
     enableEndpointSlices: false
-    grafanaUrl: ""
     highAvailability: false
     imagePullPolicy: ImagePullPolicy
     imagePullSecrets: null
     linkerdVersion: ""
-    namespace: Namespace
     prometheusUrl: ""
     proxy:
       capabilities: null
       component: linkerd-controller
-      disableIdentity: false
       disableTap: false
       enableExternalProfiles: false
       image:
@@ -2246,6 +1872,7 @@ data:
       resources: null
       saMountPath: null
       uid: 2102
+      gid: 2102
       waitBeforeExitSeconds: 0
       workloadKind: deployment
     proxyContainerName: ProxyContainerName
@@ -2258,13 +1885,7 @@ data:
         name: ProxyInitImageName
         pullPolicy: ImagePullPolicy
         version: ProxyInitVersion
-      resources:
-        cpu:
-          limit: 100m
-          request: 10m
-        memory:
-          limit: 50Mi
-          request: 10Mi
+      resources: null
       saMountPath: null
       xtMountPath:
         mountPath: /run
@@ -2274,10 +1895,8 @@ data:
     heartbeatSchedule: ""
     identityProxyResources: null
     identityResources: null
-    installNamespace: true
     nodeSelector:
-      beta.kubernetes.io/os: linux
-    omitWebhookSideEffects: false
+      kubernetes.io/os: linux
     proxyInjectorProxyResources: null
     proxyInjectorResources: null
     stage: ""
@@ -2286,23 +1905,20 @@ data:
 `,
 			},
 			&linkerd2.Values{
-				ControllerImage:        "ControllerImage",
-				ControllerUID:          2103,
-				EnableH2Upgrade:        true,
-				WebhookFailurePolicy:   "WebhookFailurePolicy",
-				OmitWebhookSideEffects: false,
-				InstallNamespace:       true,
-				NodeSelector:           defaultValues.NodeSelector,
-				Tolerations:            defaultValues.Tolerations,
-				Namespace:              "Namespace",
-				ClusterDomain:          "cluster.local",
-				ClusterNetworks:        "ClusterNetworks",
-				ImagePullPolicy:        "ImagePullPolicy",
-				CliVersion:             "CliVersion",
-				ControllerLogLevel:     "ControllerLogLevel",
-				ControllerImageVersion: "ControllerImageVersion",
-				ProxyContainerName:     "ProxyContainerName",
-				CNIEnabled:             false,
+				ControllerImage:      "ControllerImage",
+				ControllerUID:        2103,
+				ControllerGID:        2103,
+				EnableH2Upgrade:      true,
+				WebhookFailurePolicy: "WebhookFailurePolicy",
+				NodeSelector:         defaultValues.NodeSelector,
+				Tolerations:          defaultValues.Tolerations,
+				ClusterDomain:        "cluster.local",
+				ClusterNetworks:      "ClusterNetworks",
+				ImagePullPolicy:      "ImagePullPolicy",
+				CliVersion:           "CliVersion",
+				ControllerLogLevel:   "ControllerLogLevel",
+				ProxyContainerName:   "ProxyContainerName",
+				CNIEnabled:           false,
 				Proxy: &linkerd2.Proxy{
 					Image: &linkerd2.Image{
 						Name:       "ProxyImageName",
@@ -2318,23 +1934,9 @@ data:
 						Outbound: 4140,
 					},
 					UID: 2102,
+					GID: 2102,
 				},
 				ProxyInit: &linkerd2.ProxyInit{
-					Image: &linkerd2.Image{
-						Name:       "ProxyInitImageName",
-						PullPolicy: "ImagePullPolicy",
-						Version:    "ProxyInitVersion",
-					},
-					Resources: &linkerd2.Resources{
-						CPU: linkerd2.Constraints{
-							Limit:   "100m",
-							Request: "10m",
-						},
-						Memory: linkerd2.Constraints{
-							Limit:   "50Mi",
-							Request: "10Mi",
-						},
-					},
 					XTMountPath: &linkerd2.VolumeMountPath{
 						MountPath: "/run",
 						Name:      "linkerd-proxy-init-xtables-lock",
@@ -2355,13 +1957,14 @@ data:
   global: |
     {"linkerdNamespace":"linkerd","cniEnabled":false,"version":"install-control-plane-version","identityContext":{"trustDomain":"cluster.local","trustAnchorsPem":"fake-trust-anchors-pem","issuanceLifetime":"86400s","clockSkewAllowance":"20s"}}
   proxy: |
-    {"proxyImage":{"imageName":"cr.l5d.io/linkerd/proxy","pullPolicy":"IfNotPresent"},"proxyInitImage":{"imageName":"cr.l5d.io/linkerd/proxy-init","pullPolicy":"IfNotPresent"},"controlPort":{"port":4190},"ignoreInboundPorts":[],"ignoreOutboundPorts":[],"inboundPort":{"port":4143},"adminPort":{"port":4191},"outboundPort":{"port":4140},"resource":{"requestCpu":"","requestMemory":"","limitCpu":"","limitMemory":""},"proxyUid":"2102","logLevel":{"level":"warn,linkerd=info"},"disableExternalProfiles":true,"proxyVersion":"install-proxy-version","proxy_init_image_version":"v1.3.11","debugImage":{"imageName":"cr.l5d.io/linkerd/debug","pullPolicy":"IfNotPresent"},"debugImageVersion":"install-debug-version"}
+    {"proxyImage":{"imageName":"cr.l5d.io/linkerd/proxy","pullPolicy":"IfNotPresent"},"controlPort":{"port":4190},"ignoreInboundPorts":[],"ignoreOutboundPorts":[],"inboundPort":{"port":4143},"adminPort":{"port":4191},"outboundPort":{"port":4140},"resource":{"requestCpu":"","requestMemory":"","limitCpu":"","limitMemory":""},"proxyUid":"2102","proxyGid":"2102","logLevel":{"level":"warn,linkerd=info"},"disableExternalProfiles":true,"proxyVersion":"install-proxy-version","proxy_init_image_version":"v2.3.0","debugImage":{"imageName":"cr.l5d.io/linkerd/debug","pullPolicy":"IfNotPresent"},"debugImageVersion":"install-debug-version"}
   install: |
     {"cliVersion":"dev-undefined","flags":[]}
   values: |
     controllerImage: ControllerImage
     controllerReplicas: 1
     controllerUID: 2103
+    controllerGID: 2103
     debugContainer: null
     destinationProxyResources: null
     destinationResources: null
@@ -2374,20 +1977,16 @@ data:
       clusterNetworks: ClusterNetworks
       cniEnabled: false
       controlPlaneTracing: false
-      controllerImageVersion: ControllerImageVersion
       controllerLogLevel: ControllerLogLevel
       enableEndpointSlices: false
-      grafanaUrl: ""
       highAvailability: false
       imagePullPolicy: ImagePullPolicy
       imagePullSecrets: null
       linkerdVersion: ""
-      namespace: Namespace
       prometheusUrl: ""
       proxy:
         capabilities: null
         component: linkerd-controller
-        disableIdentity: false
         disableTap: false
         enableExternalProfiles: false
         image:
@@ -2409,6 +2008,7 @@ data:
         resources: null
         saMountPath: null
         uid: 2102
+        gid: 2102
         waitBeforeExitSeconds: 0
         workloadKind: deployment
       proxyContainerName: ProxyContainerName
@@ -2417,17 +2017,7 @@ data:
         closeWaitTimeoutSecs: 0
         ignoreInboundPorts: ""
         ignoreOutboundPorts: ""
-        image:
-          name: ProxyInitImageName
-          pullPolicy: ImagePullPolicy
-          version: ProxyInitVersion
         resources:
-          cpu:
-            limit: 100m
-            request: 10m
-          memory:
-            limit: 50Mi
-            request: 10Mi
         saMountPath: null
         xtMountPath:
           mountPath: /run
@@ -2437,10 +2027,8 @@ data:
     heartbeatSchedule: ""
     identityProxyResources: null
     identityResources: null
-    installNamespace: true
     nodeSelector:
-      beta.kubernetes.io/os: linux
-    omitWebhookSideEffects: false
+      kubernetes.io/os: linux
     proxyInjectorProxyResources: null
     proxyInjectorResources: null
     stage: ""
@@ -2449,23 +2037,20 @@ data:
 `,
 			},
 			&linkerd2.Values{
-				ControllerImage:        "ControllerImage",
-				ControllerUID:          2103,
-				EnableH2Upgrade:        true,
-				WebhookFailurePolicy:   "WebhookFailurePolicy",
-				OmitWebhookSideEffects: false,
-				InstallNamespace:       true,
-				NodeSelector:           defaultValues.NodeSelector,
-				Tolerations:            defaultValues.Tolerations,
-				Namespace:              "Namespace",
-				ClusterDomain:          "cluster.local",
-				ClusterNetworks:        "ClusterNetworks",
-				ImagePullPolicy:        "ImagePullPolicy",
-				CliVersion:             "CliVersion",
-				ControllerLogLevel:     "ControllerLogLevel",
-				ControllerImageVersion: "ControllerImageVersion",
-				ProxyContainerName:     "ProxyContainerName",
-				CNIEnabled:             false,
+				ControllerImage:      "ControllerImage",
+				ControllerUID:        2103,
+				ControllerGID:        2103,
+				EnableH2Upgrade:      true,
+				WebhookFailurePolicy: "WebhookFailurePolicy",
+				NodeSelector:         defaultValues.NodeSelector,
+				Tolerations:          defaultValues.Tolerations,
+				ClusterDomain:        "cluster.local",
+				ClusterNetworks:      "ClusterNetworks",
+				ImagePullPolicy:      "ImagePullPolicy",
+				CliVersion:           "CliVersion",
+				ControllerLogLevel:   "ControllerLogLevel",
+				ProxyContainerName:   "ProxyContainerName",
+				CNIEnabled:           false,
 				Proxy: &linkerd2.Proxy{
 					Image: &linkerd2.Image{
 						Name:       "ProxyImageName",
@@ -2481,73 +2066,15 @@ data:
 						Outbound: 4140,
 					},
 					UID: 2102,
+					GID: 2102,
 				},
 				ProxyInit: &linkerd2.ProxyInit{
-					Image: &linkerd2.Image{
-						Name:       "ProxyInitImageName",
-						PullPolicy: "ImagePullPolicy",
-						Version:    "ProxyInitVersion",
-					},
-					Resources: &linkerd2.Resources{
-						CPU: linkerd2.Constraints{
-							Limit:   "100m",
-							Request: "10m",
-						},
-						Memory: linkerd2.Constraints{
-							Limit:   "50Mi",
-							Request: "10Mi",
-						},
-					},
 					XTMountPath: &linkerd2.VolumeMountPath{
 						MountPath: "/run",
 						Name:      "linkerd-proxy-init-xtables-lock",
 					},
 				},
 				ControllerReplicas: 1,
-			},
-			nil,
-		},
-		{
-			[]string{`
-kind: ConfigMap
-apiVersion: v1
-metadata:
-  name: linkerd-config
-  namespace: linkerd
-data:
-  global: |
-    {"linkerdNamespace":"ns","identityContext":null, "cniEnabled": true}
-  proxy: |
-    {"proxyImage":{"imageName":"registry", "pullPolicy":"Always"}}
-  install: |
-    {"flags":[{"name":"ha","value":"true"}]}`,
-			},
-			&linkerd2.Values{
-				Namespace:        "ns",
-				CNIEnabled:       true,
-				HighAvailability: true,
-				Proxy: &linkerd2.Proxy{
-					EnableExternalProfiles: true,
-					Image: &linkerd2.Image{
-						Name:       "registry",
-						PullPolicy: "Always",
-					},
-					LogLevel: "",
-					Ports:    &linkerd2.Ports{},
-					Resources: &linkerd2.Resources{
-						CPU:    linkerd2.Constraints{},
-						Memory: linkerd2.Constraints{},
-					},
-				},
-				ProxyInit: &linkerd2.ProxyInit{
-					Image: &linkerd2.Image{},
-				},
-				Identity: &linkerd2.Identity{
-					Issuer: &linkerd2.Issuer{},
-				},
-				DebugContainer: &linkerd2.DebugContainer{
-					Image: &linkerd2.Image{},
-				},
 			},
 			nil,
 		},
@@ -2562,12 +2089,11 @@ data:
 			}
 
 			_, values, err := FetchCurrentConfiguration(context.Background(), clientset, "linkerd")
-			if !reflect.DeepEqual(err, tc.err) {
-				t.Fatalf("Expected \"%+v\", got \"%+v\"", tc.err, err)
+			if diff := deep.Equal(err, tc.err); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
-
-			if !reflect.DeepEqual(values, tc.expected) {
-				t.Fatalf("Unexpected values:\nExpected:\n%+v\nGot:\n%+v", tc.expected, values)
+			if diff := deep.Equal(values, tc.expected); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 		})
 	}
@@ -2582,8 +2108,13 @@ metadata:
   name: linkerd-config
   namespace: linkerd
 data:
-  global: |
-    {"linkerdNamespace": "linkerd", "identityContext":{"trustAnchorsPem": %s, "trustDomain": "cluster.local", "scheme": "%s"}}
+  values: |
+    namespace: linkerd
+    identityTrustAnchorsPEM: %s
+    identityTrustDomain: cluster.local
+    identity:
+      issuer:
+        scheme: %s
 ---
 `, anchors, scheme)
 }
@@ -2662,8 +2193,8 @@ func runIdentityCheckTestCase(ctx context.Context, t *testing.T, testID int, tes
 
 		obs := newObserver()
 		hc.RunChecks(obs.resultFn)
-		if !reflect.DeepEqual(obs.results, expectedOutput) {
-			t.Fatalf("Expected results %v, but got %v", expectedOutput, obs.results)
+		if diff := deep.Equal(obs.results, expectedOutput); diff != nil {
+			t.Fatalf("%+v", diff)
 		}
 	})
 }
@@ -2719,7 +2250,7 @@ func TestLinkerdIdentityCheckCertConfig(t *testing.T) {
 			schemeInConfig:   string(corev1.SecretTypeTLS),
 			expectedOutput:   []string{"linkerd-identity-test-cat certificate config is valid: not a PEM certificate"},
 			tlsSecretIssuerDataModifier: func(issuerData issuercerts.IssuerCertData) issuercerts.IssuerCertData {
-				issuerData.TrustAnchors = issuerData.TrustAnchors + "\n"
+				issuerData.TrustAnchors += "\n"
 				return issuerData
 			},
 		},
@@ -2803,11 +2334,8 @@ func TestLinkerdIdentityCheckCertValidity(t *testing.T) {
 
 type fakeCniResourcesOpts struct {
 	hasConfigMap          bool
-	hasPodSecurityPolicy  bool
 	hasClusterRole        bool
 	hasClusterRoleBinding bool
-	hasRole               bool
-	hasRoleBinding        bool
 	hasServiceAccount     bool
 	hasDaemonSet          bool
 	scheduled             int
@@ -2828,32 +2356,6 @@ metadata:
     linkerd.io/cni-resource: "true"
 data:
   dest_cni_net_dir: "/etc/cni/net.d"
----
-`)
-	}
-
-	if opts.hasPodSecurityPolicy {
-		resources = append(resources, `
-apiVersion: policy/v1beta1
-kind: PodSecurityPolicy
-metadata:
-  name: linkerd-test-ns-cni
-  labels:
-    linkerd.io/cni-resource: "true"
-spec:
-  allowPrivilegeEscalation: false
-  fsGroup:
-    rule: RunAsAny
-  hostNetwork: true
-  runAsUser:
-    rule: RunAsAny
-  seLinux:
-    rule: RunAsAny
-  supplementalGroups:
-    rule: RunAsAny
-  volumes:
-  - hostPath
-  - secret
 ---
 `)
 	}
@@ -2885,46 +2387,6 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: linkerd-cni
-subjects:
-- kind: ServiceAccount
-  name: linkerd-cni
-  namespace: test-ns
----
-`)
-	}
-
-	if opts.hasRole {
-		resources = append(resources, `
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: linkerd-cni
-  namespace: test-ns
-  labels:
-    linkerd.io/cni-resource: "true"
-rules:
-- apiGroups: ['extensions', 'policy']
-  resources: ['podsecuritypolicies']
-  resourceNames:
-  - linkerd-test-ns-cni
-  verbs: ['use']
----
-`)
-	}
-
-	if opts.hasRoleBinding {
-		resources = append(resources, `
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: linkerd-cni
-  namespace: test-ns
-  labels:
-    linkerd.io/cni-resource: "true"
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
   name: linkerd-cni
 subjects:
 - kind: ServiceAccount
@@ -2975,12 +2437,11 @@ spec:
         linkerd.io/created-by: linkerd/cli git-b4266c93
     spec:
       nodeSelector:
-        beta.kubernetes.io/os: linux
-      hostNetwork: true
+        kubernetes.io/os: linux
       serviceAccountName: linkerd-cni
       containers:
       - name: install-cni
-        image: cr.l5d.io/linkerd/cni-plugin:git-b4266c93
+        image: cr.l5d.io/linkerd/cni-plugin:v1.7.1
         env:
         - name: DEST_CNI_NET_DIR
           valueFrom:
@@ -3038,87 +2499,48 @@ func TestCniChecks(t *testing.T) {
 			[]string{"linkerd-cni-plugin cni plugin ConfigMap exists: configmaps \"linkerd-cni-config\" not found"},
 		},
 		{
-			"fails when there is no pod security policy",
+			"fails then there is no ClusterRole",
 			fakeCniResourcesOpts{hasConfigMap: true},
 			[]string{
 				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists: missing PodSecurityPolicy: linkerd-test-ns-cni"},
-		},
-		{
-			"fails then there is no ClusterRole",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true},
-			[]string{
-				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
 				"linkerd-cni-plugin cni plugin ClusterRole exists: missing ClusterRole: linkerd-cni"},
 		},
 		{
 			"fails then there is no ClusterRoleBinding",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true},
+			fakeCniResourcesOpts{hasConfigMap: true, hasClusterRole: true},
 			[]string{
 				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
 				"linkerd-cni-plugin cni plugin ClusterRole exists",
 				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists: missing ClusterRoleBinding: linkerd-cni"},
 		},
 		{
-			"fails then there is no Role",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true, hasClusterRoleBinding: true},
-			[]string{
-				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
-				"linkerd-cni-plugin cni plugin ClusterRole exists",
-				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists",
-				"linkerd-cni-plugin cni plugin Role exists: missing Role: linkerd-cni"},
-		},
-		{
-			"fails then there is no RoleBinding",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true, hasClusterRoleBinding: true, hasRole: true},
-			[]string{
-				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
-				"linkerd-cni-plugin cni plugin ClusterRole exists",
-				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists",
-				"linkerd-cni-plugin cni plugin Role exists",
-				"linkerd-cni-plugin cni plugin RoleBinding exists: missing RoleBinding: linkerd-cni"},
-		},
-		{
 			"fails then there is no ServiceAccount",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true, hasClusterRoleBinding: true, hasRole: true, hasRoleBinding: true},
+			fakeCniResourcesOpts{hasConfigMap: true, hasClusterRole: true, hasClusterRoleBinding: true},
 			[]string{
 				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
 				"linkerd-cni-plugin cni plugin ClusterRole exists",
 				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists",
-				"linkerd-cni-plugin cni plugin Role exists",
-				"linkerd-cni-plugin cni plugin RoleBinding exists",
 				"linkerd-cni-plugin cni plugin ServiceAccount exists: missing ServiceAccount: linkerd-cni",
 			},
 		},
 		{
 			"fails then there is no DaemonSet",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true, hasClusterRoleBinding: true, hasRole: true, hasRoleBinding: true, hasServiceAccount: true},
+			fakeCniResourcesOpts{hasConfigMap: true, hasClusterRole: true, hasClusterRoleBinding: true, hasServiceAccount: true},
 			[]string{
 				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
 				"linkerd-cni-plugin cni plugin ClusterRole exists",
 				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists",
-				"linkerd-cni-plugin cni plugin Role exists",
-				"linkerd-cni-plugin cni plugin RoleBinding exists",
 				"linkerd-cni-plugin cni plugin ServiceAccount exists",
 				"linkerd-cni-plugin cni plugin DaemonSet exists: missing DaemonSet: linkerd-cni",
 			},
 		},
 		{
 			"fails then there is nodes are not ready",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true, hasClusterRoleBinding: true, hasRole: true, hasRoleBinding: true, hasServiceAccount: true, hasDaemonSet: true, scheduled: 5, ready: 4},
+			fakeCniResourcesOpts{hasConfigMap: true, hasClusterRole: true, hasClusterRoleBinding: true, hasServiceAccount: true, hasDaemonSet: true, scheduled: 5, ready: 4},
 			[]string{
 				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
 				"linkerd-cni-plugin cni plugin ClusterRole exists",
 				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists",
-				"linkerd-cni-plugin cni plugin Role exists",
-				"linkerd-cni-plugin cni plugin RoleBinding exists",
 				"linkerd-cni-plugin cni plugin ServiceAccount exists",
 				"linkerd-cni-plugin cni plugin DaemonSet exists",
 				"linkerd-cni-plugin cni plugin pod is running on all nodes: number ready: 4, number scheduled: 5",
@@ -3126,14 +2548,11 @@ func TestCniChecks(t *testing.T) {
 		},
 		{
 			"fails then there is nodes are not ready",
-			fakeCniResourcesOpts{hasConfigMap: true, hasPodSecurityPolicy: true, hasClusterRole: true, hasClusterRoleBinding: true, hasRole: true, hasRoleBinding: true, hasServiceAccount: true, hasDaemonSet: true, scheduled: 5, ready: 5},
+			fakeCniResourcesOpts{hasConfigMap: true, hasClusterRole: true, hasClusterRoleBinding: true, hasServiceAccount: true, hasDaemonSet: true, scheduled: 5, ready: 5},
 			[]string{
 				"linkerd-cni-plugin cni plugin ConfigMap exists",
-				"linkerd-cni-plugin cni plugin PodSecurityPolicy exists",
 				"linkerd-cni-plugin cni plugin ClusterRole exists",
 				"linkerd-cni-plugin cni plugin ClusterRoleBinding exists",
-				"linkerd-cni-plugin cni plugin Role exists",
-				"linkerd-cni-plugin cni plugin RoleBinding exists",
 				"linkerd-cni-plugin cni plugin ServiceAccount exists",
 				"linkerd-cni-plugin cni plugin DaemonSet exists",
 				"linkerd-cni-plugin cni plugin pod is running on all nodes",
@@ -3161,8 +2580,8 @@ func TestCniChecks(t *testing.T) {
 
 			obs := newObserver()
 			hc.RunChecks(obs.resultFn)
-			if !reflect.DeepEqual(obs.results, tc.results) {
-				t.Fatalf("Expected results\n%s,\nbut got:\n%s", strings.Join(tc.results, "\n"), strings.Join(obs.results, "\n"))
+			if diff := deep.Equal(obs.results, tc.results); diff != nil {
+				t.Fatalf("%+v", diff)
 			}
 		})
 	}
@@ -3213,7 +2632,7 @@ func TestMinReplicaCheck(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		tc := tc //pin
+		tc := tc // pin
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
 			hc.kubeAPI, err = k8s.NewFakeAPI(tc.controlPlaneResourceDefs...)
 			if err != nil {
@@ -3231,6 +2650,488 @@ func TestMinReplicaCheck(t *testing.T) {
 					t.Logf("Received error: %s\n", err)
 					t.Fatal("test case failed")
 				}
+			}
+		})
+	}
+}
+
+func TestCheckOpaquePortAnnotations(t *testing.T) {
+	hc := NewHealthChecker(
+		[]CategoryID{LinkerdOpaquePortsDefinitionChecks},
+		&Options{
+			DataPlaneNamespace: "test-ns",
+		},
+	)
+
+	var err error
+
+	var testCases = []struct {
+		resources []string
+		expected  error
+	}{
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "9200"
+spec:
+  selector:
+    app: test
+  ports:
+  - name: test
+    port: 9200
+    targetPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  labels:
+    app: test
+  annotations:
+    config.linkerd.io/opaque-ports: "9200"
+spec:
+  containers:
+  - name: test
+    image: test
+    ports:
+    - name: test
+      containerPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.244.3.12
+    nodeName: nod
+    targetRef:
+      kind: Pod
+      name: pod
+      namespace: test-ns
+  ports:
+  - name: test
+    port: 9200
+    protocol: TCP
+`,
+			},
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+spec:
+  selector:
+    app: test
+  ports:
+  - name: http
+    port: 9200
+    targetPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  labels:
+    app: test
+  annotations:
+    config.linkerd.io/opaque-ports: "9200"
+spec:
+  containers:
+  - name: test
+    image: test
+    ports:
+    - name: test
+      containerPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.244.3.12
+    nodeName: nod
+    targetRef:
+      kind: Pod
+      name: pod
+      namespace: test-ns
+  ports:
+  - name: test
+    port: 9200
+    protocol: TCP
+`,
+			},
+			expected: fmt.Errorf("\t* service svc targets the opaque port 9200 through 9200; add 9200 to its config.linkerd.io/opaque-ports annotation"),
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "9200"
+spec:
+  selector:
+    app: test
+  ports:
+  - name: test
+    port: 9200
+    targetPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  labels:
+    app: test
+spec:
+  containers:
+  - name: test
+    image: test
+    ports:
+    - name: test
+      containerPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.244.3.12
+    nodeName: nod
+    targetRef:
+      kind: Pod
+      name: pod
+      namespace: test-ns
+  ports:
+  - name: test
+    port: 9200
+    protocol: TCP
+`,
+			},
+			expected: fmt.Errorf("\t* service svc expects target port 9200 to be opaque; add it to pod pod config.linkerd.io/opaque-ports annotation"),
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "9200"
+spec:
+  selector:
+    app: test
+  ports:
+    - name: test
+      port: 9200
+      targetPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  labels:
+    app: test
+  annotations:
+    config.linkerd.io/opaque-ports: "9300"
+spec:
+  containers:
+  - name: test
+    image: test
+    ports:
+    - name: test
+      containerPort: 9300
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.244.3.12
+    nodeName: node
+    targetRef:
+      kind: Pod
+      name: pod
+      namespace: test-ns
+  ports:
+  - name: test
+    port: 9200
+    protocol: TCP
+`,
+			},
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+spec:
+  selector:
+    app: test
+  ports:
+  - name: test
+    port: 1002
+    targetPort: 2002
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "2002"
+  labels:
+    app: test
+spec:
+  containers:
+  - name: test
+    image: test
+    ports:
+    - name: test
+      containerPort: 2002
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.42.0.111
+    nodeName: node
+    targetRef:
+      kind: Pod
+      name: pod
+  ports:
+  - name: test
+    port: 2002
+    protocol: TCP
+`,
+			},
+			expected: fmt.Errorf("\t* service svc targets the opaque port 2002 through 1002; add 1002 to its config.linkerd.io/opaque-ports annotation"),
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+spec:
+  selector:
+    app: test
+  ports:
+  - name: test
+    port: 1003
+    targetPort: pod-test
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "2003"
+  labels:
+    app: test
+spec:
+  containers:
+  - name: test
+    image: test
+    ports:
+    - name: pod-test
+      containerPort: 2003
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.42.0.112
+    nodeName: node
+    targetRef:
+      kind: Pod
+      name: pod
+  ports:
+  - name: test
+    port: 2003
+    protocol: TCP
+`,
+			},
+			expected: fmt.Errorf("\t* service svc targets the opaque port pod-test through 1003; add 1003 to its config.linkerd.io/opaque-ports annotation"),
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+spec:
+  selector:
+    app: test
+  ports:
+  - port: 80
+    targetPort: 6502
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "5432"
+  labels:
+    app: test
+spec:
+  containers:
+  - name: c1
+    image: test
+    ports:
+    - containerPort: 6502
+  - name: c2
+    image: test
+    ports:
+    - containerPort: 5432
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.42.0.112
+    nodeName: node
+    targetRef:
+      kind: Pod
+      name: pod
+  ports:
+  - port: 6502
+    protocol: TCP
+  - port: 5432
+    protocol: TCP
+`,
+			},
+			expected: nil,
+		},
+		{
+			resources: []string{`
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc
+  namespace: test-ns
+  annotations:
+    config.linkerd.io/opaque-ports: "9200"
+spec:
+  selector:
+    app: test
+  ports:
+  - name: test
+    port: 9200
+    targetPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod
+  namespace: test-ns
+  labels:
+    app: test
+spec:
+  initContainers:
+  - name: test
+    image: test
+    restartPolicy: Always
+    ports:
+    - name: test
+      containerPort: 9200
+`,
+				`
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc
+  namespace: test-ns
+subsets:
+- addresses:
+  - ip: 10.244.3.12
+    nodeName: nod
+    targetRef:
+      kind: Pod
+      name: pod
+      namespace: test-ns
+  ports:
+  - name: test
+    port: 9200
+    protocol: TCP
+`,
+			},
+			expected: fmt.Errorf("\t* service svc expects target port 9200 to be opaque; add it to pod pod config.linkerd.io/opaque-ports annotation"),
+		},
+	}
+
+	for i, tc := range testCases {
+		tc := tc // pin
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			hc.kubeAPI, err = k8s.NewFakeAPI(tc.resources...)
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+			err = hc.checkMisconfiguredOpaquePortAnnotations(context.Background())
+			if err == nil && tc.expected != nil {
+				t.Fatalf("Expected check to fail with %s", tc.expected.Error())
+			}
+			if err != nil && tc.expected != nil {
+				if err.Error() != tc.expected.Error() {
+					t.Fatalf("Expected error: %s, received: %s", tc.expected, err)
+				}
+			}
+			if err != nil && tc.expected == nil {
+				t.Fatalf("Did not expect error but got: %s", err.Error())
 			}
 		})
 	}
@@ -3277,4 +3178,12 @@ func generateAllControlPlaneDef(replicaOptions *controlPlaneReplicaOptions, t *t
 		}
 	}
 	return resourceDefs
+}
+
+func multiappend(slices ...[]string) []string {
+	res := []string{}
+	for _, slice := range slices {
+		res = append(res, slice...)
+	}
+	return res
 }

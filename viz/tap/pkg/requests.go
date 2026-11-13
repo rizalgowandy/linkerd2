@@ -3,10 +3,9 @@ package pkg
 import (
 	"fmt"
 
-	"github.com/linkerd/linkerd2/controller/api/util"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	metricsPb "github.com/linkerd/linkerd2/viz/metrics-api/gen/viz"
-	"github.com/linkerd/linkerd2/viz/pkg"
+	"github.com/linkerd/linkerd2/viz/pkg/util"
 	tapPb "github.com/linkerd/linkerd2/viz/tap/gen/tap"
 )
 
@@ -46,9 +45,9 @@ type TapRequestParams struct {
 func BuildTapByResourceRequest(params TapRequestParams) (*tapPb.TapByResourceRequest, error) {
 	target, err := util.BuildResource(params.Namespace, params.Resource)
 	if err != nil {
-		return nil, fmt.Errorf("target resource invalid: %s", err)
+		return nil, fmt.Errorf("target resource invalid: %w", err)
 	}
-	if !contains(pkg.ValidTargets, target.Type) {
+	if !contains(util.ValidTargets, target.Type) {
 		return nil, fmt.Errorf("unsupported resource type [%s]", target.Type)
 	}
 
@@ -57,7 +56,7 @@ func BuildTapByResourceRequest(params TapRequestParams) (*tapPb.TapByResourceReq
 	if params.ToResource != "" {
 		destination, err := util.BuildResource(params.ToNamespace, params.ToResource)
 		if err != nil {
-			return nil, fmt.Errorf("destination resource invalid: %s", err)
+			return nil, fmt.Errorf("destination resource invalid: %w", err)
 		}
 		if !contains(ValidTapDestinations, destination.Type) {
 			return nil, fmt.Errorf("unsupported resource type [%s]", destination.Type)

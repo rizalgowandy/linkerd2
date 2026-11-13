@@ -2,8 +2,9 @@ package util
 
 import (
 	"fmt"
-	"reflect"
 	"testing"
+
+	"github.com/go-test/deep"
 )
 
 func TestParsePorts(t *testing.T) {
@@ -44,13 +45,9 @@ func TestParsePorts(t *testing.T) {
 	for _, tc := range testCases {
 		tc := tc // pin
 		t.Run(fmt.Sprintf("test %s", tc.ports), func(t *testing.T) {
-			ports, err := ParsePorts(tc.ports)
-			if err != nil {
-				t.Fatalf("could not parse ports: %v", err)
-			}
-
-			if !reflect.DeepEqual(ports, tc.result) {
-				t.Fatalf("Expected output: \"%v\", got: \"%v\"", tc.result, ports)
+			ports := ParsePorts(tc.ports)
+			if diff := deep.Equal(ports, tc.result); diff != nil {
+				t.Errorf("%v", diff)
 			}
 		})
 	}

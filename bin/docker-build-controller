@@ -15,6 +15,4 @@ rootdir=$( cd "$bindir"/.. && pwd )
 # shellcheck source=_tag.sh
 . "$bindir"/_tag.sh
 
-dockerfile=$rootdir/controller/Dockerfile
-tag=$(head_root_tag)
-docker_build controller "$tag" "$dockerfile" --build-arg LINKERD_VERSION="$tag"
+docker_build controller "${TAG:-$(head_root_tag)}" "$rootdir/Dockerfile.controller" --build-arg LINKERD_VERSION="${TAG:-$(head_root_tag)}"

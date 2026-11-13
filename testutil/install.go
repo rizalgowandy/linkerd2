@@ -8,6 +8,7 @@ import (
 
 // TestResourcesPostInstall tests resources post control plane installation
 func TestResourcesPostInstall(namespace string, services []Service, deploys map[string]DeploySpec, h *TestHelper, t *testing.T) {
+	t.Helper()
 	ctx := context.Background()
 	// Tests Namespace
 	err := h.CheckIfNamespaceExists(ctx, namespace)
@@ -27,6 +28,7 @@ func TestResourcesPostInstall(namespace string, services []Service, deploys map[
 	// Tests Pods and Deployments
 	for deploy, spec := range deploys {
 		if err := h.CheckPods(ctx, spec.Namespace, deploy, spec.Replicas); err != nil {
+			//nolint:errorlint
 			if rce, ok := err.(*RestartCountError); ok {
 				AnnotatedWarn(t, "CheckPods timed-out", rce)
 			} else {

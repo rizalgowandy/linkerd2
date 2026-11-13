@@ -1,13 +1,9 @@
-import { OctopusArms, inboundAlignment } from './util/OctopusArms.jsx';
-import { displayName, metricToFormatter } from './util/Utils.js';
-
 import Card from '@material-ui/core/Card';
 import CardContent from '@material-ui/core/CardContent';
 import Grid from '@material-ui/core/Grid';
 import PropTypes from 'prop-types';
 import React from 'react';
 import RootRef from '@material-ui/core/RootRef';
-import { StyledProgress } from './util/Progress.jsx';
 import Table from '@material-ui/core/Table';
 import TableBody from '@material-ui/core/TableBody';
 import TableCell from '@material-ui/core/TableCell';
@@ -20,8 +16,11 @@ import _size from 'lodash/size';
 import _slice from 'lodash/slice';
 import _sortBy from 'lodash/sortBy';
 import _take from 'lodash/take';
-import { getSuccessRateClassification } from './util/MetricUtils.jsx';
 import { withStyles } from '@material-ui/core/styles';
+import { getSuccessRateClassification } from './util/MetricUtils.jsx';
+import { StyledProgress } from './util/Progress.jsx';
+import { displayName, metricToFormatter } from './util/Utils.js';
+import { OctopusArms, inboundAlignment } from './util/OctopusArms.jsx';
 
 const maxNumNeighbors = 6; // max number of neighbor nodes to show in the octopus graph
 
@@ -56,7 +55,7 @@ class Octopus extends React.Component {
     this.downstreamsRefs = [];
   }
 
-  getNeighborDisplayData = neighbors => {
+  static getNeighborDisplayData(neighbors) {
     // only display maxNumNeighbors neighboring nodes in the octopus graph,
     // otherwise it will be really tall
     // even though _sortBy is a stable sort, the order that this data is returned by the API
@@ -97,7 +96,7 @@ class Octopus extends React.Component {
         this.upstreamsRefs[index] = element;
       }
     }
-  }
+  };
 
   linkedResourceTitle = (resource, display) => {
     // trafficsplit leaf resources cannot be linked
@@ -105,7 +104,7 @@ class Octopus extends React.Component {
 
     const { api: { ResourceLink } } = this.props;
     return <ResourceLink resource={resource} linkText={display} />;
-  }
+  };
 
   renderResourceCard(resource, type, index, isOutbound) {
     const { classes } = this.props;
@@ -128,13 +127,13 @@ class Octopus extends React.Component {
             <CardContent>
 
               <Typography variant={type === 'neighbor' ? 'subtitle1' : 'h6'} align="center">
-                { this.linkedResourceTitle(resource, display) }
+                {this.linkedResourceTitle(resource, display)}
               </Typography>
 
               <Progress variant="determinate" value={resource.successRate * 100} />
 
               <Table>
-                {showTcp ? this.renderTCPStats(resource) : this.renderHttpStats(resource)}
+                {showTcp ? Octopus.renderTCPStats(resource) : Octopus.renderHttpStats(resource)}
               </Table>
             </CardContent>
           </Card>
@@ -143,14 +142,14 @@ class Octopus extends React.Component {
     );
   }
 
-  renderHttpStats = resource => {
+  static renderHttpStats(resource) {
     return (
       <TableBody>
         {resource.isLeafService &&
-        <TableRow>
-          <TableCell><Typography>Weight</Typography></TableCell>
-          <TableCell align="right"><Typography>{resource.tsStats.weight}</Typography></TableCell>
-        </TableRow>
+          <TableRow>
+            <TableCell><Typography>Weight</Typography></TableCell>
+            <TableCell align="right"><Typography>{resource.tsStats.weight}</Typography></TableCell>
+          </TableRow>
         }
         <TableRow>
           <TableCell><Typography>SR</Typography></TableCell>
@@ -161,16 +160,16 @@ class Octopus extends React.Component {
           <TableCell align="right"><Typography>{metricToFormatter.NO_UNIT(resource.requestRate)}</Typography></TableCell>
         </TableRow>
         {!resource.isApexService &&
-        <TableRow>
-          <TableCell><Typography>P99</Typography></TableCell>
-          <TableCell align="right"><Typography>{metricToFormatter.LATENCY(_get(resource, 'latency.P99'))}</Typography></TableCell>
-        </TableRow>
+          <TableRow>
+            <TableCell><Typography>P99</Typography></TableCell>
+            <TableCell align="right"><Typography>{metricToFormatter.LATENCY(_get(resource, 'latency.P99'))}</Typography></TableCell>
+          </TableRow>
         }
       </TableBody>
     );
   }
 
-  renderTCPStats = resource => {
+  static renderTCPStats(resource) {
     const { tcp } = resource;
     return (
       <TableBody>
@@ -209,7 +208,7 @@ class Octopus extends React.Component {
         </Grid>
       </RootRef>
     );
-  }
+  };
 
   renderCollapsedNeighbors = (neighbors, index, isOutbound) => {
     const { classes } = this.props;
@@ -220,7 +219,7 @@ class Octopus extends React.Component {
           <Card className={classes.neighborNode}>
             <CardContent>
               <Typography variant="subtitle1">
-                + { neighbors.length } more...
+                + {neighbors.length} more...
               </Typography>
               <Progress variant="determinate" value={100} />
               {
@@ -234,7 +233,7 @@ class Octopus extends React.Component {
         </Grid>
       </RootRef>
     );
-  }
+  };
 
   renderArrowCol = (numNeighbors, isOutbound) => {
     const container = !isOutbound ? this.upstreamsContainer : this.downstreamsContainer;
@@ -256,12 +255,12 @@ class Octopus extends React.Component {
         const height = elementTop + halfElement;
         return { type: 'flat', inboundType: 'flat', height };
 
-      // Elements underneath main element
+        // Elements underneath main element
       } else if (elementTop + halfElement >= fullHeight / 2) {
         const height = !isOutbound ? elementTop - fullHeight / 2 + halfElement - inboundAlignment : fullHeight - elementTop - halfElement + inboundAlignment;
         return { type: 'down', inboundType: 'up', height, elementHeight };
 
-      // Elements over main element
+        // Elements over main element
       } else {
         const height = !isOutbound ? elementTop + halfElement + inboundAlignment : fullHeight / 2 - elementTop - halfElement - inboundAlignment;
         return { type: 'up', inboundType: 'down', height, elementHeight };
@@ -281,7 +280,7 @@ class Octopus extends React.Component {
     );
 
     return svg;
-  }
+  };
 
   render() {
     const { resource, neighbors, unmeshedSources, classes } = this.props;
@@ -290,10 +289,10 @@ class Octopus extends React.Component {
       return null;
     }
 
-    const display = this.getNeighborDisplayData(neighbors);
+    const display = Octopus.getNeighborDisplayData(neighbors);
 
     const numUpstreams = _size(display.upstreams.displayed) + (_isEmpty(unmeshedSources) ? 0 : 1) +
-       (_isEmpty(display.upstreams.collapsed) ? 0 : 1);
+      (_isEmpty(display.upstreams.collapsed) ? 0 : 1);
 
     const numDownstreams = _size(display.downstreams.displayed) + (_isEmpty(display.downstreams.collapsed) ? 0 : 1);
 
@@ -303,7 +302,7 @@ class Octopus extends React.Component {
           <Grid
             container
             direction="row"
-            justify="center"
+            justifyContent="center"
             alignItems="center">
 
             <RootRef rootRef={this.upstreamsContainer}>
@@ -311,7 +310,7 @@ class Octopus extends React.Component {
                 container
                 spacing={3}
                 direction="column"
-                justify="center"
+                justifyContent="center"
                 alignItems="center"
                 item
                 xs={3}>
@@ -338,7 +337,7 @@ class Octopus extends React.Component {
                 container
                 spacing={3}
                 direction="column"
-                justify="center"
+                justifyContent="center"
                 alignItems="center"
                 item
                 xs={3}>

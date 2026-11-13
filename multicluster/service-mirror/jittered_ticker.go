@@ -38,7 +38,7 @@ func NewTicker(minDuration time.Duration, maxJitter time.Duration) *Ticker {
 	if maxJitter < 0 {
 		log.WithField("jitter", minDuration).Panic("Negative jitter")
 	}
-	c := make(chan time.Time, 1)
+	c := make(chan time.Time)
 	ticker := &Ticker{
 		C:           c,
 		stop:        make(chan bool),
@@ -66,6 +66,9 @@ tickLoop:
 }
 
 func (t *Ticker) calculateDelay() time.Duration {
+	// The weakness of this random number generator is not significant for
+	// calculating a delay.
+	//nolint:gosec
 	jitter := time.Duration(rand.Int63n(int64(t.MaxJitter)))
 	delay := t.MinDuration + jitter
 	return delay

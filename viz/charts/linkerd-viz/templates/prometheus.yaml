@@ -7,11 +7,12 @@ kind: ConfigMap
 apiVersion: v1
 metadata:
   name: prometheus-config
-  namespace: {{.Values.namespace}}
+  namespace: {{ .Release.Namespace }}
   labels:
     linkerd.io/extension: viz
     component: prometheus
-    namespace: {{.Values.namespace}}
+    namespace: {{.Release.Namespace}}
+    {{- with .Values.commonLabels }}{{ toYaml . | trim | nindent 4 }}{{- end }}
   annotations:
     {{ include "partials.annotations.created-by" . }}
 data:
@@ -29,19 +30,6 @@ data:
     - job_name: 'prometheus'
       static_configs:
       - targets: ['localhost:9090']
-
-    {{ if .Values.grafana.enabled -}}
-    - job_name: 'grafana'
-      kubernetes_sd_configs:
-      - role: pod
-        namespaces:
-          names: ['{{.Values.namespace}}']
-      relabel_configs:
-      - source_labels:
-        - __meta_kubernetes_pod_container_name
-        action: keep
-        regex: ^grafana$
-    {{- end }}
 
     #  Required for: https://grafana.com/grafana/dashboards/315
     - job_name: 'kubernetes-nodes-cadvisor'
@@ -75,25 +63,33 @@ data:
         namespaces:
           names:
           - '{{.Values.linkerdNamespace}}'
-          - '{{.Values.namespace}}'
+          - '{{.Release.Namespace}}'
       relabel_configs:
       - source_labels:
         - __meta_kubernetes_pod_container_port_name
         action: keep
-        regex: admin-http
+        regex: .*admin$
+      - source_labels:
+        - __meta_kubernetes_pod_container_port_name
+        action: drop
+        regex: linkerd-admin
       - source_labels: [__meta_kubernetes_pod_container_name]
         action: replace
         target_label: component
 
-    - job_name: 'linkerd-service-mirror'
+    - job_name: 'linkerd-multicluster-controller'
       kubernetes_sd_configs:
       - role: pod
       relabel_configs:
       - source_labels:
-        - __meta_kubernetes_pod_label_linkerd_io_control_plane_component
+        - __meta_kubernetes_pod_label_component
         - __meta_kubernetes_pod_container_port_name
         action: keep
-        regex: linkerd-service-mirror;admin-http$
+        regex: (linkerd-service-mirror|controller);.*-admin$
+      - source_labels:
+        - __meta_kubernetes_pod_container_port_name
+        action: drop
+        regex: linkerd-admin
       - source_labels: [__meta_kubernetes_pod_container_name]
         action: replace
         target_label: component
@@ -102,6 +98,9 @@ data:
       kubernetes_sd_configs:
       - role: pod
       relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_phase]
+        regex: (Pending|Running)
+        action: keep
       - source_labels:
         - __meta_kubernetes_pod_container_name
         - __meta_kubernetes_pod_container_port_name
@@ -149,6 +148,10 @@ data:
       # Copy tmp labels into real labels
       - action: labelmap
         regex: __tmp_pod_label_(.+)
+      {{- if .Values.prometheus.metricRelabelConfigs }}
+      metric_relabel_configs:
+      {{- toYaml .Values.prometheus.metricRelabelConfigs | trim | nindent 6 }}
+      {{- end}}
 
     {{- if .Values.prometheus.scrapeConfigs }}
     {{- toYaml .Values.prometheus.scrapeConfigs | trim | nindent 4 }}
@@ -168,27 +171,29 @@ data:
 
     {{- if .Values.prometheus.remoteWrite }}
     remote_write:
-      {{- toYaml .Values.prometheus.remoteWrite | trim | nindent 4 }}
+      {{- toYaml .Values.prometheus.remoteWrite | trim | nindent 6 }}
     {{- end }}
 ---
 kind: Service
 apiVersion: v1
 metadata:
   name: prometheus
-  namespace: {{.Values.namespace}}
+  namespace: {{ .Release.Namespace }}
   labels:
     linkerd.io/extension: viz
     component: prometheus
-    namespace: {{.Values.namespace}}
+    namespace: {{.Release.Namespace}}
+    {{- with .Values.commonLabels }}{{ toYaml . | trim | nindent 4 }}{{- end }}
   annotations:
     {{ include "partials.annotations.created-by" . }}
+    linkerd.io/inject: enabled
 spec:
   type: ClusterIP
   selector:
     linkerd.io/extension: viz
     component: prometheus
   ports:
-  - name: admin-http
+  - name: admin
     port: 9090
     targetPort: 9090
 ---
@@ -197,17 +202,21 @@ kind: Deployment
 metadata:
   annotations:
     {{ include "partials.annotations.created-by" . }}
+    linkerd.io/inject: enabled
+    config.linkerd.io/proxy-await: "enabled"
   labels:
     linkerd.io/extension: viz
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/part-of: Linkerd
-    app.kubernetes.io/version: {{default .Values.linkerdVersion .Values.cliVersion}}
+    app.kubernetes.io/version: {{.Values.linkerdVersion}}
     component: prometheus
-    namespace: {{.Values.namespace}}
+    namespace: {{.Release.Namespace}}
+    {{- with .Values.commonLabels }}{{ toYaml . | trim | nindent 4 }}{{- end }}
   name: prometheus
-  namespace: {{.Values.namespace}}
+  namespace: {{ .Release.Namespace }}
 spec:
   replicas: 1
+  revisionHistoryLimit: {{.Values.revisionHistoryLimit}}
   {{- if .Values.prometheus.persistence }}
   strategy:
     type: Recreate
@@ -216,7 +225,7 @@ spec:
     matchLabels:
       linkerd.io/extension: viz
       component: prometheus
-      namespace: {{.Values.namespace}}
+      namespace: {{.Release.Namespace}}
   template:
     metadata:
       annotations:
@@ -224,19 +233,21 @@ spec:
         {{- with .Values.prometheus.proxy }}
         {{- include "partials.proxy.config.annotations" .resources | nindent 8 }}
         {{- end }}
-        {{- with .Values.podAnnotations }}{{  . | trim | nindent 8 }}{{- end }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | trim | nindent 8 }}{{- end }}
+        {{- with .Values.prometheus.podAnnotations }}{{ toYaml . | trim | nindent 8 }}{{- end }}
+        linkerd.io/inject: enabled
+        config.alpha.linkerd.io/proxy-wait-before-exit-seconds: "0"
       labels:
         linkerd.io/extension: viz
         component: prometheus
-        namespace: {{.Values.namespace}}
+        namespace: {{.Release.Namespace}}
         {{- with .Values.podLabels }}{{ toYaml . | trim | nindent 8 }}{{- end }}
     spec:
-      {{- if .Values.tolerations -}}
-      {{- include "linkerd.tolerations" . | nindent 6 }}
+      {{- if .Values.prometheus.tolerations -}}
+      {{- include "linkerd.tolerations" (dict "Values" .Values.prometheus) | nindent 6 }}
       {{- end -}}
-      {{- include "linkerd.node-selector" . | nindent 6 }}
-      securityContext:
-        fsGroup: 65534
+      {{- include "linkerd.node-selector" (dict "Values" .Values.prometheus) | nindent 6 }}
+      automountServiceAccountToken: false
       containers:
       {{- if .Values.prometheus.sidecarContainers -}}
       {{- toYaml .Values.prometheus.sidecarContainers | trim | nindent 6 }}
@@ -244,6 +255,9 @@ spec:
       - args:
         {{- if not (hasKey .Values.prometheus.args "log.level") }}
         - --log.level={{.Values.prometheus.logLevel | default .Values.defaultLogLevel}}
+        {{- end }}
+        {{- if not (hasKey .Values.prometheus.args "log.format") }}
+        - --log.format={{.Values.prometheus.logFormat | default .Values.defaultLogFormat | replace "plain" "logfmt" }}
         {{- end }}
         {{- range $key, $value := .Values.prometheus.args}}
         - --{{ $key }}{{ if $value }}={{ $value }}{{ end }}
@@ -259,7 +273,7 @@ spec:
         name: prometheus
         ports:
         - containerPort: 9090
-          name: admin-http
+          name: admin
         readinessProbe:
           httpGet:
             path: /-/ready
@@ -270,9 +284,16 @@ spec:
         {{- include "partials.resources" .Values.prometheus.resources | nindent 8 }}
         {{- end }}
         securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsGroup: 65534
           runAsNonRoot: true
           runAsUser: 65534
-          runAsGroup: 65534
+          seccompProfile:
+            type: RuntimeDefault
         volumeMounts:
       {{- range .Values.prometheus.ruleConfigMapMounts }}
         - name: {{ .name }}
@@ -286,6 +307,13 @@ spec:
           name: prometheus-config
           subPath: prometheus.yml
           readOnly: true
+        - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          name: kube-api-access
+          readOnly: true
+      securityContext:
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: prometheus
       volumes:
     {{- range .Values.prometheus.ruleConfigMapMounts }}
@@ -303,6 +331,7 @@ spec:
       - configMap:
           name: prometheus-config
         name: prometheus-config
+      - {{- include "partials.volumes.manual-mount-service-account-token" . | indent 8 | trimPrefix (repeat 7 " ") }}
 {{- if .Values.prometheus.persistence }}
 ---
 kind: PersistentVolumeClaim
@@ -312,10 +341,11 @@ metadata:
     linkerd.io/extension: viz
     app.kubernetes.io/name: prometheus
     app.kubernetes.io/part-of: Linkerd
-    app.kubernetes.io/version: {{default .Values.linkerdVersion}}
+    app.kubernetes.io/version: {{.Values.linkerdVersion}}
     component: prometheus
+    {{- with .Values.commonLabels }}{{ toYaml . | trim | nindent 4 }}{{- end }}
   name: prometheus
-  namespace: {{.Values.namespace}}
+  namespace: {{ .Release.Namespace }}
 spec:
   accessModes:
     - {{ .Values.prometheus.persistence.accessMode | quote }}

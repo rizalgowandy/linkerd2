@@ -8,6 +8,7 @@ package k8s
 import (
 	"fmt"
 
+	ewv1beta1 "github.com/linkerd/linkerd2/controller/gen/apis/externalworkload/v1beta1"
 	"github.com/linkerd/linkerd2/pkg/version"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -20,10 +21,6 @@ const (
 
 	// Prefix is the prefix common to all labels and annotations injected by Linkerd
 	Prefix = "linkerd.io"
-
-	// LinkerdNamespaceLabel is a label that helps identifying the namespaces
-	// that contain a Linkerd control plane
-	LinkerdNamespaceLabel = Prefix + "/is-control-plane"
 
 	// LinkerdExtensionLabel is a label that helps identifying the namespace
 	// that contain a Linkerd Extension
@@ -84,7 +81,7 @@ const (
 	// Enabled is used by annotations whose valid values include "enabled".
 	Enabled = "enabled"
 
-	// Disabled is used by annotations whose valid values incluce "disabled".
+	// Disabled is used by annotations whose valid values include "disabled".
 	Disabled = "disabled"
 
 	/*
@@ -94,10 +91,6 @@ const (
 	// CreatedByAnnotation indicates the source of the injected data plane
 	// (e.g. linkerd/cli v2.0.0).
 	CreatedByAnnotation = Prefix + "/created-by"
-
-	// IdentityIssuerExpiryAnnotation indicates the time at which this set of identity
-	// issuer credentials will cease to be valid.
-	IdentityIssuerExpiryAnnotation = Prefix + "/identity-issuer-expiry"
 
 	// ProxyVersionAnnotation indicates the version of the injected data plane
 	// (e.g. v0.1.3).
@@ -120,9 +113,9 @@ const (
 	// disable injection for a pod or namespace.
 	ProxyInjectDisabled = Disabled
 
-	// IdentityModeAnnotation controls how a pod participates
-	// in service identity.
-	IdentityModeAnnotation = Prefix + "/identity-mode"
+	// ProxyTrustRootSHA indicates the cert bundle configured on the injected
+	// workload.
+	ProxyTrustRootSHA = Prefix + "/trust-root-sha256"
 
 	/*
 	 * Proxy config annotations
@@ -134,19 +127,15 @@ const (
 	// ProxyConfigAnnotationsPrefixAlpha is the prefix of newly released config-related annotations
 	ProxyConfigAnnotationsPrefixAlpha = "config.alpha.linkerd.io"
 
+	// ProxyConfigAnnotationsPrefixBeta is the prefix for config-related annotations more mature than alpha but not yet stable
+	ProxyConfigAnnotationsPrefixBeta = "config.beta.linkerd.io"
+
 	// ProxyImageAnnotation can be used to override the proxyImage config.
 	ProxyImageAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-image"
 
 	// ProxyImagePullPolicyAnnotation can be used to override the
 	// proxyImagePullPolicy and proxyInitImagePullPolicy configs.
 	ProxyImagePullPolicyAnnotation = ProxyConfigAnnotationsPrefix + "/image-pull-policy"
-
-	// ProxyInitImageAnnotation can be used to override the proxyInitImage
-	// config.
-	ProxyInitImageAnnotation = ProxyConfigAnnotationsPrefix + "/init-image"
-
-	// ProxyInitImageVersionAnnotation can be used to override the proxy-init image version
-	ProxyInitImageVersionAnnotation = ProxyConfigAnnotationsPrefix + "/init-image-version"
 
 	// DebugImageAnnotation can be used to override the debugImage config.
 	DebugImageAnnotation = ProxyConfigAnnotationsPrefix + "/debug-image"
@@ -172,6 +161,9 @@ const (
 	// ignoreOutboundPorts config.
 	ProxyIgnoreOutboundPortsAnnotation = ProxyConfigAnnotationsPrefix + "/skip-outbound-ports"
 
+	// ProxySkipSubnetsAnnotation can be used to override the skipSubnets config
+	ProxySkipSubnetsAnnotation = ProxyConfigAnnotationsPrefix + "/skip-subnets"
+
 	// ProxyInboundPortAnnotation can be used to override the inboundPort config.
 	ProxyInboundPortAnnotation = ProxyConfigAnnotationsPrefix + "/inbound-port"
 
@@ -182,6 +174,12 @@ const (
 	// config.
 	ProxyOutboundPortAnnotation = ProxyConfigAnnotationsPrefix + "/outbound-port"
 
+	// ProxyPodInboundPortsAnnotation can be used to set a comma-separated
+	// list of (non-proxy) container ports exposed by the pod spec. Useful
+	// when other mutating webhooks inject sidecar containers after the
+	// proxy injector has run.
+	ProxyPodInboundPortsAnnotation = ProxyConfigAnnotationsPrefix + "/pod-inbound-ports"
+
 	// ProxyCPURequestAnnotation can be used to override the requestCPU config.
 	ProxyCPURequestAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-cpu-request"
 
@@ -189,17 +187,37 @@ const (
 	// requestMemoryConfig.
 	ProxyMemoryRequestAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-memory-request"
 
+	// ProxyEphemeralStorageRequestAnnotation can be used to override the requestEphemeralStorage config.
+	ProxyEphemeralStorageRequestAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-ephemeral-storage-request"
+
 	// ProxyCPULimitAnnotation can be used to override the limitCPU config.
 	ProxyCPULimitAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-cpu-limit"
+
+	// ProxyCPURatioLimitAnnotation can be used to configure
+	// proxy worker threads as a proportion of the node's available CPUs.
+	ProxyCPURatioLimitAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-cpu-ratio-limit"
 
 	// ProxyMemoryLimitAnnotation can be used to override the limitMemory config.
 	ProxyMemoryLimitAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-memory-limit"
 
+	// ProxyEphemeralStorageLimitAnnotation can be used to override the limitEphemeralStorage config.
+	ProxyEphemeralStorageLimitAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-ephemeral-storage-limit"
+
 	// ProxyUIDAnnotation can be used to override the UID config.
 	ProxyUIDAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-uid"
 
+	// ProxyGIDAnnotation can be used to override the GID config.
+	ProxyGIDAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-gid"
+
+	// ProxyAdminShutdownAnnotation can be used to override the
+	// LINKERD2_PROXY_SHUTDOWN_ENDPOINT_ENABLED config.
+	ProxyAdminShutdownAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-admin-shutdown"
+
 	// ProxyLogLevelAnnotation can be used to override the log level config.
 	ProxyLogLevelAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-log-level"
+
+	// ProxyLogHTTPHeaders can be used to override if the proxy is permitted to log HTTP headers.
+	ProxyLogHTTPHeaders = ProxyConfigAnnotationsPrefix + "/proxy-log-http-headers"
 
 	// ProxyLogFormatAnnotation can be used to override the log format config.
 	ProxyLogFormatAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-log-format"
@@ -217,18 +235,37 @@ const (
 
 	// ProxyOutboundConnectTimeout can be used to configure the outbound TCP connection
 	// timeout in the proxy
+	ProxyEnableHostnameLabels = ProxyConfigAnnotationsPrefix + "/proxy-metrics-hostname-labels"
+
+	// ProxyOutboundConnectTimeout can be used to configure the outbound TCP connection
+	// timeout in the proxy
 	ProxyOutboundConnectTimeout = ProxyConfigAnnotationsPrefix + "/proxy-outbound-connect-timeout"
 
 	// ProxyInboundConnectTimeout can be used to configure the inbound TCP connection
 	// timeout in the proxy
 	ProxyInboundConnectTimeout = ProxyConfigAnnotationsPrefix + "/proxy-inbound-connect-timeout"
 
+	// ProxyOutboundDiscoveryCacheTimeout can be used to configure the timeout
+	// that will evict unused outbound discovery results
+	ProxyOutboundDiscoveryCacheUnusedTimeout = ProxyConfigAnnotationsPrefix + "/proxy-outbound-discovery-cache-unused-timeout"
+
+	// ProxyInboundDiscoveryCacheUnusedTimeout can be used to configure the timeout
+	// that will evict unused inbound discovery results
+	ProxyInboundDiscoveryCacheUnusedTimeout = ProxyConfigAnnotationsPrefix + "/proxy-inbound-discovery-cache-unused-timeout"
+
+	// ProxyDisableOutboundProtocolDetectTimeout can be used to disable protocol
+	// detection timeouts for outbound connections by setting them to a very
+	// high value.
+	ProxyDisableOutboundProtocolDetectTimeout = ProxyConfigAnnotationsPrefix + "/proxy-disable-outbound-protocol-detect-timeout"
+
+	// ProxyDisableInboundProtocolDetectTimeout can be used to disable protocol
+	// detection timeouts for inbound connections by setting them to a very
+	// high value.
+	ProxyDisableInboundProtocolDetectTimeout = ProxyConfigAnnotationsPrefix + "/proxy-disable-inbound-protocol-detect-timeout"
+
 	// ProxyEnableGatewayAnnotation can be used to configure the proxy
 	// to operate as a gateway, routing requests that target the inbound router.
 	ProxyEnableGatewayAnnotation = ProxyConfigAnnotationsPrefix + "/enable-gateway"
-
-	// ProxyDisableIdentityAnnotation can be used to disable identity on the injected proxy.
-	ProxyDisableIdentityAnnotation = ProxyConfigAnnotationsPrefix + "/disable-identity"
 
 	// ProxyEnableDebugAnnotation is set to true if the debug container is
 	// injected.
@@ -242,17 +279,63 @@ const (
 	// configured for the Pod
 	ProxyWaitBeforeExitSecondsAnnotation = ProxyConfigAnnotationsPrefixAlpha + "/proxy-wait-before-exit-seconds"
 
+	// ProxyEnableNativeSidecarAnnotationAlpha enables the native initContainer sidecar.
+	// Deprecated: use ProxyEnableNativeSidecarAnnotation instead.
+	ProxyEnableNativeSidecarAnnotationAlpha = ProxyConfigAnnotationsPrefixAlpha + "/proxy-enable-native-sidecar"
+
+	// ProxyEnableNativeSidecarAnnotationBeta enables the native initContainer sidecar
+	// Deprecated: use ProxyEnableNativeSidecarAnnotation instead.
+	ProxyEnableNativeSidecarAnnotationBeta = ProxyConfigAnnotationsPrefixBeta + "/proxy-enable-native-sidecar"
+
+	// ProxyEnableNativeSidecarAnnotation enables the native initContainer sidecar
+	ProxyEnableNativeSidecarAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-enable-native-sidecar"
+
 	// ProxyAwait can be used to force the application to wait for the proxy
 	// to be ready.
 	ProxyAwait = ProxyConfigAnnotationsPrefix + "/proxy-await"
 
-	// IdentityModeDefault is assigned to IdentityModeAnnotation to
-	// use the control plane's default identity scheme.
-	IdentityModeDefault = "default"
+	// ProxyDefaultInboundPolicyAnnotation is used to configure the default
+	// inbound policy of the proxy
+	ProxyDefaultInboundPolicyAnnotation = ProxyConfigAnnotationsPrefix + "/default-inbound-policy"
 
-	// IdentityModeDisabled is assigned to IdentityModeAnnotation to
-	// disable the proxy from participating in automatic identity.
-	IdentityModeDisabled = Disabled
+	// ProxyAccessLogAnnotation configures whether HTTP access logging is
+	// enabled, and what access log format is used.
+	ProxyAccessLogAnnotation = ProxyConfigAnnotationsPrefix + "/access-log"
+
+	// AllUnauthenticated allows all unathenticated connections.
+	AllUnauthenticated = "all-unauthenticated"
+
+	// AllAuthenticated allows all authenticated connections.
+	AllAuthenticated = "all-authenticated"
+
+	// ClusterUnauthenticated allows all unauthenticated connections from
+	// within the cluster.
+	ClusterUnauthenticated = "cluster-unauthenticated"
+
+	// ClusterAuthenticated allows all authenticated connections from within
+	// the cluster.
+	ClusterAuthenticated = "cluster-authenticated"
+
+	// Deny denies all connections.
+	Deny = "deny"
+
+	// Audit allows all connections, but logs and emits audit metrics whenever
+	// the default policy is enacted
+	Audit = "audit"
+
+	// ProxyShutdownGracePeriodAnnotation configures the grace period for
+	// graceful shutdowns in the proxy.
+	ProxyShutdownGracePeriodAnnotation = ProxyConfigAnnotationsPrefix + "/shutdown-grace-period"
+
+	// ProxyAdditionalEnvAnnotation allows setting additional proxy environment
+	// variables via a JSON-encoded list of Kubernetes EnvVar objects.
+	// Unlike other override annotations, this annotation is not inherited
+	// wholesale from the namespace. Instead, env vars are merged by name
+	// across three layers with increasing precedence:
+	// Helm proxy.additionalEnv < namespace annotation < workload annotation.
+	// Entries from higher-precedence layers override entries with the same
+	// env var name rather than replacing the entire list.
+	ProxyAdditionalEnvAnnotation = ProxyConfigAnnotationsPrefix + "/proxy-additional-env"
 
 	/*
 	 * Component Names
@@ -261,11 +344,8 @@ const (
 	// ConfigConfigMapName is the name of the ConfigMap containing the linkerd controller configuration.
 	ConfigConfigMapName = "linkerd-config"
 
-	// AddOnsConfigMapName is the name of the ConfigMap containing the linkerd add-ons configuration.
-	AddOnsConfigMapName = "linkerd-config-addons"
-
-	// DebugSidecarName is the name of the default linkerd debug container
-	DebugSidecarName = "linkerd-debug"
+	// DebugContainerName is the name of the default linkerd debug container
+	DebugContainerName = "linkerd-debug"
 
 	// DebugSidecarImage is the image name of the default linkerd debug container
 	DebugSidecarImage = "cr.l5d.io/linkerd/debug"
@@ -276,6 +356,10 @@ const (
 	// InitXtablesLockVolumeMountName is the name of the volumeMount used by proxy-init
 	// to handle iptables-legacy
 	InitXtablesLockVolumeMountName = "linkerd-proxy-init-xtables-lock"
+
+	// LinkerdTokenVolumeMountName is the name of the volumeMount used for
+	// the serviceAccount token
+	LinkerdTokenVolumeMountName = "linkerd-identity-token"
 
 	// ProxyContainerName is the name assigned to the injected proxy container.
 	ProxyContainerName = "linkerd-proxy"
@@ -317,14 +401,8 @@ const (
 	// SPValidatorWebhookConfigName is the name of the validating webhook configuration
 	SPValidatorWebhookConfigName = SPValidatorWebhookServiceName + "-webhook-config"
 
-	// TapServiceName is the name of the tap APIService
-	TapServiceName = "linkerd-tap"
-
-	// TapAPIRegistrationServiceName is the name of the tap APIService registration resource
-	TapAPIRegistrationServiceName = "v1alpha1.tap.linkerd.io"
-
-	// AdmissionWebhookLabel indicates whether admission webhooks are enabled for a namespace
-	AdmissionWebhookLabel = ProxyConfigAnnotationsPrefix + "/admission-webhooks"
+	// PolicyValidatorWebhookConfigName is the name of the validating webhook configuration
+	PolicyValidatorWebhookConfigName = "linkerd-policy-validator-webhook-config"
 
 	/*
 	 * Mount paths
@@ -333,25 +411,18 @@ const (
 	// MountPathBase is the base directory of the mount path.
 	MountPathBase = "/var/run/linkerd"
 
+	// MountPathTrustRootsBase is the base directory of the trust roots.
+	MountPathTrustRootsBase = MountPathBase + "/identity/trust-roots"
+
+	// MountPathTrustRootsPEM is the path at which the trust bundle is mounted.
+	MountPathTrustRootsPEM = MountPathTrustRootsBase + "/ca-bundle.crt"
+
 	// MountPathServiceAccount is the default path where Kubernetes stores
 	// the service account token
 	MountPathServiceAccount = "/var/run/secrets/kubernetes.io/serviceaccount"
 
-	// MountPathGlobalConfig is the path at which the global config file is mounted.
-	MountPathGlobalConfig = MountPathBase + "/config/global"
-
-	// MountPathProxyConfig is the path at which the global config file is mounted.
-	MountPathProxyConfig = MountPathBase + "/config/proxy"
-
-	// MountPathInstallConfig is the path at which the install config file is mounted.
-	MountPathInstallConfig = MountPathBase + "/config/install"
-
 	// MountPathValuesConfig is the path at which the values config file is mounted.
 	MountPathValuesConfig = MountPathBase + "/config/values"
-
-	// MountPathEndEntity is the path at which a tmpfs directory is mounted to
-	// store identity credentials.
-	MountPathEndEntity = MountPathBase + "/identity/end-entity"
 
 	// MountPathTLSBase is the path at which the TLS cert and key PEM files are mounted
 	MountPathTLSBase = MountPathBase + "/tls"
@@ -362,16 +433,6 @@ const (
 	// MountPathTLSCrtPEM is the path at which the TLS cert PEM file is mounted.
 	MountPathTLSCrtPEM = MountPathTLSBase + "/tls.crt"
 
-	// MountPathXtablesLock is the path at which the proxy init container mounts xtables
-	// This is necessary for xtables-legacy support
-	MountPathXtablesLock = "/run"
-
-	// IdentityServiceAccountTokenPath is the path to the kubernetes service
-	// account token used by proxies to provision identity.
-	//
-	// In the future, this should be changed to a time- and audience-scoped secret.
-	IdentityServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-
 	/*
 	 * Service mirror constants
 	 */
@@ -379,6 +440,10 @@ const (
 	// SvcMirrorPrefix is the prefix common to all labels and annotations
 	// and types used by the service mirror component
 	SvcMirrorPrefix = "mirror.linkerd.io"
+
+	// MulticlusterPrefix is the prefix common to all labels and annotations
+	// used for multicluster services.
+	MulticlusterPrefix = "multicluster.linkerd.io"
 
 	// MirrorSecretType is the type of secret that is supposed to contain
 	// the access information for remote clusters.
@@ -388,6 +453,10 @@ const (
 	// services.
 	DefaultExportedServiceSelector = SvcMirrorPrefix + "/exported"
 
+	// DefaultFederatedServiceSelector is the default label selector for
+	// federated services.
+	DefaultFederatedServiceSelector = SvcMirrorPrefix + "/federated"
+
 	// MirroredResourceLabel indicates that this resource is the result
 	// of a mirroring operation (can be a namespace or a service)
 	MirroredResourceLabel = SvcMirrorPrefix + "/mirrored-service"
@@ -395,9 +464,33 @@ const (
 	// MirroredGatewayLabel indicates that this is a mirrored gateway
 	MirroredGatewayLabel = SvcMirrorPrefix + "/mirrored-gateway"
 
+	// MirroredHeadlessSvcNameLabel indicates the root headless service for
+	// mirrored headless hosts.
+	MirroredHeadlessSvcNameLabel = SvcMirrorPrefix + "/headless-mirror-svc-name"
+
 	// RemoteClusterNameLabel put on a local mirrored service, it
 	// allows us to associate a mirrored service with a remote cluster
 	RemoteClusterNameLabel = SvcMirrorPrefix + "/cluster-name"
+
+	// RemoteDiscoveryLabel indicates that this service is a remote discovery
+	// service and the value of this label is the name of the remote cluster.
+	RemoteDiscoveryLabel = MulticlusterPrefix + "/remote-discovery"
+
+	// RemoteServiceLabel is the name of the service in the remote cluster.
+	RemoteServiceLabel = MulticlusterPrefix + "/remote-service"
+
+	// RemoteDiscoveryAnnotation indicates that this service is a remote discovery
+	// service and the value of this label is a comma-separated list of remote
+	// discovery targets of the form <service>@<cluster>. This can be used in
+	// conjunction with LocalDiscoveryAnnotation and the endpoints will be
+	// unioned.
+	RemoteDiscoveryAnnotation = MulticlusterPrefix + "/remote-discovery"
+
+	// LocalDiscoveryAnnotation indicates that service discovery information for
+	// this service should be fetched from another service in the local cluster
+	// instead of the target service itself. This can be used in conjunction
+	// with RemoteDiscoveryAnnotation and the endpoints will be unioned.
+	LocalDiscoveryAnnotation = MulticlusterPrefix + "/local-discovery"
 
 	// RemoteResourceVersionAnnotation is the last observed remote resource
 	// version of a mirrored resource. Useful when doing updates
@@ -407,22 +500,23 @@ const (
 	// on the remote cluster
 	RemoteServiceFqName = SvcMirrorPrefix + "/remote-svc-fq-name"
 
-	// RemoteGatewayResourceVersionAnnotation is the last observed remote resource
-	// version of the gateway for a particular mirrored service. It is used
-	// in cases we detect a change in a remote gateway
-	RemoteGatewayResourceVersionAnnotation = SvcMirrorPrefix + "/remote-gateway-resource-version"
-
 	// RemoteGatewayIdentity follows the same kind of logic as RemoteGatewayNameLabel
 	RemoteGatewayIdentity = SvcMirrorPrefix + "/remote-gateway-identity"
 
 	// GatewayIdentity can be found on the remote gateway service
 	GatewayIdentity = SvcMirrorPrefix + "/gateway-identity"
 
+	// GatewayProbeFailureThreshold is the minimum consecutive failures for the probe to be considered failed
+	GatewayProbeFailureThreshold = SvcMirrorPrefix + "/probe-failure-threshold"
+
 	// GatewayProbePeriod the interval at which the health of the gateway should be probed
 	GatewayProbePeriod = SvcMirrorPrefix + "/probe-period"
 
 	// GatewayProbePath the path at which the health of the gateway should be probed
 	GatewayProbePath = SvcMirrorPrefix + "/probe-path"
+
+	// GatewayProbeTimeout is the probe request timeout
+	GatewayProbeTimeout = SvcMirrorPrefix + "/probe-timeout"
 
 	// ConfigKeyName is the key in the secret that stores the kubeconfig needed to connect
 	// to a remote cluster
@@ -434,8 +528,14 @@ const (
 	// ProbePortName is the name of the probe port of the gateway
 	ProbePortName = "mc-probe"
 
-	// ServiceMirrorLabel is the value used in the controller component label
-	ServiceMirrorLabel = "servicemirror"
+	// TracingNameLabel is a pod label that the trace service name can be populated from
+	TracingNameLabel = "app.kubernetes.io/name"
+	// TracingInstanceLabel is a pod label that the trace service name can be populated from
+	TracingInstanceLabel = "app.kubernetes.io/instance"
+	// TracingSemanticConventionPrefix is the prefix for pod annotations that specify custom trace labels
+	TracingSemanticConventionPrefix = "resource.opentelemetry.io/"
+	// TracingServiceName is the label for the trace service name
+	TracingServiceName = "service.name"
 )
 
 // CreatedByAnnotationValue returns the value associated with
@@ -476,6 +576,16 @@ func GetPodLabels(ownerKind, ownerName string, pod *corev1.Pod) map[string]strin
 		labels["pod_template_hash"] = pth
 	}
 
+	return labels
+}
+
+// GetExternalWorkloadLabels returns the set of prometheus owner labels for a given ExternalWorkload
+func GetExternalWorkloadLabels(ownerKind, ownerName string, ew *ewv1beta1.ExternalWorkload) map[string]string {
+	labels := map[string]string{"external_workload": ew.Name}
+
+	if ownerKind != "" && ownerName != "" {
+		labels[ownerKind] = ownerName
+	}
 	return labels
 }
 

@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	timeout = 10 * time.Second
+	timeout = 15 * time.Second
 
 	// statExpiration indicates when items in the stat cache expire.
 	statExpiration = 1500 * time.Millisecond
@@ -53,10 +53,12 @@ type (
 		PathPrefix          string
 		Jaeger              string
 		Grafana             string
+		GrafanaExternalURL  string
+		GrafanaPrefix       string
 	}
 
 	healthChecker interface {
-		RunChecks(observer healthcheck.CheckObserver) bool
+		RunChecks(observer healthcheck.CheckObserver) (bool, bool)
 	}
 )
 
@@ -83,6 +85,8 @@ Please see https://linkerd.io/dns-rebinding for an explanation of what is happen
 func NewServer(
 	addr string,
 	grafanaAddr string,
+	grafanaExternalAddr string,
+	grafanaPrefix string,
 	jaegerAddr string,
 	templateDir string,
 	staticDir string,
@@ -117,19 +121,26 @@ func NewServer(
 		version:             version,
 		controllerNamespace: controllerNamespace,
 		clusterDomain:       clusterDomain,
-		grafanaProxy:        newReverseProxy(grafanaAddr, "/grafana"),
 		jaegerProxy:         newReverseProxy(jaegerAddr, ""),
 		grafana:             grafanaAddr,
+		grafanaExternalURL:  grafanaExternalAddr,
+		grafanaPrefix:       grafanaPrefix,
 		jaeger:              jaegerAddr,
 		hc:                  hc,
 		statCache:           cache.New(statExpiration, statCleanupInterval),
 	}
 
+	// Only create the grafana reverse proxy if we aren't using external grafana
+	if grafanaExternalAddr == "" {
+		handler.grafanaProxy = newReverseProxy(grafanaAddr, "/grafana")
+	}
+
 	httpServer := &http.Server{
-		Addr:         addr,
-		ReadTimeout:  timeout,
-		WriteTimeout: timeout,
-		Handler:      wrappedServer,
+		Addr:              addr,
+		ReadTimeout:       timeout,
+		ReadHeaderTimeout: timeout,
+		WriteTimeout:      timeout,
+		Handler:           wrappedServer,
 	}
 
 	// webapp routes
@@ -141,9 +152,9 @@ func NewServer(
 	// paths for a list of resources by namespace
 	server.router.GET("/namespaces/:namespace/daemonsets", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/statefulsets", handler.handleIndex)
-	server.router.GET("/namespaces/:namespace/trafficsplits", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/jobs", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/deployments", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/services", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/replicationcontrollers", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/pods", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/cronjobs", handler.handleIndex)
@@ -153,9 +164,9 @@ func NewServer(
 	server.router.GET("/overview", handler.handleIndex)
 	server.router.GET("/daemonsets", handler.handleIndex)
 	server.router.GET("/statefulsets", handler.handleIndex)
-	server.router.GET("/trafficsplits", handler.handleIndex)
 	server.router.GET("/jobs", handler.handleIndex)
 	server.router.GET("/deployments", handler.handleIndex)
+	server.router.GET("/services", handler.handleIndex)
 	server.router.GET("/replicationcontrollers", handler.handleIndex)
 	server.router.GET("/pods", handler.handleIndex)
 
@@ -164,8 +175,8 @@ func NewServer(
 	server.router.GET("/namespaces/:namespace/pods/:pod", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/daemonsets/:daemonset", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/statefulsets/:statefulset", handler.handleIndex)
-	server.router.GET("/namespaces/:namespace/trafficsplits/:trafficsplit", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/deployments/:deployment", handler.handleIndex)
+	server.router.GET("/namespaces/:namespace/services/:deployment", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/jobs/:job", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/replicationcontrollers/:replicationcontroller", handler.handleIndex)
 	server.router.GET("/namespaces/:namespace/cronjobs/:cronjob", handler.handleIndex)
@@ -176,6 +187,7 @@ func NewServer(
 	server.router.GET("/top", handler.handleIndex)
 	server.router.GET("/community", handler.handleIndex)
 	server.router.GET("/routes", handler.handleIndex)
+	server.router.GET("/extensions", handler.handleIndex)
 	server.router.GET("/profiles/new", handler.handleProfileDownload)
 
 	// add catch-all parameter to match all files in dir
@@ -195,10 +207,12 @@ func NewServer(
 	server.router.GET("/api/check", handler.handleAPICheck)
 	server.router.GET("/api/resource-definition", handler.handleAPIResourceDefinition)
 	server.router.GET("/api/gateways", handler.handleAPIGateways)
-	server.router.GET("/api/extension", handler.handleGetExtension)
+	server.router.GET("/api/extensions", handler.handleGetExtensions)
 
-	// grafana proxy
-	server.handleAllOperationsForPath("/grafana/*grafanapath", handler.handleGrafana)
+	// grafana proxy, only used if external grafana is not in use
+	if grafanaExternalAddr == "" {
+		server.handleAllOperationsForPath("/grafana/*grafanapath", handler.handleGrafana)
+	}
 
 	// jaeger proxy
 	server.handleAllOperationsForPath("/jaeger/*jaegerpath", handler.handleJaeger)

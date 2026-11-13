@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
+	"os"
 	"testing"
 
+	"github.com/go-test/deep"
 	"github.com/julienschmidt/httprouter"
 	"github.com/linkerd/linkerd2/pkg/healthcheck"
 	vizApi "github.com/linkerd/linkerd2/viz/metrics-api"
@@ -20,38 +21,38 @@ type mockHealthChecker struct {
 	results []*healthcheck.CheckResult
 }
 
-func (c *mockHealthChecker) RunChecks(observer healthcheck.CheckObserver) bool {
+func (c *mockHealthChecker) RunChecks(observer healthcheck.CheckObserver) (bool, bool) {
 	for _, result := range c.results {
 		observer(result)
 	}
-	return true
+	return true, false
 }
 
 func TestHandleApiCheck(t *testing.T) {
 	// Setup handler using a mock health checker
 	mockResults := []*healthcheck.CheckResult{
-		&healthcheck.CheckResult{
+		{
 			Category:    healthcheck.LinkerdConfigChecks,
 			Description: "check3-description",
 			HintURL:     healthcheck.DefaultHintBaseURL + "check3-hint-anchor",
 			Warning:     false,
 			Err:         nil,
 		},
-		&healthcheck.CheckResult{
+		{
 			Category:    healthcheck.LinkerdConfigChecks,
 			Description: "check4-description-kubectl",
 			HintURL:     healthcheck.DefaultHintBaseURL + "check4-hint-anchor",
 			Warning:     true,
 			Err:         nil,
 		},
-		&healthcheck.CheckResult{
+		{
 			Category:    healthcheck.KubernetesAPIChecks,
 			Description: "check1-description",
 			HintURL:     healthcheck.DefaultHintBaseURL + "check1-hint-anchor",
 			Warning:     false,
 			Err:         nil,
 		},
-		&healthcheck.CheckResult{
+		{
 			Category:    healthcheck.KubernetesAPIChecks,
 			Description: "check2-description",
 			HintURL:     healthcheck.DefaultHintBaseURL + "check2-hint-anchor",
@@ -71,7 +72,7 @@ func TestHandleApiCheck(t *testing.T) {
 	h.handleAPICheck(w, req, httprouter.Params{})
 	resp := w.Result()
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("not expecting error reading response body but got: %v", err)
 	}
@@ -80,10 +81,10 @@ func TestHandleApiCheck(t *testing.T) {
 	expectedHeaders := http.Header{
 		"Content-Type": []string{"application/json"},
 	}
-	if !reflect.DeepEqual(resp.Header, expectedHeaders) {
-		t.Errorf("expecting headers to be\n %v\n but got\n %v", expectedHeaders, resp.Header)
+	if diff := deep.Equal(resp.Header, expectedHeaders); diff != nil {
+		t.Errorf("Unexpected header: %v", diff)
 	}
-	apiCheckOutputGolden, err := ioutil.ReadFile("testdata/api_check_output.json")
+	apiCheckOutputGolden, err := os.ReadFile("testdata/api_check_output.json")
 	if err != nil {
 		t.Fatalf("not expecting error reading api check output golden file but got: %v", err)
 	}
@@ -129,7 +130,7 @@ func TestHandleApiGateway(t *testing.T) {
 		handler.handleAPIGateways(recorder, req, httprouter.Params{})
 		resp := recorder.Result()
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("not expecting error reading response body but got: %v", err)
 		}
@@ -142,11 +143,11 @@ func TestHandleApiGateway(t *testing.T) {
 		header := http.Header{
 			"Content-Type": []string{"application/json"},
 		}
-		if !reflect.DeepEqual(recorder.Header(), header) {
-			t.Errorf("Incorrect headers: %+v", recorder.Header())
-			t.Errorf("Expected:          %+v", header)
+		if diff := deep.Equal(recorder.Header(), header); diff != nil {
+			t.Errorf("Unexpected header: %v", diff)
 		}
-		apiGatewayOutputGolden, err := ioutil.ReadFile("testdata/api_gateway_output.json")
+
+		apiGatewayOutputGolden, err := os.ReadFile("testdata/api_gateway_output.json")
 		if err != nil {
 			t.Fatalf("not expecting error reading api check output golden file but got: %v", err)
 		}
@@ -155,8 +156,13 @@ func TestHandleApiGateway(t *testing.T) {
 		if err != nil {
 			t.Fatalf("not expecting error compacting api check output golden file but got: %v", err)
 		}
-		if !bytes.Equal(body, apiGatewayOutputGoldenCompact.Bytes()) {
-			t.Errorf("expecting response body to be\n %s\n but got\n %s", apiGatewayOutputGoldenCompact.Bytes(), body)
+		bodyCompact := &bytes.Buffer{}
+		err = json.Compact(bodyCompact, body)
+		if err != nil {
+			t.Fatalf("failed to compact response body: %s", err)
+		}
+		if !bytes.Equal(bodyCompact.Bytes(), apiGatewayOutputGoldenCompact.Bytes()) {
+			t.Errorf("expecting response body to be\n %s\n but got\n %s", apiGatewayOutputGoldenCompact.Bytes(), bodyCompact.Bytes())
 		}
 	})
 
@@ -166,7 +172,7 @@ func TestHandleApiGateway(t *testing.T) {
 		handler.handleAPIGateways(recorder, req, httprouter.Params{})
 		resp := recorder.Result()
 		defer resp.Body.Close()
-		_, err := ioutil.ReadAll(resp.Body)
+		_, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("not expecting error reading response body but got: %v", err)
 		}

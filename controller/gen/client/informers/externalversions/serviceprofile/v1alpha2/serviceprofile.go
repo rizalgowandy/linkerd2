@@ -19,13 +19,13 @@ limitations under the License.
 package v1alpha2
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	serviceprofilev1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
+	apisserviceprofilev1alpha2 "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	versioned "github.com/linkerd/linkerd2/controller/gen/client/clientset/versioned"
 	internalinterfaces "github.com/linkerd/linkerd2/controller/gen/client/informers/externalversions/internalinterfaces"
-	v1alpha2 "github.com/linkerd/linkerd2/controller/gen/client/listers/serviceprofile/v1alpha2"
+	serviceprofilev1alpha2 "github.com/linkerd/linkerd2/controller/gen/client/listers/serviceprofile/v1alpha2"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	watch "k8s.io/apimachinery/pkg/watch"
@@ -36,7 +36,7 @@ import (
 // ServiceProfiles.
 type ServiceProfileInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1alpha2.ServiceProfileLister
+	Lister() serviceprofilev1alpha2.ServiceProfileLister
 }
 
 type serviceProfileInformer struct {
@@ -57,21 +57,33 @@ func NewServiceProfileInformer(client versioned.Interface, namespace string, res
 // one. This reduces memory footprint and number of connections to the server.
 func NewFilteredServiceProfileInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
 	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
 			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.LinkerdV1alpha2().ServiceProfiles(namespace).List(context.TODO(), options)
+				return client.LinkerdV1alpha2().ServiceProfiles(namespace).List(context.Background(), options)
 			},
 			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
 					tweakListOptions(&options)
 				}
-				return client.LinkerdV1alpha2().ServiceProfiles(namespace).Watch(context.TODO(), options)
+				return client.LinkerdV1alpha2().ServiceProfiles(namespace).Watch(context.Background(), options)
 			},
-		},
-		&serviceprofilev1alpha2.ServiceProfile{},
+			ListWithContextFunc: func(ctx context.Context, options v1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.LinkerdV1alpha2().ServiceProfiles(namespace).List(ctx, options)
+			},
+			WatchFuncWithContext: func(ctx context.Context, options v1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&options)
+				}
+				return client.LinkerdV1alpha2().ServiceProfiles(namespace).Watch(ctx, options)
+			},
+		}, client),
+		&apisserviceprofilev1alpha2.ServiceProfile{},
 		resyncPeriod,
 		indexers,
 	)
@@ -82,9 +94,9 @@ func (f *serviceProfileInformer) defaultInformer(client versioned.Interface, res
 }
 
 func (f *serviceProfileInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&serviceprofilev1alpha2.ServiceProfile{}, f.defaultInformer)
+	return f.factory.InformerFor(&apisserviceprofilev1alpha2.ServiceProfile{}, f.defaultInformer)
 }
 
-func (f *serviceProfileInformer) Lister() v1alpha2.ServiceProfileLister {
-	return v1alpha2.NewServiceProfileLister(f.Informer().GetIndexer())
+func (f *serviceProfileInformer) Lister() serviceprofilev1alpha2.ServiceProfileLister {
+	return serviceprofilev1alpha2.NewServiceProfileLister(f.Informer().GetIndexer())
 }

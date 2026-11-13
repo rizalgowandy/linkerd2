@@ -11,7 +11,7 @@ import (
 
 var (
 	defaultMetricTimeWindow    = "1m"
-	metricTimeWindowLowerBound = time.Second * 15 //the window value needs to equal or larger than that
+	metricTimeWindowLowerBound = time.Second * 15 // the window value needs to equal or larger than that
 )
 
 // StatsBaseRequestParams contains parameters that are used to build requests
@@ -68,18 +68,9 @@ type GatewayRequestParams struct {
 // BuildStatSummaryRequest builds a Public API StatSummaryRequest from a
 // StatsSummaryRequestParams.
 func BuildStatSummaryRequest(p StatsSummaryRequestParams) (*pb.StatSummaryRequest, error) {
-	window := defaultMetricTimeWindow
-	if p.TimeWindow != "" {
-		w, err := time.ParseDuration(p.TimeWindow)
-		if err != nil {
-			return nil, err
-		}
-
-		if w < metricTimeWindowLowerBound {
-			return nil, errors.New("metrics time window needs to be at least 15s")
-		}
-
-		window = p.TimeWindow
+	window, err := ValidateTimeWindow(p.TimeWindow)
+	if err != nil {
+		return nil, err
 	}
 
 	if p.AllNamespaces && p.ResourceName != "" {
@@ -258,15 +249,32 @@ func BuildTopRoutesRequest(p TopRoutesRequestParams) (*pb.TopRoutesRequest, erro
 	return topRoutesRequest, nil
 }
 
+// ValidateTimeWindow validates the given duration as a time window. If an empty
+// string is provided, the default time window is returned, otherwise, if
+// validation is successful, the original time window is returned.
+func ValidateTimeWindow(window string) (string, error) {
+	if window == "" {
+		return defaultMetricTimeWindow, nil
+	}
+	w, err := time.ParseDuration(window)
+	if err != nil {
+		return "", err
+	}
+
+	if w < metricTimeWindowLowerBound {
+		return "", errors.New("metrics time window needs to be at least 15s")
+	}
+
+	return window, nil
+}
+
 // An authority can only receive traffic, not send it, so it can't be a --from
 func validateFromResourceType(resourceType string) (string, error) {
 	name, err := k8s.CanonicalResourceNameFromFriendlyName(resourceType)
 	if err != nil {
 		return "", err
 	}
-	if name == k8s.Authority {
-		return "", errors.New("cannot query traffic --from an authority")
-	}
+
 	return name, nil
 }
 

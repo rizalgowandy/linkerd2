@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"net/url"
+	"runtime"
 
 	"github.com/linkerd/linkerd2/controller/heartbeat"
 	"github.com/linkerd/linkerd2/pkg/flags"
@@ -36,6 +37,7 @@ func Main(args []string) {
 	// TODO:
 	// - k8s-env
 	v := url.Values{}
+	v.Set("arch", runtime.GOARCH)
 	v.Set("version", version.Version)
 	v.Set("source", "heartbeat")
 
@@ -49,7 +51,7 @@ func Main(args []string) {
 
 	prometheusClient, err := promApi.NewClient(promApi.Config{Address: *prometheusURL})
 	if err != nil {
-		log.Errorf("Failed to initialize Prometheus client: %s", err)
+		log.Warnf("Failed to initialize Prometheus client: %s", err)
 	} else {
 		promAPI := promv1.NewAPI(prometheusClient)
 		promV := heartbeat.PromValues(promAPI, *controllerNamespace)

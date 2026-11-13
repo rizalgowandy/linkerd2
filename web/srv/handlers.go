@@ -28,6 +28,8 @@ type (
 		controllerNamespace string
 		clusterDomain       string
 		grafana             string
+		grafanaExternalURL  string
+		grafanaPrefix       string
 		jaeger              string
 		grafanaProxy        *reverseProxy
 		jaegerProxy         *reverseProxy
@@ -49,6 +51,8 @@ func (h *handler) handleIndex(w http.ResponseWriter, req *http.Request, p httpro
 		ControllerNamespace: h.controllerNamespace,
 		PathPrefix:          pathPfx,
 		Grafana:             h.grafana,
+		GrafanaExternalURL:  h.grafanaExternalURL,
+		GrafanaPrefix:       h.grafanaPrefix,
 		Jaeger:              h.jaeger,
 	}
 
@@ -70,7 +74,7 @@ func (h *handler) handleProfileDownload(w http.ResponseWriter, req *http.Request
 	}
 
 	profileYaml := &bytes.Buffer{}
-	err := profiles.RenderProfileTemplate(namespace, service, h.clusterDomain, profileYaml)
+	err := profiles.RenderProfileTemplate(namespace, service, h.clusterDomain, profileYaml, "yaml")
 
 	if err != nil {
 		log.Error(err)

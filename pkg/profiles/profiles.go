@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"text/template"
 	"time"
 
 	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2" // TODO: pkg/profiles should not depend on controller/gen
+	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
+	yamlDecoder "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
 )
 
@@ -35,6 +38,8 @@ var (
 	minStatus uint32 = 100
 	maxStatus uint32 = 599
 
+	errNilMatchAll        = fmt.Errorf("null condition \"all\"")
+	errNilMatchAny        = fmt.Errorf("null condition \"any\"")
 	errRequestMatchField  = errors.New("A request match must have a field set")
 	errResponseMatchField = errors.New("A response match must have a field set")
 )
@@ -54,42 +59,44 @@ func Validate(data []byte) error {
 	var serviceProfile sp.ServiceProfile
 	err := yaml.UnmarshalStrict(data, &serviceProfile)
 	if err != nil {
-		return fmt.Errorf("failed to validate ServiceProfile: %s", err)
+		return fmt.Errorf("failed to validate ServiceProfile: %w", err)
 	}
 
 	errs := validation.IsDNS1123Subdomain(serviceProfile.Name)
 	if len(errs) > 0 {
-		return fmt.Errorf("ServiceProfile \"%s\" has invalid name: %s", serviceProfile.Name, errs[0])
-	}
-
-	if len(serviceProfile.Spec.Routes) == 0 {
-		return fmt.Errorf("ServiceProfile \"%s\" has no routes", serviceProfile.Name)
+		return fmt.Errorf("ServiceProfile %q has invalid name: %s", serviceProfile.Name, errs[0])
 	}
 
 	for _, route := range serviceProfile.Spec.Routes {
+		if route == nil {
+			return fmt.Errorf("ServiceProfile %q has a null route", serviceProfile.Name)
+		}
 		if route.Name == "" {
-			return fmt.Errorf("ServiceProfile \"%s\" has a route with no name", serviceProfile.Name)
+			return fmt.Errorf("ServiceProfile %q has a route with no name", serviceProfile.Name)
 		}
 		if route.Timeout != "" {
 			_, err := time.ParseDuration(route.Timeout)
 			if err != nil {
-				return fmt.Errorf("ServiceProfile \"%s\" has a route with an invalid timeout: %s", serviceProfile.Name, err)
+				return fmt.Errorf("ServiceProfile %q has a route with an invalid timeout: %w", serviceProfile.Name, err)
 			}
 		}
 		if route.Condition == nil {
-			return fmt.Errorf("ServiceProfile \"%s\" has a route with no condition", serviceProfile.Name)
+			return fmt.Errorf("ServiceProfile %q has a route with no condition", serviceProfile.Name)
 		}
 		err := ValidateRequestMatch(route.Condition)
 		if err != nil {
-			return fmt.Errorf("ServiceProfile \"%s\" has a route with an invalid condition: %s", serviceProfile.Name, err)
+			return fmt.Errorf("ServiceProfile %q has a route with an invalid condition: %w", serviceProfile.Name, err)
 		}
 		for _, rc := range route.ResponseClasses {
+			if rc == nil {
+				return fmt.Errorf("ServiceProfile %q has a null response class", serviceProfile.Name)
+			}
 			if rc.Condition == nil {
-				return fmt.Errorf("ServiceProfile \"%s\" has a response class with no condition", serviceProfile.Name)
+				return fmt.Errorf("ServiceProfile %q has a response class with no condition", serviceProfile.Name)
 			}
 			err = ValidateResponseMatch(rc.Condition)
 			if err != nil {
-				return fmt.Errorf("ServiceProfile \"%s\" has a response class with an invalid condition: %s", serviceProfile.Name, err)
+				return fmt.Errorf("ServiceProfile %q has a response class with an invalid condition: %w", serviceProfile.Name, err)
 			}
 		}
 	}
@@ -97,16 +104,16 @@ func Validate(data []byte) error {
 	rb := serviceProfile.Spec.RetryBudget
 	if rb != nil {
 		if rb.RetryRatio < 0 {
-			return fmt.Errorf("ServiceProfile \"%s\" RetryBudget RetryRatio must be non-negative: %f", serviceProfile.Name, rb.RetryRatio)
+			return fmt.Errorf("ServiceProfile %q RetryBudget RetryRatio must be non-negative: %f", serviceProfile.Name, rb.RetryRatio)
 		}
 
 		if rb.TTL == "" {
-			return fmt.Errorf("ServiceProfile \"%s\" RetryBudget missing TTL field", serviceProfile.Name)
+			return fmt.Errorf("ServiceProfile %q RetryBudget missing TTL field", serviceProfile.Name)
 		}
 
 		_, err := time.ParseDuration(rb.TTL)
 		if err != nil {
-			return fmt.Errorf("ServiceProfile \"%s\" RetryBudget: %s", serviceProfile.Name, err)
+			return fmt.Errorf("ServiceProfile %q RetryBudget: %w", serviceProfile.Name, err)
 		}
 	}
 
@@ -120,6 +127,9 @@ func ValidateRequestMatch(reqMatch *sp.RequestMatch) error {
 	if reqMatch.All != nil {
 		matchKindSet = true
 		for _, child := range reqMatch.All {
+			if child == nil {
+				return errNilMatchAll
+			}
 			err := ValidateRequestMatch(child)
 			if err != nil {
 				return err
@@ -129,6 +139,9 @@ func ValidateRequestMatch(reqMatch *sp.RequestMatch) error {
 	if reqMatch.Any != nil {
 		matchKindSet = true
 		for _, child := range reqMatch.Any {
+			if child == nil {
+				return errNilMatchAny
+			}
 			err := ValidateRequestMatch(child)
 			if err != nil {
 				return err
@@ -163,6 +176,9 @@ func ValidateResponseMatch(rspMatch *sp.ResponseMatch) error {
 	if rspMatch.All != nil {
 		matchKindSet = true
 		for _, child := range rspMatch.All {
+			if child == nil {
+				return errNilMatchAll
+			}
 			err := ValidateResponseMatch(child)
 			if err != nil {
 				return err
@@ -172,6 +188,9 @@ func ValidateResponseMatch(rspMatch *sp.ResponseMatch) error {
 	if rspMatch.Any != nil {
 		matchKindSet = true
 		for _, child := range rspMatch.Any {
+			if child == nil {
+				return errNilMatchAny
+			}
 			err := ValidateResponseMatch(child)
 			if err != nil {
 				return err
@@ -213,7 +232,7 @@ func buildConfig(namespace, service, clusterDomain string) *profileTemplateConfi
 
 // RenderProfileTemplate renders a ServiceProfile template to a buffer, given a
 // namespace, service, and control plane namespace.
-func RenderProfileTemplate(namespace, service, clusterDomain string, w io.Writer) error {
+func RenderProfileTemplate(namespace, service, clusterDomain string, w io.Writer, format string) error {
 	config := buildConfig(namespace, service, clusterDomain)
 	template, err := template.New("profile").Parse(Template)
 	if err != nil {
@@ -225,24 +244,27 @@ func RenderProfileTemplate(namespace, service, clusterDomain string, w io.Writer
 		return err
 	}
 
-	_, err = w.Write(buf.Bytes())
-	return err
+	if format == pkgcmd.JsonOutput {
+		bytes, err := yamlDecoder.ToJSON(buf.Bytes())
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(append(bytes, '\n'))
+		return err
+	}
+	if format == pkgcmd.YamlOutput {
+		_, err = w.Write(buf.Bytes())
+		return err
+	}
+
+	return fmt.Errorf("unknown output format: %s", format)
 }
 
 func readFile(fileName string) (io.Reader, error) {
 	if fileName == "-" {
 		return os.Stdin, nil
 	}
-	return os.Open(fileName)
-}
-
-func writeProfile(profile sp.ServiceProfile, w io.Writer) error {
-	output, err := yaml.Marshal(profile)
-	if err != nil {
-		return fmt.Errorf("Error writing Service Profile: %s", err)
-	}
-	_, err = w.Write(output)
-	return err
+	return os.Open(filepath.Clean(fileName))
 }
 
 // PathToRegex converts a path into a regex.

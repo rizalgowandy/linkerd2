@@ -1,8 +1,8 @@
 package watcher
 
 import (
-	"fmt"
 	"sync"
+	"time"
 
 	sp "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
 	splisters "github.com/linkerd/linkerd2/controller/gen/client/listers/serviceprofile/v1alpha2"
@@ -45,22 +45,25 @@ var profileVecs = newMetricsVecs("profile", []string{"namespace", "profile"})
 
 // NewProfileWatcher creates a ProfileWatcher and begins watching the k8sAPI for
 // service profile changes.
-func NewProfileWatcher(k8sAPI *k8s.API, log *logging.Entry) *ProfileWatcher {
+func NewProfileWatcher(k8sAPI *k8s.API, log *logging.Entry) (*ProfileWatcher, error) {
 	watcher := &ProfileWatcher{
 		profileLister: k8sAPI.SP().Lister(),
 		profiles:      make(map[ProfileID]*profilePublisher),
 		log:           log.WithField("component", "profile-watcher"),
 	}
 
-	k8sAPI.SP().Informer().AddEventHandler(
+	_, err := k8sAPI.SP().Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc:    watcher.addProfile,
 			UpdateFunc: watcher.updateProfile,
 			DeleteFunc: watcher.deleteProfile,
 		},
 	)
+	if err != nil {
+		return nil, err
+	}
 
-	return watcher
+	return watcher, nil
 }
 
 //////////////////////
@@ -71,24 +74,27 @@ func NewProfileWatcher(k8sAPI *k8s.API, log *logging.Entry) *ProfileWatcher {
 // The provided listener will be updated each time the service profile for the
 // given authority is changed.
 func (pw *ProfileWatcher) Subscribe(id ProfileID, listener ProfileUpdateListener) error {
-	pw.log.Infof("Establishing watch on profile %s", id)
+	pw.log.Debugf("Establishing watch on profile %s", id)
 
-	publisher := pw.getOrNewProfilePublisher(id, nil)
+	publisher, err := pw.getOrNewProfilePublisher(id, nil)
+	if err != nil {
+		pw.log.Errorf("error getting or creating profile publisher %s: %s", id, err)
+		return err
+	}
 
 	publisher.subscribe(listener)
 	return nil
 }
 
 // Unsubscribe removes a listener from the subscribers list for this authority.
-func (pw *ProfileWatcher) Unsubscribe(id ProfileID, listener ProfileUpdateListener) error {
-	pw.log.Infof("Stopping watch on profile %s", id)
+func (pw *ProfileWatcher) Unsubscribe(id ProfileID, listener ProfileUpdateListener) {
+	pw.log.Debugf("Stopping watch on profile %s", id)
 
 	publisher, ok := pw.getProfilePublisher(id)
 	if !ok {
-		return fmt.Errorf("cannot unsubscribe from unknown service [%s] ", id)
+		pw.log.Errorf("cannot unsubscribe from unknown service [%s]", id)
 	}
 	publisher.unsubscribe(listener)
-	return nil
 }
 
 func (pw *ProfileWatcher) addProfile(obj interface{}) {
@@ -98,12 +104,26 @@ func (pw *ProfileWatcher) addProfile(obj interface{}) {
 		Name:      profile.Name,
 	}
 
-	publisher := pw.getOrNewProfilePublisher(id, profile)
+	publisher, err := pw.getOrNewProfilePublisher(id, profile)
+	if err != nil {
+		pw.log.Errorf("error getting or creating profile publisher: %s", err)
+		return
+	}
 
 	publisher.update(profile)
 }
 
 func (pw *ProfileWatcher) updateProfile(old interface{}, new interface{}) {
+	oldProfile := old.(*sp.ServiceProfile)
+	newProfile := new.(*sp.ServiceProfile)
+
+	oldUpdated := latestUpdated(oldProfile.ManagedFields)
+	updated := latestUpdated(newProfile.ManagedFields)
+	if !updated.IsZero() && updated != oldUpdated {
+		delta := time.Since(updated)
+		serviceProfileInformerLag.Observe(delta.Seconds())
+	}
+
 	pw.addProfile(new)
 }
 
@@ -133,7 +153,7 @@ func (pw *ProfileWatcher) deleteProfile(obj interface{}) {
 	}
 }
 
-func (pw *ProfileWatcher) getOrNewProfilePublisher(id ProfileID, profile *sp.ServiceProfile) *profilePublisher {
+func (pw *ProfileWatcher) getOrNewProfilePublisher(id ProfileID, profile *sp.ServiceProfile) (*profilePublisher, error) {
 	pw.Lock()
 	defer pw.Unlock()
 
@@ -150,6 +170,13 @@ func (pw *ProfileWatcher) getOrNewProfilePublisher(id ProfileID, profile *sp.Ser
 			}
 		}
 
+		profileMetrics, err := profileVecs.newMetrics(prometheus.Labels{
+			"namespace": id.Namespace,
+			"profile":   id.Name,
+		})
+		if err != nil {
+			return nil, err
+		}
 		publisher = &profilePublisher{
 			profile:   profile,
 			listeners: make([]ProfileUpdateListener, 0),
@@ -158,15 +185,12 @@ func (pw *ProfileWatcher) getOrNewProfilePublisher(id ProfileID, profile *sp.Ser
 				"ns":        id.Namespace,
 				"profile":   id.Name,
 			}),
-			profileMetrics: profileVecs.newMetrics(prometheus.Labels{
-				"namespace": id.Namespace,
-				"profile":   id.Name,
-			}),
+			profileMetrics: profileMetrics,
 		}
 		pw.profiles[id] = publisher
 	}
 
-	return publisher
+	return publisher, nil
 }
 
 func (pw *ProfileWatcher) getProfilePublisher(id ProfileID) (publisher *profilePublisher, ok bool) {
